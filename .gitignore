@@ -1,0 +1,13 @@
+# Build output
+/out/
+web/node_modules/
+web/dist/
+
+# Runtime state (never commit a data dir — it holds the DB and the secrets key)
+/data/
+/run-data/
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db

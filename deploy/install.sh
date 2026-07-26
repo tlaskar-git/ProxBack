@@ -12,8 +12,8 @@ echo "Installing ProxBack server..."
 id -u proxback &>/dev/null || useradd --system --home /var/lib/proxback --shell /usr/sbin/nologin proxback
 
 install -d -o proxback -g proxback /var/lib/proxback /var/lib/proxback/downloads
-install -d /opt/proxback
-install -m 0755 ./proxback-server /opt/proxback/proxback-server
+install -d -o proxback -g proxback /opt/proxback
+install -m 0755 -o proxback -g proxback ./proxback-server /opt/proxback/proxback-server
 
 # Agent binaries served from the "Deploy Agent" page, if present alongside the installer.
 [[ -f ./proxback-agent-linux-amd64 ]] && install -m 0644 ./proxback-agent-linux-amd64 /var/lib/proxback/downloads/proxback-agent-linux-amd64

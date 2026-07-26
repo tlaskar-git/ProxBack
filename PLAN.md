@@ -171,6 +171,16 @@ Agents
 Settings
 - `GET/PUT /api/settings` → `{"serverName","concurrency"}`
 
+Software update (session auth; release source is the GitHub repo, overridable via
+`PROXBACK_UPDATE_REPO` / `PROXBACK_UPDATE_API` env vars)
+- `GET  /api/update/status` → `{"currentVersion","latestVersion"?,"updateAvailable",
+  "releaseNotes"?,"releaseUrl"?,"publishedAt"?,"assetName"?,"assetAvailable","checkError"?}`
+- `POST /api/update/apply` → `{"ok","version","restarting"}` — downloads the platform's
+  server asset from the latest release, verifies it against the release's `checksums.txt`,
+  swaps the running binary (previous kept as `.old`), then exits gracefully so systemd
+  (`Restart=always`) boots the new build. 409 when already latest / no releases.
+- `GET /api/me` additionally returns `"serverVersion"`.
+
 Static: everything not under `/api` serves the embedded SPA (fallback to index.html).
 
 ## Web UI (React + Vite + TS + Tailwind, visual/button-first UX)

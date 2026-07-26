@@ -123,6 +123,23 @@ loudly before your first backup, not during it.
   `--server` and `--token` yourself. Agents heartbeat every 15 s and never hold S3
   credentials: chunks flow through the server.
 
+## Updating
+
+ProxBack updates itself from this repository's GitHub releases:
+
+- **Settings → Software update** shows the installed version, checks the latest release,
+  and — when a newer version with a binary for your platform exists — offers a one-click
+  **Install update**. The new binary is downloaded, verified against the release's
+  `checksums.txt`, swapped in place (the previous binary is kept as `proxback-server.old`),
+  and the service restarts itself into the new build (`Restart=always` in the shipped
+  systemd unit). Expect a few seconds of downtime; let running jobs finish first.
+- Running outside systemd (or on Windows), the update is installed the same way but you
+  restart the process yourself.
+- Air-gapped or building from source? `git pull && go build` and replace the binary — the
+  in-app updater is optional.
+- The update source can be overridden with the `PROXBACK_UPDATE_REPO` environment variable
+  (`owner/name`), e.g. to point a fleet at your own fork.
+
 ## Building and testing from source
 
 ```bash

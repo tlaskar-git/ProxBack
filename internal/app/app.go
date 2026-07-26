@@ -21,6 +21,9 @@ import (
 type Options struct {
 	DataDir string
 	Logger  *slog.Logger
+	// OnRestartRequested is called after a software update is installed so the
+	// process can exit gracefully and be restarted by its supervisor.
+	OnRestartRequested func()
 }
 
 // App is a fully wired ProxBack server.
@@ -74,12 +77,13 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 	handler, err := api.New(api.Config{
-		Store:   st,
-		Auth:    authSvc,
-		Agents:  agents,
-		Sched:   scheduler,
-		DataDir: dataDir,
-		Logger:  log,
+		Store:              st,
+		Auth:               authSvc,
+		Agents:             agents,
+		Sched:              scheduler,
+		DataDir:            dataDir,
+		Logger:             log,
+		OnRestartRequested: opts.OnRestartRequested,
 	})
 	if err != nil {
 		scheduler.Stop()

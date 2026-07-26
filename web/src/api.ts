@@ -35,6 +35,28 @@ export interface MeResponse {
   user: User
   /** True while the seeded default admin/admin credentials are unchanged. */
   mustChangePassword?: boolean
+  /** Version of the server build answering this request. */
+  serverVersion?: string
+}
+
+export interface UpdateStatus {
+  currentVersion: string
+  latestVersion?: string
+  updateAvailable: boolean
+  releaseNotes?: string
+  releaseUrl?: string
+  publishedAt?: string
+  assetName?: string
+  assetAvailable: boolean
+  /** Set when the release repository could not be reached. */
+  checkError?: string
+}
+
+export interface UpdateApplyResult {
+  ok: boolean
+  version: string
+  /** True when the server is about to restart itself into the new build. */
+  restarting: boolean
 }
 
 /* Dashboard ---------------------------------------------------------------- */
@@ -438,6 +460,18 @@ export function changePassword(currentPassword: string, newPassword: string): Pr
     method: 'POST',
     body: { currentPassword, newPassword },
   })
+}
+
+/* ---------------------------------------------------------------------------
+ * Software update
+ * ------------------------------------------------------------------------- */
+
+export function getUpdateStatus(): Promise<UpdateStatus> {
+  return request<UpdateStatus>('/api/update/status')
+}
+
+export function applyUpdate(): Promise<UpdateApplyResult> {
+  return request<UpdateApplyResult>('/api/update/apply', { method: 'POST' })
 }
 
 /* ---------------------------------------------------------------------------

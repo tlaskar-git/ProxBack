@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"proxback/internal/app"
+	"proxback/internal/version"
 )
 
 func main() {
@@ -44,8 +45,17 @@ func main() {
 func run(listen, dataDir string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// A successful self-update requests a graceful exit; the service manager
+	// (systemd Restart=always) then starts the freshly installed binary.
+	ctx, requestRestart := context.WithCancel(ctx)
+	defer requestRestart()
 
-	instance, err := app.New(ctx, app.Options{DataDir: dataDir, Logger: log})
+	log.Info("proxback", "version", version.Version)
+	instance, err := app.New(ctx, app.Options{
+		DataDir:            dataDir,
+		Logger:             log,
+		OnRestartRequested: requestRestart,
+	})
 	if err != nil {
 		return err
 	}

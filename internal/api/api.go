@@ -38,6 +38,10 @@ type Config struct {
 	Sched   *sched.Manager
 	DataDir string
 	Logger  *slog.Logger
+	// OnRestartRequested is invoked after a software update is applied so the
+	// process can shut down gracefully (systemd Restart=always brings the new
+	// binary up). Nil disables the automatic restart.
+	OnRestartRequested func()
 }
 
 // Server is the ProxBack HTTP handler.
@@ -48,6 +52,7 @@ type Server struct {
 	sched   *sched.Manager
 	dataDir string
 	log     *slog.Logger
+	restart func()
 
 	spa    fs.FS
 	router chi.Router
@@ -73,6 +78,7 @@ func New(cfg Config) (*Server, error) {
 		sched:   cfg.Sched,
 		dataDir: cfg.DataDir,
 		log:     log,
+		restart: cfg.OnRestartRequested,
 		spa:     spa,
 	}
 	s.router = s.routes()
@@ -128,6 +134,9 @@ func (s *Server) apiRoutes() chi.Router {
 		r.Post("/logout", s.handleLogout)
 		r.Get("/me", s.handleMe)
 		r.Post("/me/password", s.handleChangePassword)
+
+		r.Get("/update/status", s.handleUpdateStatus)
+		r.Post("/update/apply", s.handleUpdateApply)
 
 		r.Get("/dashboard", s.handleDashboard)
 

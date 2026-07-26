@@ -9,12 +9,14 @@ Type=simple
 User=proxback
 Group=proxback
 ExecStart=/opt/proxback/proxback-server --listen :8443 --data /var/lib/proxback
-Restart=on-failure
+# "always" so a clean exit after an in-app software update boots the new binary.
+Restart=always
 RestartSec=5
-# Hardening
+# Hardening. /opt/proxback stays writable so the in-app updater can replace
+# the binary; everything else on the system is read-only to the service.
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/proxback
+ReadWritePaths=/var/lib/proxback /opt/proxback
 ProtectHome=true
 PrivateTmp=true
 

@@ -7,6 +7,7 @@ import (
 
 	"proxback/internal/auth"
 	"proxback/internal/store"
+	"proxback/internal/version"
 )
 
 type userDTO struct {
@@ -120,7 +121,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"user": toUserDTO(user), "mustChangePassword": def})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user":               toUserDTO(user),
+		"mustChangePassword": def,
+		"serverVersion":      version.Version,
+	})
 }
 
 func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {

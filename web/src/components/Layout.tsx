@@ -86,9 +86,9 @@ function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
                   onClick={onNavigate}
                   className={({ isActive }) =>
                     cn(
-                      'group flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors',
+                      'group relative flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors duration-150',
                       isActive
-                        ? 'bg-accent-500/10 font-medium text-accent-300 ring-1 ring-accent-500/20 ring-inset'
+                        ? 'bg-accent-500/10 font-medium text-accent-200 before:absolute before:top-1/2 before:left-0 before:h-4 before:w-0.5 before:-translate-y-1/2 before:rounded-full before:bg-accent-400'
                         : 'text-slate-400 hover:bg-slate-800/60 hover:text-slate-100',
                     )
                   }
@@ -116,7 +116,7 @@ function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 export function Layout() {
-  const { user, serverName, signOut, mustChangePassword } = useSession()
+  const { user, serverName, signOut, mustChangePassword, serverVersion } = useSession()
   const [drawerOpen, setDrawerOpen] = useState(false)
   const location = useLocation()
 
@@ -130,8 +130,13 @@ export function Layout() {
       <aside className="fixed inset-y-0 left-0 hidden w-64 flex-col border-r border-slate-800 bg-slate-900/50 lg:flex">
         <Brand />
         <SidebarNav />
-        <div className="border-t border-slate-800 px-5 py-3">
+        <div className="flex items-center justify-between gap-2 border-t border-slate-800 px-5 py-3">
           <p className="truncate text-[11px] text-slate-600">Signed in as {user.username}</p>
+          {serverVersion ? (
+            <span className="shrink-0 font-mono text-[10px] text-slate-600" title="Server version">
+              v{serverVersion}
+            </span>
+          ) : null}
         </div>
       </aside>
 

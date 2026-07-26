@@ -10,6 +10,8 @@ export interface Session {
   /** True while the seeded admin/admin credentials are unchanged. */
   mustChangePassword: boolean
   setMustChangePassword: (value: boolean) => void
+  /** Version of the server build, e.g. "0.2.0". Empty when unknown. */
+  serverVersion: string
 }
 
 const SessionContext = createContext<Session | null>(null)

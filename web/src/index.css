@@ -13,17 +13,19 @@
     ui-monospace, 'JetBrains Mono', 'Cascadia Mono', Consolas, 'Courier New',
     monospace;
 
-  --color-accent-50: #f0f9ff;
-  --color-accent-100: #e0f2fe;
-  --color-accent-200: #bae6fd;
-  --color-accent-300: #7dd3fc;
-  --color-accent-400: #38bdf8;
-  --color-accent-500: #0ea5e9;
-  --color-accent-600: #0284c7;
-  --color-accent-700: #0369a1;
-  --color-accent-800: #075985;
-  --color-accent-900: #0c4a6e;
-  --color-accent-950: #082f49;
+  /* Emerald accent: green reads as "protected / healthy" in a backup product,
+     and doubles as the positive-state color on the deep slate surface. */
+  --color-accent-50: #ecfdf5;
+  --color-accent-100: #d1fae5;
+  --color-accent-200: #a7f3d0;
+  --color-accent-300: #6ee7b9;
+  --color-accent-400: #34d399;
+  --color-accent-500: #10b981;
+  --color-accent-600: #059669;
+  --color-accent-700: #047857;
+  --color-accent-800: #065f46;
+  --color-accent-900: #064e3b;
+  --color-accent-950: #022c22;
 }
 
 @layer base {
@@ -62,6 +64,20 @@
   *:focus-visible {
     outline: 2px solid var(--color-accent-500);
     outline-offset: 2px;
+  }
+
+  /* Tailwind v4 resets buttons to cursor: default; clickable things must
+     read as clickable. */
+  button:not(:disabled),
+  [role='button']:not([aria-disabled='true']),
+  select:not(:disabled),
+  summary,
+  label[for] {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
   }
 
   ::selection {

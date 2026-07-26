@@ -32,7 +32,7 @@ type Phase =
   | { state: 'loading' }
   | { state: 'setup' }
   | { state: 'login'; defaultLogin: boolean }
-  | { state: 'ready'; user: User; mustChangePassword: boolean }
+  | { state: 'ready'; user: User; mustChangePassword: boolean; serverVersion: string }
   | { state: 'unreachable'; message: string }
 
 function BootScreen({ message, onRetry }: { message?: string; onRetry?: () => void }) {
@@ -83,7 +83,12 @@ export default function App() {
       }
       try {
         const me = await getMe()
-        setPhase({ state: 'ready', user: me.user, mustChangePassword: !!me.mustChangePassword })
+        setPhase({
+          state: 'ready',
+          user: me.user,
+          mustChangePassword: !!me.mustChangePassword,
+          serverVersion: me.serverVersion ?? '',
+        })
       } catch (err) {
         if (isApiError(err) && err.isUnauthorized) {
           setPhase({ state: 'login', defaultLogin: !!status.defaultLogin })
@@ -118,11 +123,16 @@ export default function App() {
 
   const onAuthenticated = useCallback(
     (user: User) => {
-      setPhase({ state: 'ready', user, mustChangePassword: false })
+      setPhase({ state: 'ready', user, mustChangePassword: false, serverVersion: '' })
       // The login response does not carry the default-password flag; refresh it.
       getMe()
         .then((me) =>
-          setPhase({ state: 'ready', user: me.user, mustChangePassword: !!me.mustChangePassword }),
+          setPhase({
+            state: 'ready',
+            user: me.user,
+            mustChangePassword: !!me.mustChangePassword,
+            serverVersion: me.serverVersion ?? '',
+          }),
         )
         .catch(() => {
           /* the session is already usable */
@@ -157,6 +167,7 @@ export default function App() {
       signOut,
       mustChangePassword: phase.mustChangePassword,
       setMustChangePassword,
+      serverVersion: phase.serverVersion,
     }
   }, [phase, serverName, signOut, setMustChangePassword])
 

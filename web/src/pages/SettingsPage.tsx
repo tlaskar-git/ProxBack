@@ -1,9 +1,26 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
-import { KeyRound, RefreshCw, Save, SlidersHorizontal } from 'lucide-react'
-import { changePassword, errorMessage, getSettings, putSettings } from '../api'
-import type { Settings } from '../api'
+import {
+  ArrowUpCircle,
+  CheckCircle2,
+  ExternalLink,
+  KeyRound,
+  RefreshCw,
+  Save,
+  SlidersHorizontal,
+} from 'lucide-react'
+import {
+  applyUpdate,
+  changePassword,
+  errorMessage,
+  getSettings,
+  getSetupStatus,
+  getUpdateStatus,
+  putSettings,
+} from '../api'
+import type { Settings, UpdateStatus } from '../api'
 import { useToast } from '../components/Toast'
+import { useConfirm } from '../components/Confirm'
 import { useSession } from '../session'
 import {
   Button,
@@ -15,10 +32,161 @@ import {
   LoadingBlock,
   PageHeader,
   SectionNote,
+  Spinner,
 } from '../components/ui'
 import { useAsync } from '../lib/useAsync'
 
 const MAX_CONCURRENCY = 32
+
+function SoftwareUpdateCard() {
+  const toast = useToast()
+  const confirm = useConfirm()
+  const loader = useCallback(() => getUpdateStatus(), [])
+  const { data: status, loading, error, reload } = useAsync<UpdateStatus>(loader)
+  const [applying, setApplying] = useState(false)
+  const [restarting, setRestarting] = useState(false)
+
+  const install = async () => {
+    if (!status) return
+    const ok = await confirm({
+      title: `Install ProxBack ${status.latestVersion}?`,
+      message:
+        'The new server binary is downloaded, checksum-verified, and swapped in. The server then restarts itself — expect a few seconds of downtime. Let running backup jobs finish first.',
+      confirmLabel: 'Install update',
+      destructive: false,
+    })
+    if (!ok) return
+    setApplying(true)
+    try {
+      const result = await applyUpdate()
+      if (result.restarting) {
+        setRestarting(true)
+        // Poll an unauthenticated endpoint until the new build answers, then reload.
+        const started = Date.now()
+        const poll = window.setInterval(() => {
+          getSetupStatus()
+            .then(() => {
+              window.clearInterval(poll)
+              window.location.reload()
+            })
+            .catch(() => {
+              if (Date.now() - started > 120_000) window.clearInterval(poll)
+            })
+        }, 2000)
+      } else {
+        toast.success(
+          `Version ${result.version} installed.`,
+          'Restart the ProxBack service to start running it.',
+        )
+        await reload()
+      }
+    } catch (err) {
+      const message = errorMessage(err)
+      toast.error('Update failed', message)
+      setApplying(false)
+    }
+  }
+
+  return (
+    <Card className="mt-6 max-w-2xl">
+      <CardHeader
+        title="Software update"
+        subtitle="Pulled from the ProxBack release repository on GitHub."
+      />
+      <div className="space-y-4 px-5 py-5">
+        {restarting ? (
+          <div className="flex items-center gap-3 rounded-lg border border-accent-500/30 bg-accent-500/10 px-4 py-3 text-sm text-accent-200">
+            <Spinner />
+            Installing and restarting the server — this page reloads automatically.
+          </div>
+        ) : loading && !status ? (
+          <LoadingBlock label="Checking for updates…" />
+        ) : error && !status ? (
+          <ErrorBlock message={error} onRetry={() => void reload()} />
+        ) : status ? (
+          <>
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+              <div>
+                <div className="text-[11px] tracking-wide text-slate-500 uppercase">Installed</div>
+                <div className="font-mono text-slate-200">v{status.currentVersion}</div>
+              </div>
+              <div>
+                <div className="text-[11px] tracking-wide text-slate-500 uppercase">Latest</div>
+                <div className="font-mono text-slate-200">
+                  {status.latestVersion ? `v${status.latestVersion}` : '— none published'}
+                </div>
+              </div>
+            </div>
+
+            {status.checkError ? (
+              <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-300">
+                Could not reach the release repository: {status.checkError}
+              </p>
+            ) : status.updateAvailable ? (
+              <div className="space-y-3 rounded-lg border border-accent-500/30 bg-accent-500/10 px-4 py-3">
+                <p className="text-sm font-medium text-accent-200">
+                  Version {status.latestVersion} is available.
+                </p>
+                {status.releaseNotes ? (
+                  <p className="line-clamp-4 text-xs whitespace-pre-line text-slate-400">
+                    {status.releaseNotes}
+                  </p>
+                ) : null}
+                {!status.assetAvailable ? (
+                  <p className="text-xs text-amber-300">
+                    The release has no prebuilt binary for this platform — update manually from
+                    source.
+                  </p>
+                ) : null}
+              </div>
+            ) : status.latestVersion ? (
+              <p className="flex items-center gap-2 text-sm text-slate-400">
+                <CheckCircle2 className="size-4 text-accent-400" aria-hidden />
+                You are running the latest version.
+              </p>
+            ) : (
+              <p className="text-sm text-slate-400">
+                No releases have been published yet. Once a release is tagged on GitHub, it appears
+                here.
+              </p>
+            )}
+
+            <div className="flex flex-wrap items-center gap-3 border-t border-slate-800 pt-4">
+              {status.updateAvailable && status.assetAvailable ? (
+                <Button
+                  variant="primary"
+                  loading={applying}
+                  onClick={() => void install()}
+                  icon={<ArrowUpCircle className="size-4" aria-hidden />}
+                >
+                  Install update
+                </Button>
+              ) : null}
+              <Button
+                icon={<RefreshCw className="size-4" aria-hidden />}
+                onClick={() => void reload()}
+                loading={loading}
+              >
+                Check again
+              </Button>
+              {status.releaseUrl ? (
+                <a
+                  href={status.releaseUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 text-xs text-slate-400 transition hover:text-slate-200"
+                >
+                  Release notes on GitHub
+                  <ExternalLink className="size-3.5" aria-hidden />
+                </a>
+              ) : null}
+            </div>
+          </>
+        ) : null}
+      </div>
+    </Card>
+  )
+}
 
 function ChangePasswordCard() {
   const toast = useToast()
@@ -282,6 +450,7 @@ export function SettingsPage() {
         </Card>
       )}
 
+      <SoftwareUpdateCard />
       <ChangePasswordCard />
     </>
   )

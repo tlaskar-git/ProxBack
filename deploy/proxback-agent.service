@@ -1,0 +1,13 @@
+[Unit]
+Description=ProxBack in-guest backup agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/proxback/proxback-agent --config /etc/proxback-agent
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

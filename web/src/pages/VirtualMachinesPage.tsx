@@ -15,6 +15,7 @@ import {
   vmSourcesOf,
 } from '../api'
 import type { Agent, CachedVM, Host, Job, Target } from '../api'
+import { WorkloadIdentity } from '../components/Identity'
 import { JobWizard } from '../components/JobWizard'
 import { useToast } from '../components/Toast'
 import {
@@ -77,19 +78,24 @@ function VMCard({
     // dashboard counts is findable by scanning rather than by reading every
     // card. A disabled job protects nothing until it is switched back on.
     <Card
-      className={cn('flex flex-col p-5', job?.enabled ? '' : 'border-l-2 border-l-amber-500/50')}
+      className={cn('flex flex-col p-5', job?.enabled ? '' : 'border-l-2 border-l-warn-500/50')}
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-start gap-3">
           <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-slate-800 bg-slate-950/60 text-accent-400">
             <Laptop className="size-4" aria-hidden />
           </div>
-          <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-slate-100">{vm.name}</p>
-            <p className="truncate text-xs text-slate-500">
-              <Num>#{vm.vmid}</Num> · {vm.hostName} · {vm.node}
-            </p>
-          </div>
+          {/* cluster / name (vmid) / node — the only unambiguous way to name
+              a guest once a second cluster exists. */}
+          <WorkloadIdentity
+            emphasis="strong"
+            workload={{
+              hostName: vm.hostName,
+              name: vm.name,
+              vmid: vm.vmid,
+              node: vm.node,
+            }}
+          />
         </div>
         <StatusPill tone={toneForStatus(vm.status)} label={vm.status} />
       </div>
@@ -131,12 +137,12 @@ function VMCard({
         ) : job ? (
           <>
             {' · '}
-            <span className="text-amber-400/80">Only “{job.name}”, which is disabled</span>
+            <span className="text-warn-300">Only “{job.name}”, which is disabled</span>
           </>
         ) : (
           <>
             {' · '}
-            <span className="text-amber-400/80">Not in any job</span>
+            <span className="text-warn-300">Not in any job</span>
           </>
         )}
       </p>

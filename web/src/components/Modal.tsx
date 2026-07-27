@@ -52,20 +52,20 @@ export function Modal({
         type="button"
         aria-label="Close dialog"
         onClick={onClose}
-        className="pb-overlay-in fixed inset-0 cursor-default bg-slate-950/80 backdrop-blur-sm"
+        className="scrim pb-overlay-in fixed inset-0 cursor-default"
       />
       <div
         role="dialog"
         aria-modal="true"
         aria-label={title}
         className={cn(
-          'pb-modal-in relative my-auto w-full rounded-xl border border-slate-800 bg-slate-900 shadow-2xl shadow-black/60',
+          'pb-modal-in relative my-auto w-full rounded-xl border border-slate-800 bg-slate-900 elev-3',
           WIDTHS[width],
         )}
       >
         <div className="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
           <div className="min-w-0">
-            <h2 className="text-base font-semibold text-white">{title}</h2>
+            <h2 className="text-base font-semibold text-slate-50">{title}</h2>
             {subtitle ? <p className="mt-1 text-xs text-slate-400">{subtitle}</p> : null}
           </div>
           <IconButton onClick={onClose} aria-label="Close dialog">

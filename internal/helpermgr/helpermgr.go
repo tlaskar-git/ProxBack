@@ -27,6 +27,10 @@ const OnlineWindow = 90 * time.Second
 var (
 	ErrUnauthorized = errors.New("helpermgr: unauthorized")
 	ErrBadToken     = errors.New("helpermgr: invalid or expired enrollment token")
+	// ErrNoHost is returned when a helper enrollment token is minted without a
+	// Proxmox host. A helper that does not know its cluster cannot be routed to,
+	// so there is no useful token to hand out.
+	ErrNoHost = errors.New("helpermgr: an enrollment token needs the Proxmox host the node belongs to")
 )
 
 // Manager owns node helper registrations.
@@ -43,13 +47,27 @@ func New(st *store.Store, log *slog.Logger) *Manager {
 	return &Manager{st: st, log: log}
 }
 
-// CreateEnrollToken issues a single-use helper enrollment token valid for 24 hours.
-func (m *Manager) CreateEnrollToken(ctx context.Context) (*store.EnrollToken, error) {
+// CreateEnrollToken issues a single-use helper enrollment token valid for 24
+// hours, minted for one Proxmox host. The host travels with the token so the
+// registering helper inherits it: the node never has to know, or be told, which
+// cluster it belongs to. An unknown or empty host is refused, because the
+// resulting registration could not be used to route anything.
+func (m *Manager) CreateEnrollToken(ctx context.Context, hostID string) (*store.EnrollToken, error) {
+	hostID = strings.TrimSpace(hostID)
+	if hostID == "" {
+		return nil, ErrNoHost
+	}
+	if _, err := m.st.PVEHostByID(ctx, hostID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, ErrNoHost
+		}
+		return nil, err
+	}
 	tok, err := auth.NewEnrollToken()
 	if err != nil {
 		return nil, err
 	}
-	return m.st.CreateEnrollToken(ctx, tok, store.EnrollPurposeHelper, auth.EnrollTokenTTL)
+	return m.st.CreateEnrollToken(ctx, tok, store.EnrollPurposeHelper, hostID, auth.EnrollTokenTTL)
 }
 
 // RegisterRequest is the body of POST /api/helpers/register.
@@ -84,11 +102,19 @@ func (m *Manager) Register(ctx context.Context, req RegisterRequest, remoteAddr 
 	if req.AccessSecret == "" {
 		return nil, errors.New("helpermgr: accessSecret is required")
 	}
-	if err := m.st.ConsumeEnrollToken(ctx, req.Token, store.EnrollPurposeHelper); err != nil {
+	// The token names the host, so the registration is bound to (host, node)
+	// without the node knowing anything about its cluster.
+	tok, err := m.st.ConsumeEnrollTokenFor(ctx, req.Token, store.EnrollPurposeHelper)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, ErrBadToken
 		}
 		return nil, err
+	}
+	if tok.HostID == "" {
+		// A token minted before helpers carried a host identity. Refusing it is
+		// the safe answer: the alternative is a registration nothing may route to.
+		return nil, ErrNoHost
 	}
 	key, err := auth.NewAgentKey()
 	if err != nil {
@@ -100,6 +126,7 @@ func (m *Manager) Register(ctx context.Context, req RegisterRequest, remoteAddr 
 	}
 	now := store.Now()
 	h := &store.NodeHelper{
+		HostID:       tok.HostID,
 		Node:         node,
 		Address:      Address(remoteAddr),
 		Port:         port,
@@ -111,7 +138,7 @@ func (m *Manager) Register(ctx context.Context, req RegisterRequest, remoteAddr 
 	if _, err := m.st.CreateHelper(ctx, h); err != nil {
 		return nil, err
 	}
-	m.log.Info("node helper registered", "helperId", h.ID, "node", h.Node,
+	m.log.Info("node helper registered", "helperId", h.ID, "hostId", h.HostID, "node", h.Node,
 		"address", h.Address, "port", h.Port, "version", h.Version)
 	return &RegisterResponse{HelperID: h.ID, APIKey: key}, nil
 }
@@ -154,8 +181,13 @@ func Online(h *store.NodeHelper) bool {
 	return time.Since(*h.LastSeen) <= OnlineWindow
 }
 
-// Status returns "online" or "offline" for a helper.
+// Status returns "unassigned", "online" or "offline" for a helper. A helper
+// with no host outranks liveness: it may be heartbeating perfectly and still
+// must not be used, because nothing can say which cluster's "pve1" it is.
 func Status(h *store.NodeHelper) string {
+	if h == nil || h.HostID == "" {
+		return store.HelperUnassigned
+	}
 	if Online(h) {
 		return "online"
 	}

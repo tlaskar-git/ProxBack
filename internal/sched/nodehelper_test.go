@@ -79,9 +79,9 @@ func TestIsVMAManifest(t *testing.T) {
 	}
 }
 
-// TestHelperForNode covers the three states a node can be in: no helper (fall
-// back to the extension), a live helper, and a helper that has stopped
-// heartbeating — which must fail loudly rather than silently take the old path.
+// TestHelperForNode covers the states a node can be in: no helper (fall back to
+// the extension), a live helper, and a helper that has stopped heartbeating —
+// which must fail loudly rather than silently take the old path.
 func TestHelperForNode(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, t.TempDir())
@@ -90,29 +90,36 @@ func TestHelperForNode(t *testing.T) {
 	}
 	defer st.Close()
 	m := New(st, agentmgr.New(st, discardLog()), discardLog())
+	const hostID = "host-a"
 
 	// No helper: not an error, the caller tries the export extension.
-	h, err := m.helperForNode(ctx, "pve1")
+	h, err := m.helperForNode(ctx, hostID, "pve1")
 	if err != nil || h != nil {
 		t.Fatalf("helperForNode without a helper = %+v (%v)", h, err)
 	}
-	if _, err := m.requireHelperForNode(ctx, "pve1"); err == nil ||
+	if _, err := m.requireHelperForNode(ctx, hostID, "pve1"); err == nil ||
 		!strings.Contains(err.Error(), NoHelperHint) {
 		t.Fatalf("requireHelperForNode without a helper = %v", err)
 	}
 
 	fresh := time.Now().UTC()
 	if _, err := st.CreateHelper(ctx, &store.NodeHelper{
-		Node: "pve1", Address: "10.0.0.11", Port: 8007, Version: "0.3.0",
+		HostID: hostID, Node: "pve1", Address: "10.0.0.11", Port: 8007, Version: "0.3.0",
 		AccessSecret: "secret", APIKeyHash: "hash", LastSeen: &fresh,
 	}); err != nil {
 		t.Fatalf("create helper: %v", err)
 	}
-	if h, err = m.helperForNode(ctx, "pve1"); err != nil || h == nil || h.AccessSecret != "secret" {
+	if h, err = m.helperForNode(ctx, hostID, "pve1"); err != nil || h == nil || h.AccessSecret != "secret" {
 		t.Fatalf("helperForNode with a live helper = %+v (%v)", h, err)
 	}
-	if h, err = m.requireHelperForNode(ctx, "pve1"); err != nil || h.Node != "pve1" {
+	if h, err = m.requireHelperForNode(ctx, hostID, "pve1"); err != nil || h.Node != "pve1" {
 		t.Fatalf("requireHelperForNode with a live helper = %+v (%v)", h, err)
+	}
+
+	// Another cluster's identically named node is not served by it. Answering
+	// anything else here is the defect that routes a backup to the wrong machine.
+	if other, err := m.helperForNode(ctx, "host-b", "pve1"); err != nil || other != nil {
+		t.Fatalf("helperForNode for another cluster's pve1 = %+v (%v), want no helper", other, err)
 	}
 
 	// Two missed heartbeats is still online; a helper unseen for minutes is not.
@@ -120,13 +127,53 @@ func TestHelperForNode(t *testing.T) {
 	if err := st.TouchHelper(ctx, h.ID, stale); err != nil {
 		t.Fatalf("age the helper: %v", err)
 	}
-	if _, err := m.helperForNode(ctx, "pve1"); err == nil ||
+	if _, err := m.helperForNode(ctx, hostID, "pve1"); err == nil ||
 		!strings.Contains(err.Error(), "helper for node pve1 is offline") {
 		t.Fatalf("helperForNode with a stale helper = %v, want an offline error", err)
 	}
-	if _, err := m.requireHelperForNode(ctx, "pve1"); err == nil ||
+	if _, err := m.requireHelperForNode(ctx, hostID, "pve1"); err == nil ||
 		!strings.Contains(err.Error(), "offline") {
 		t.Fatalf("requireHelperForNode with a stale helper = %v", err)
+	}
+}
+
+// An unassigned helper — one that predates host identity — must never be used
+// for routing, and the operator must be told what to do about it rather than
+// left with a silent fall back to a path that will not work on real Proxmox.
+func TestHelperForNodeRefusesAnUnassignedHelper(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	m := New(st, agentmgr.New(st, discardLog()), discardLog())
+
+	fresh := time.Now().UTC()
+	unassigned, err := st.CreateHelper(ctx, &store.NodeHelper{
+		Node: "pve1", Address: "10.0.0.11", Port: 8007, Version: "0.3.0",
+		AccessSecret: "secret", APIKeyHash: "hash", LastSeen: &fresh,
+	})
+	if err != nil {
+		t.Fatalf("create helper: %v", err)
+	}
+
+	got, err := m.helperForNode(ctx, "host-a", "pve1")
+	if got != nil {
+		t.Fatalf("an unassigned helper was used for routing: %+v", got)
+	}
+	if err == nil || !strings.Contains(err.Error(), UnassignedHelperHint) ||
+		!strings.Contains(err.Error(), `node "pve1"`) {
+		t.Fatalf("helperForNode with an unassigned helper = %v, want the assign-it instruction", err)
+	}
+
+	// Binding it to a host makes it routable, without redeploying anything.
+	if err := st.AssignHelperHost(ctx, unassigned.ID, "host-a"); err != nil {
+		t.Fatalf("assign helper: %v", err)
+	}
+	bound, err := m.helperForNode(ctx, "host-a", "pve1")
+	if err != nil || bound == nil || bound.ID != unassigned.ID {
+		t.Fatalf("helperForNode after assignment = %+v (%v)", bound, err)
 	}
 }
 

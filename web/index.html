@@ -1,12 +1,32 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
-    <meta name="description" content="ProxBack — backup and replication for Proxmox VE." />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="description" content="ProxBack — recoverability for Proxmox VE." />
     <title>ProxBack</title>
+    <script>
+      // Resolve the theme before first paint so a light-theme operator never
+      // sees a dark flash on load. The app re-applies the same logic in
+      // src/theme.tsx; this is only the head start.
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('proxback.theme')
+          var choice = stored === 'light' || stored === 'dark' ? stored : 'system'
+          var resolved =
+            choice === 'system'
+              ? window.matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark'
+              : choice
+          document.documentElement.setAttribute('data-theme', resolved)
+        } catch (err) {
+          document.documentElement.setAttribute('data-theme', 'dark')
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

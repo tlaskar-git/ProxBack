@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -70,6 +71,15 @@ type Manager struct {
 	// monitors holds the live per-source and throughput state of the runs in
 	// flight, keyed by run id. A run has an entry exactly while it is running.
 	monitors map[string]*runMonitor
+
+	// policyMinute is how long one minute of policy time lasts — a retry delay
+	// of 5 or a duration limit of 10. It is a minute everywhere except in
+	// tests, which shrink it so the behaviour can be exercised in milliseconds
+	// instead of in minutes. Zero means a real minute.
+	policyMinute time.Duration
+	// httpClient carries policy script calls to node helpers. Nil builds the
+	// default client.
+	httpClient *http.Client
 }
 
 // New builds a scheduler manager.
@@ -174,9 +184,16 @@ func (m *Manager) ReloadSchedules(ctx context.Context) error {
 			if !schedule.ShouldRun(time.Now()) {
 				return
 			}
-			if _, err := m.TriggerJob(m.baseContext(), jobID); err != nil {
+			if _, err := m.TriggerScheduledJob(m.baseContext(), jobID); err != nil {
 				if errors.Is(err, ErrAlreadyRunning) {
 					m.log.Warn("scheduled run skipped, already running", "job", name)
+					return
+				}
+				if errors.Is(err, ErrOutsideWindow) {
+					// The window is a deliberate operator setting, not a fault:
+					// the reason is recorded and the next firing is tried.
+					m.log.Info("scheduled run skipped, outside the job's backup window",
+						"job", name, "reason", err)
 					return
 				}
 				m.log.Error("scheduled run failed to start", "job", name, "error", err)
@@ -236,11 +253,30 @@ func (m *Manager) baseContext() context.Context {
 
 // ---------------------------------------------------------------- triggering
 
-// TriggerJob starts a job run and returns its id.
+// TriggerJob starts a job run on an operator's request and returns its id. A
+// manual run is never refused by the job's backup window: the window says when
+// ProxBack may start a run by itself, not when a person may.
 func (m *Manager) TriggerJob(ctx context.Context, jobID string) (string, error) {
+	return m.trigger(ctx, jobID, TriggerManual)
+}
+
+// TriggerScheduledJob starts a job run from its schedule. It is the only path
+// the backup window can refuse, answering ErrOutsideWindow.
+func (m *Manager) TriggerScheduledJob(ctx context.Context, jobID string) (string, error) {
+	return m.trigger(ctx, jobID, TriggerScheduled)
+}
+
+func (m *Manager) trigger(ctx context.Context, jobID, origin string) (string, error) {
 	job, err := m.st.JobByID(ctx, jobID)
 	if err != nil {
 		return "", err
+	}
+	policy := job.Policy.Normalized()
+	// The window governs starting, in the server's local time — which is what
+	// the schedule's "02:00" means too.
+	allowed, note := windowCheck(policy, origin, time.Now())
+	if !allowed {
+		return "", fmt.Errorf("%w: %s: %s", ErrOutsideWindow, job.Name, note)
 	}
 	running, err := m.st.HasRunningRun(ctx, jobID)
 	if err != nil {
@@ -258,6 +294,9 @@ func (m *Manager) TriggerJob(ctx context.Context, jobID string) (string, error) 
 	})
 	if err != nil {
 		return "", err
+	}
+	if note != "" {
+		m.logRun(ctx, run.ID, "%s", note)
 	}
 	m.launch(run, job.Kind, func(runCtx context.Context) (*engine.Stats, error) {
 		return m.executeBackup(runCtx, run, job)
@@ -302,34 +341,208 @@ type RestoreSpec struct {
 	BackupID string              `json:"backupId"`
 	VM       *VMRestoreTarget    `json:"vm,omitempty"`
 	Agent    *AgentRestoreTarget `json:"agent,omitempty"`
+	// Mode is "alongside" (the default) or "overwrite". A request that does not
+	// say is treated as alongside: a restore must never destroy a running guest
+	// because a field was left out.
+	Mode string `json:"mode,omitempty"`
+	// ConfirmName must equal the destination guest's current name for an
+	// overwrite. It is the operator typing out what they are about to destroy.
+	ConfirmName string `json:"confirmName,omitempty"`
 }
 
-// TriggerRestore starts a restore run and returns its id.
+// Restore-safety errors. They are separate values because the API answers 409
+// for them: the request was well formed, the estate says no.
+var (
+	// ErrVMIDInUse is returned when an "alongside" restore targets a VMID that
+	// already exists on the destination host.
+	ErrVMIDInUse = errors.New("sched: the target VMID already exists on this host")
+	// ErrConfirmName is returned when an "overwrite" restore does not carry the
+	// destination guest's current name.
+	ErrConfirmName = errors.New("sched: overwrite needs a matching confirmName")
+	// ErrBadRestoreMode is returned for an unrecognised mode.
+	ErrBadRestoreMode = errors.New(`sched: mode must be "alongside" or "overwrite"`)
+)
+
+// restorePlan is the checked destination of a restore: what the run will do and
+// where, resolved before the run row exists so an unsafe request is refused
+// synchronously rather than becoming a failed run in the history.
+type restorePlan struct {
+	meta  store.RestoreMeta
+	node  string
+	vmid  int
+	force bool
+}
+
+// planVMRestore resolves and safety-checks a VM restore destination.
+//
+//   - alongside (the default): the VMID must not exist on that host. Restoring
+//     next to the original is the safe operation, so it is what a request that
+//     says nothing gets.
+//   - overwrite: the VMID must exist and confirmName must be its current name.
+//     Nothing else unlocks it.
+func (m *Manager) planVMRestore(ctx context.Context, backup *store.Backup, spec RestoreSpec) (*restorePlan, error) {
+	if spec.VM == nil {
+		return nil, errors.New("vm restore target required")
+	}
+	mode := spec.Mode
+	if mode == "" {
+		mode = store.RestoreAlongside
+	}
+	if !store.ValidRestoreMode(mode) {
+		return nil, ErrBadRestoreMode
+	}
+	hostID := spec.VM.HostID
+	if hostID == "" {
+		hostID = backup.HostID
+	}
+	if hostID == "" {
+		return nil, errors.New("vm restore needs a hostId")
+	}
+	host, err := m.st.PVEHostByID(ctx, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("load proxmox host: %w", err)
+	}
+	client, err := PVEClient(host)
+	if err != nil {
+		return nil, err
+	}
+	vmid := spec.VM.VMID
+	if vmid == 0 {
+		if vmid, err = vmidFromSourceID(backup.SourceID); err != nil {
+			return nil, err
+		}
+	}
+	vms, err := client.AllVMs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list guests on %s: %w", host.Name, err)
+	}
+	var existing *pve.VM
+	for i := range vms {
+		if vms[i].VMID == vmid {
+			existing = &vms[i]
+			break
+		}
+	}
+	plan := &restorePlan{
+		vmid: vmid,
+		node: spec.VM.Node,
+		meta: store.RestoreMeta{
+			Mode: mode, HostID: host.ID, HostName: host.Name,
+			Node: spec.VM.Node, VMID: vmid, Storage: spec.VM.Storage,
+		},
+	}
+	switch mode {
+	case store.RestoreAlongside:
+		if existing != nil {
+			return nil, fmt.Errorf("%w: vm %d (%s) already exists on %s/%s — pick a free VMID "+
+				"(GET /api/hosts/%s/free-vmid suggests one) or restore with mode \"overwrite\"",
+				ErrVMIDInUse, vmid, existing.Name, host.Name, existing.Node, host.ID)
+		}
+	case store.RestoreOverwrite:
+		if existing == nil {
+			return nil, fmt.Errorf("%w: vm %d does not exist on %s, so there is nothing to overwrite — "+
+				"restore it alongside instead", ErrConfirmName, vmid, host.Name)
+		}
+		if strings.TrimSpace(spec.ConfirmName) != existing.Name {
+			return nil, fmt.Errorf("%w: type the destination guest's current name (%q) to confirm "+
+				"overwriting vm %d on %s/%s", ErrConfirmName, existing.Name, vmid, host.Name, existing.Node)
+		}
+		plan.force = true
+	}
+	if plan.node == "" && existing != nil {
+		plan.node = existing.Node
+	}
+	plan.meta.Node = plan.node
+	return plan, nil
+}
+
+// TriggerRestore starts a restore run and returns its id. The destination is
+// checked — and persisted — before the run exists, so an unsafe restore is
+// refused rather than started.
 func (m *Manager) TriggerRestore(ctx context.Context, spec RestoreSpec) (string, error) {
 	backup, err := m.st.BackupByID(ctx, spec.BackupID)
 	if err != nil {
 		return "", err
 	}
-	switch {
-	case backup.SourceKind == store.SourceVM && spec.VM == nil:
-		return "", errors.New("vm restore target required")
-	case backup.SourceKind == store.SourceAgent && spec.Agent == nil:
-		return "", errors.New("agent restore target required")
+	var plan *restorePlan
+	switch backup.SourceKind {
+	case store.SourceVM:
+		if plan, err = m.planVMRestore(ctx, backup, spec); err != nil {
+			return "", err
+		}
+	case store.SourceAgent:
+		if spec.Agent == nil {
+			return "", errors.New("agent restore target required")
+		}
+		mode := spec.Mode
+		if mode == "" {
+			mode = store.RestoreAlongside
+		}
+		if !store.ValidRestoreMode(mode) {
+			return "", ErrBadRestoreMode
+		}
+		plan = &restorePlan{meta: store.RestoreMeta{
+			Mode: mode, AgentID: spec.Agent.AgentID, DestPath: spec.Agent.DestPath,
+		}}
 	}
+	meta := plan.meta
 	run, err := m.st.CreateRun(ctx, &store.JobRun{
 		JobID:       "",
 		JobName:     "Restore " + backup.SourceName,
 		Kind:        store.RunKindRestore,
 		Status:      store.RunRunning,
 		CurrentStep: "Queued",
+		Restore:     &meta,
 	})
 	if err != nil {
 		return "", err
 	}
+	resolved := *plan
 	m.launch(run, store.RunKindRestore, func(runCtx context.Context) (*engine.Stats, error) {
-		return m.executeRestore(runCtx, run, backup, spec)
+		return m.executeRestore(runCtx, run, backup, spec, resolved)
 	}, nil)
 	return run.ID, nil
+}
+
+// FreeVMID returns the lowest guest id at or above after that no guest in used
+// occupies. Proxmox reserves everything below 100, so that is the floor
+// whatever the caller asks for.
+func FreeVMID(used []int, after int) int {
+	const firstUserVMID = 100
+	if after < firstUserVMID {
+		after = firstUserVMID
+	}
+	taken := make(map[int]struct{}, len(used))
+	for _, id := range used {
+		taken[id] = struct{}{}
+	}
+	for id := after; ; id++ {
+		if _, busy := taken[id]; !busy {
+			return id
+		}
+	}
+}
+
+// FreeVMIDForHost asks a Proxmox host for its guest list and returns the lowest
+// free id at or above after.
+func (m *Manager) FreeVMIDForHost(ctx context.Context, hostID string, after int) (int, error) {
+	host, err := m.st.PVEHostByID(ctx, hostID)
+	if err != nil {
+		return 0, err
+	}
+	client, err := PVEClient(host)
+	if err != nil {
+		return 0, err
+	}
+	vms, err := client.AllVMs(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("list guests on %s: %w", host.Name, err)
+	}
+	used := make([]int, 0, len(vms))
+	for _, v := range vms {
+		used = append(used, v.VMID)
+	}
+	return FreeVMID(used, after), nil
 }
 
 // Verify starts a restore-point verification run and returns its id. The run
@@ -371,7 +584,10 @@ func (m *Manager) Verify(ctx context.Context, backupID string) (string, error) {
 	m.mu.Unlock()
 
 	m.launch(run, store.RunKindVerify, func(runCtx context.Context) (*engine.Stats, error) {
-		return m.executeVerify(runCtx, run, backup)
+		stats, err := m.executeVerify(runCtx, run, backup)
+		// The evidence belongs to the restore point, whichever way it went.
+		m.recordVerification(backup.ID, stats, err)
+		return stats, err
 	}, release)
 	return run.ID, nil
 }
@@ -458,19 +674,16 @@ func (m *Manager) finish(runID, notifyKind string, stats *engine.Stats, runErr e
 		return
 	}
 	processed, uploaded := cur.BytesProcessed, cur.BytesUploaded
-	ratio := cur.DedupRatio
 	if stats != nil {
 		processed, uploaded = stats.BytesProcessed, stats.BytesUploaded
-		ratio = stats.DedupRatio()
-	} else if processed > 0 {
-		ratio = 1 - float64(uploaded)/float64(processed)
-		if ratio < 0 {
-			ratio = 0
-		}
 	}
+	// One definition of data reduction for the whole product: the stored ratio
+	// is always store.ReductionPct expressed as a fraction, never a separately
+	// computed number that could disagree with what the API reports.
+	ratio := store.ReductionPct(processed, uploaded) / 100
 	if cur.Kind == store.RunKindRestore || cur.Kind == store.RunKindVerify {
 		// Deduplication is a backup-side concept; restores and verifies read
-		// only, so a "100% deduplicated" ratio would be meaningless.
+		// only, so any reduction figure would be meaningless.
 		ratio = 0
 	}
 	status := store.RunSuccess
@@ -487,7 +700,7 @@ func (m *Manager) finish(runID, notifyKind string, stats *engine.Stats, runErr e
 	if err := m.st.FinishRun(ctx, runID, status, processed, uploaded, ratio, msg); err != nil {
 		m.log.Error("could not finish run", "run", runID, "error", err)
 	}
-	m.logTerminal(ctx, cur, status, processed, uploaded, ratio, msg)
+	m.logTerminal(ctx, cur, status, processed, uploaded, msg)
 	if runErr != nil {
 		m.log.Error("run finished", "run", runID, "status", status, "error", runErr)
 	} else {
@@ -523,7 +736,7 @@ func (m *Manager) logRun(ctx context.Context, runID, format string, args ...any)
 // logTerminal writes the last line of a run: the success summary, the
 // cancellation note or the full error.
 func (m *Manager) logTerminal(ctx context.Context, run *store.JobRun, status string,
-	processed, uploaded int64, ratio float64, msg string) {
+	processed, uploaded int64, msg string) {
 	dur := store.Now().Sub(run.StartedAt).Round(time.Millisecond)
 	switch status {
 	case store.RunSuccess:
@@ -533,8 +746,9 @@ func (m *Manager) logTerminal(ctx context.Context, run *store.JobRun, status str
 			m.logRun(ctx, run.ID, "run succeeded in %s — %s processed", dur, humanBytes(processed))
 			return
 		}
-		m.logRun(ctx, run.ID, "run succeeded in %s — %s processed, %s uploaded, %.0f%% deduplicated",
-			dur, humanBytes(processed), humanBytes(uploaded), ratio*100)
+		m.logRun(ctx, run.ID, "run succeeded in %s — %s processed, %s uploaded, %s",
+			dur, humanBytes(processed), humanBytes(uploaded),
+			store.ReductionSummary(processed, uploaded))
 	case store.RunCanceled:
 		m.logRun(ctx, run.ID, "run canceled after %s", dur)
 	default:
@@ -630,10 +844,26 @@ func gcGrace() time.Duration {
 	return d
 }
 
-// engineFor builds the engine for a target, reading the throughput settings on
-// every call so a change to upload concurrency, compression or the rate limit
-// takes effect on the next run without a restart.
+// engineFor builds the engine for a target under the global throughput
+// settings. Restores, verifications and ad-hoc deletions use it; a job run goes
+// through engineForJob so its policy can raise or lower the ceiling.
 func (m *Manager) engineFor(ctx context.Context, targetID string) (*engine.Engine, *store.S3Target, error) {
+	return m.engineForJob(ctx, targetID, 0)
+}
+
+// engineForJob builds the engine for a target, reading the throughput settings
+// on every call so a change to upload concurrency, compression or the rate
+// limit takes effect on the next run without a restart.
+//
+// uploadLimitOverride is the job policy's per-job ceiling in Mbps; 0 inherits
+// the global one. The rate limiter is one process-wide token bucket by design
+// — an operator's limit is a limit on what the server does to the uplink, not
+// on what one stream does — so an override is in force for as long as the run
+// that set it lasts, and applyGlobalUploadLimit puts the global ceiling back
+// when it finishes. Two concurrent runs with different overrides therefore see
+// the ceiling of whichever started last; that is the honest consequence of a
+// server-wide bucket, and the global limit is always restored.
+func (m *Manager) engineForJob(ctx context.Context, targetID string, uploadLimitOverride int) (*engine.Engine, *store.S3Target, error) {
 	target, err := m.st.S3TargetByID(ctx, targetID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load backup target: %w", err)
@@ -655,13 +885,28 @@ func (m *Manager) engineFor(ctx context.Context, targetID string) (*engine.Engin
 	}
 	// One token bucket for the whole process: the operator's limit is a limit on
 	// what the server does to the uplink, not on what one stream does.
-	engine.SetUploadLimitMbps(float64(settings.UploadLimitMbps))
+	limit := settings.UploadLimitMbps
+	if uploadLimitOverride > 0 {
+		limit = uploadLimitOverride
+	}
+	engine.SetUploadLimitMbps(float64(limit))
 	eng := engine.NewWithOptions(client, target.ID, m.st, m.log, engine.Options{
 		UploadConcurrency: settings.UploadConcurrency,
 		Compression:       settings.Compression,
 		GCGrace:           gcGrace(),
 	})
 	return eng, target, nil
+}
+
+// applyGlobalUploadLimit puts the server-wide upload ceiling back in force
+// after a run that raised or lowered it for itself.
+func (m *Manager) applyGlobalUploadLimit(ctx context.Context) {
+	settings, err := m.st.Settings(ctx)
+	if err != nil {
+		m.log.Warn("could not restore the global upload limit", "error", err)
+		return
+	}
+	engine.SetUploadLimitMbps(float64(settings.UploadLimitMbps))
 }
 
 // PVEClient builds a client for a stored Proxmox host.

@@ -308,6 +308,43 @@ func (s Schedule) Cron() string {
 	}
 }
 
+// RPO is the recovery point objective the schedule implies: how old a
+// workload's newest restore point is allowed to get before protection has
+// silently lapsed. It is derived from the operator's own words rather than from
+// the cron expression — hourly means an hour, daily a day, weekly a week,
+// monthly 30 days.
+//
+// The second result is false when the schedule promises nothing: a manual job
+// runs when someone asks, and an advanced expression can be anything at all
+// ("0 3 29 2 *" fires once a leap year), so inventing an RPO for either would
+// mean reporting a workload at risk against a target nobody set.
+func (s Schedule) RPO() (time.Duration, bool) {
+	switch s.Normalized().Kind {
+	case ScheduleHourly:
+		return time.Hour, true
+	case ScheduleDaily:
+		return 24 * time.Hour, true
+	case ScheduleWeekly:
+		return 168 * time.Hour, true
+	case ScheduleMonthly:
+		return 720 * time.Hour, true
+	default: // manual, advanced and anything unrecognised
+		return 0, false
+	}
+}
+
+// RPOGrace is the slack allowed on top of an RPO before a workload counts as
+// at risk: a quarter of the objective, never less than an hour. A daily job
+// that starts at 02:00 and takes twenty minutes must not flip the whole estate
+// red at 02:00 the next day.
+func RPOGrace(rpo time.Duration) time.Duration {
+	grace := rpo / 4
+	if grace < time.Hour {
+		grace = time.Hour
+	}
+	return grace
+}
+
 // ShouldRun reports whether a firing at t is a real occurrence of the schedule.
 // Only the monthly last-day schedule can answer false: its expression covers
 // days 28–31 and this discards the days that are not the last of their month.

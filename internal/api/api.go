@@ -160,12 +160,14 @@ func (s *Server) apiRoutes() chi.Router {
 		r.Post("/update/apply", s.handleUpdateApply)
 
 		r.Get("/dashboard", s.handleDashboard)
+		r.Get("/posture", s.handlePosture)
 
 		r.Get("/hosts", s.handleListHosts)
 		r.Post("/hosts", s.handleCreateHost)
 		r.Post("/hosts/{id}/test", s.handleTestHost)
 		r.Delete("/hosts/{id}", s.handleDeleteHost)
 		r.Get("/hosts/{id}/vms", s.handleHostVMs)
+		r.Get("/hosts/{id}/free-vmid", s.handleFreeVMID)
 		r.Get("/vms", s.handleListVMs)
 
 		r.Get("/targets", s.handleListTargets)
@@ -178,6 +180,7 @@ func (s *Server) apiRoutes() chi.Router {
 		r.Patch("/jobs/{id}", s.handlePatchJob)
 		r.Delete("/jobs/{id}", s.handleDeleteJob)
 		r.Post("/jobs/{id}/run", s.handleRunJob)
+		r.Get("/jobs/{id}/retention-preview", s.handleRetentionPreview)
 
 		r.Get("/runs", s.handleListRuns)
 		r.Post("/runs/clear", s.handleClearRuns)
@@ -199,6 +202,7 @@ func (s *Server) apiRoutes() chi.Router {
 		r.Get("/helpers", s.handleListHelpers)
 		r.Post("/helpers/enroll-token", s.handleCreateHelperEnrollToken)
 		r.Post("/helpers/deploy", s.handleDeployHelper)
+		r.Post("/helpers/{id}/assign", s.handleAssignHelper)
 		r.Delete("/helpers/{id}", s.handleDeleteHelper)
 
 		r.Get("/settings", s.handleGetSettings)

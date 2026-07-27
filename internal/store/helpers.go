@@ -8,14 +8,14 @@ import (
 	"time"
 )
 
-const helperCols = `id, node, address, port, version, access_secret_enc, api_key_hash, last_seen, registered_at`
+const helperCols = `id, host_id, node, address, port, version, access_secret_enc, api_key_hash, last_seen, registered_at`
 
 func (s *Store) scanHelper(sc interface{ Scan(...any) error }) (*NodeHelper, error) {
 	var h NodeHelper
 	var enc []byte
 	var lastSeen sql.NullString
 	var registered string
-	if err := sc.Scan(&h.ID, &h.Node, &h.Address, &h.Port, &h.Version, &enc,
+	if err := sc.Scan(&h.ID, &h.HostID, &h.Node, &h.Address, &h.Port, &h.Version, &enc,
 		&h.APIKeyHash, &lastSeen, &registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -33,8 +33,10 @@ func (s *Store) scanHelper(sc interface{ Scan(...any) error }) (*NodeHelper, err
 }
 
 // CreateHelper registers a node helper, encrypting its access secret. A node
-// runs exactly one helper, so an existing registration for the same node is
-// replaced — re-running the installer re-enrolls rather than duplicating.
+// of one host runs exactly one helper, so an existing registration for the same
+// (host, node) pair is replaced — re-running the installer re-enrolls rather
+// than duplicating. Crucially it is only that pair: a node called "pve1" in one
+// cluster must never displace the "pve1" of another.
 func (s *Store) CreateHelper(ctx context.Context, h *NodeHelper) (*NodeHelper, error) {
 	if h.ID == "" {
 		h.ID = NewID()
@@ -47,12 +49,13 @@ func (s *Store) CreateHelper(ctx context.Context, h *NodeHelper) (*NodeHelper, e
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM helpers WHERE node = ?`, h.Node); err != nil {
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM helpers WHERE host_id = ? AND node = ?`, h.HostID, h.Node); err != nil {
 		return nil, fmt.Errorf("replace helper for node %q: %w", h.Node, err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO helpers (`+helperCols+`) VALUES (?,?,?,?,?,?,?,?,?)`,
-		h.ID, h.Node, h.Address, h.Port, h.Version, enc, h.APIKeyHash,
+		`INSERT INTO helpers (`+helperCols+`) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		h.ID, h.HostID, h.Node, h.Address, h.Port, h.Version, enc, h.APIKeyHash,
 		fmtTimePtr(h.LastSeen), fmtTime(h.RegisteredAt))
 	if err != nil {
 		return nil, fmt.Errorf("create helper: %w", err)
@@ -60,9 +63,40 @@ func (s *Store) CreateHelper(ctx context.Context, h *NodeHelper) (*NodeHelper, e
 	return h, nil
 }
 
-// ListHelpers returns every registered helper ordered by node name.
+// AssignHelperHost binds an existing registration to a Proxmox host, which is
+// what turns an unassigned helper into a routable one without redeploying it.
+// It fails when the host already has a helper for that node, because that pair
+// is the helper's identity.
+func (s *Store) AssignHelperHost(ctx context.Context, id, hostID string) error {
+	h, err := s.HelperByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if h.HostID == hostID {
+		return nil
+	}
+	var clash int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM helpers WHERE host_id = ? AND node = ? AND id <> ?`,
+		hostID, h.Node, id).Scan(&clash); err != nil {
+		return fmt.Errorf("assign helper host: %w", err)
+	}
+	if clash > 0 {
+		return fmt.Errorf("that host already has a node helper for node %q", h.Node)
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE helpers SET host_id = ? WHERE id = ?`, hostID, id)
+	if err != nil {
+		return fmt.Errorf("assign helper host: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListHelpers returns every registered helper ordered by host then node name.
 func (s *Store) ListHelpers(ctx context.Context) ([]*NodeHelper, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+helperCols+` FROM helpers ORDER BY node`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+helperCols+` FROM helpers ORDER BY node, host_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list helpers: %w", err)
 	}
@@ -83,10 +117,30 @@ func (s *Store) HelperByID(ctx context.Context, id string) (*NodeHelper, error) 
 	return s.scanHelper(s.db.QueryRowContext(ctx, `SELECT `+helperCols+` FROM helpers WHERE id = ?`, id))
 }
 
-// HelperByNode loads the helper registered for a Proxmox node name.
-func (s *Store) HelperByNode(ctx context.Context, node string) (*NodeHelper, error) {
+// HelperFor loads the helper that serves a node of a specific Proxmox host.
+// This is the only lookup used for routing: resolving by node name alone would
+// send a backup or a restore to the "pve1" of the wrong cluster. An empty
+// hostID answers ErrNotFound rather than matching unassigned registrations.
+func (s *Store) HelperFor(ctx context.Context, hostID, node string) (*NodeHelper, error) {
+	if hostID == "" || node == "" {
+		return nil, ErrNotFound
+	}
 	return s.scanHelper(s.db.QueryRowContext(ctx,
-		`SELECT `+helperCols+` FROM helpers WHERE node = ? ORDER BY registered_at DESC LIMIT 1`, node))
+		`SELECT `+helperCols+` FROM helpers WHERE host_id = ? AND node = ?
+		 ORDER BY registered_at DESC LIMIT 1`, hostID, node))
+}
+
+// UnassignedHelperForNode finds a registration that carries the node's name but
+// no host. It exists so a run can tell "no helper at all" (fall back to the
+// export extension) from "a helper is installed but nobody knows which cluster
+// it belongs to", which is an operator action, not a silent guess.
+func (s *Store) UnassignedHelperForNode(ctx context.Context, node string) (*NodeHelper, error) {
+	if node == "" {
+		return nil, ErrNotFound
+	}
+	return s.scanHelper(s.db.QueryRowContext(ctx,
+		`SELECT `+helperCols+` FROM helpers WHERE host_id = '' AND node = ?
+		 ORDER BY registered_at DESC LIMIT 1`, node))
 }
 
 // HelperByKeyHash resolves a helper from a hashed API key.

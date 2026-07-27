@@ -60,7 +60,7 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
         }
       >
         <div className="flex gap-3.5">
-          <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-400">
+          <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-warn-500/30 bg-warn-500/10 text-warn-400">
             <TriangleAlert className="size-4" aria-hidden />
           </div>
           <div className="min-w-0 pt-1 text-sm leading-relaxed text-slate-300">

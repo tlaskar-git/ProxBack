@@ -13,21 +13,30 @@ import (
 	"proxback/internal/store"
 )
 
-func newManager(t *testing.T) (*helpermgr.Manager, *store.Store) {
+// newManager builds a manager over a store that already knows one Proxmox
+// host, because a helper enrollment token is always minted for a host.
+func newManager(t *testing.T) (*helpermgr.Manager, *store.Store, string) {
 	t.Helper()
 	st, err := store.Open(context.Background(), t.TempDir())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return helpermgr.New(st, slog.New(slog.NewTextHandler(io.Discard, nil))), st
+	host, err := st.CreatePVEHost(context.Background(), &store.PVEHost{
+		Name: "cluster-a", BaseURL: "https://pve-a.example:8006",
+		TokenID: "root@pam!proxback", TokenSecret: "secret", Status: "online",
+	})
+	if err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+	return helpermgr.New(st, slog.New(slog.NewTextHandler(io.Discard, nil))), st, host.ID
 }
 
 func TestRegisterConsumesTheTokenAndLearnsTheAddress(t *testing.T) {
 	ctx := context.Background()
-	m, st := newManager(t)
+	m, st, hostID := newManager(t)
 
-	tok, err := m.CreateEnrollToken(ctx)
+	tok, err := m.CreateEnrollToken(ctx, hostID)
 	if err != nil {
 		t.Fatalf("create enroll token: %v", err)
 	}
@@ -50,9 +59,14 @@ func TestRegisterConsumesTheTokenAndLearnsTheAddress(t *testing.T) {
 		t.Fatalf("registration = %+v", res)
 	}
 
-	h, err := st.HelperByNode(ctx, "pve2")
+	h, err := st.HelperFor(ctx, hostID, "pve2")
 	if err != nil {
 		t.Fatalf("load registered helper: %v", err)
+	}
+	// The helper inherited the host from the token: the node never said which
+	// cluster it belongs to.
+	if h.HostID != hostID {
+		t.Fatalf("registered helper hostId = %q, want %q", h.HostID, hostID)
 	}
 	// The address comes from the connection, and the port from the body.
 	if h.Address != "10.0.0.12" || h.Port != 8107 {
@@ -91,7 +105,7 @@ func TestRegisterConsumesTheTokenAndLearnsTheAddress(t *testing.T) {
 
 func TestRegisterRejectsBadInput(t *testing.T) {
 	ctx := context.Background()
-	m, _ := newManager(t)
+	m, _, hostID := newManager(t)
 
 	if _, err := m.Register(ctx, helpermgr.RegisterRequest{Node: "pve2", AccessSecret: "s"}, "1.2.3.4:5"); !errors.Is(err, helpermgr.ErrBadToken) {
 		t.Fatalf("register without a token = %v, want ErrBadToken", err)
@@ -100,7 +114,7 @@ func TestRegisterRejectsBadInput(t *testing.T) {
 		t.Fatalf("register with an unknown token = %v, want ErrBadToken", err)
 	}
 
-	tok, err := m.CreateEnrollToken(ctx)
+	tok, err := m.CreateEnrollToken(ctx, hostID)
 	if err != nil {
 		t.Fatalf("create enroll token: %v", err)
 	}
@@ -126,8 +140,8 @@ func TestRegisterRejectsBadInput(t *testing.T) {
 
 func TestRegisterDefaultsThePort(t *testing.T) {
 	ctx := context.Background()
-	m, st := newManager(t)
-	tok, err := m.CreateEnrollToken(ctx)
+	m, st, hostID := newManager(t)
+	tok, err := m.CreateEnrollToken(ctx, hostID)
 	if err != nil {
 		t.Fatalf("create enroll token: %v", err)
 	}
@@ -136,12 +150,88 @@ func TestRegisterDefaultsThePort(t *testing.T) {
 	}, "10.0.0.12:1"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	h, err := st.HelperByNode(ctx, "pve2")
+	h, err := st.HelperFor(ctx, hostID, "pve2")
 	if err != nil {
 		t.Fatalf("load helper: %v", err)
 	}
 	if h.Port != store.DefaultHelperPort {
 		t.Fatalf("port = %d, want %d", h.Port, store.DefaultHelperPort)
+	}
+}
+
+// An enrollment token is minted for a host, and only for a host: without one
+// the resulting registration could never be routed to.
+func TestEnrollTokenRequiresAKnownHost(t *testing.T) {
+	ctx := context.Background()
+	m, _, hostID := newManager(t)
+
+	for _, bad := range []string{"", "   ", "no-such-host"} {
+		if _, err := m.CreateEnrollToken(ctx, bad); !errors.Is(err, helpermgr.ErrNoHost) {
+			t.Fatalf("CreateEnrollToken(%q) = %v, want ErrNoHost", bad, err)
+		}
+	}
+	if _, err := m.CreateEnrollToken(ctx, hostID); err != nil {
+		t.Fatalf("CreateEnrollToken with a real host: %v", err)
+	}
+}
+
+// Two clusters that each contain a node called "pve1" must end up with two
+// registrations, neither of which displaces the other. This is the defect that
+// could route a backup to the wrong physical machine.
+func TestTwoClustersWithTheSameNodeNameCoexist(t *testing.T) {
+	ctx := context.Background()
+	m, st, hostA := newManager(t)
+	otherHost, err := st.CreatePVEHost(ctx, &store.PVEHost{
+		Name: "cluster-b", BaseURL: "https://pve-b.example:8006",
+		TokenID: "root@pam!proxback", TokenSecret: "secret", Status: "online",
+	})
+	if err != nil {
+		t.Fatalf("create second host: %v", err)
+	}
+
+	register := func(hostID, secret, addr string) string {
+		t.Helper()
+		tok, err := m.CreateEnrollToken(ctx, hostID)
+		if err != nil {
+			t.Fatalf("create enroll token: %v", err)
+		}
+		res, err := m.Register(ctx, helpermgr.RegisterRequest{
+			Token: tok.Token, Node: "pve1", AccessSecret: secret, Version: "0.5.0",
+		}, addr)
+		if err != nil {
+			t.Fatalf("register helper for %s: %v", hostID, err)
+		}
+		return res.HelperID
+	}
+	idA := register(hostA, "secret-a", "10.0.0.11:1")
+	idB := register(otherHost.ID, "secret-b", "10.9.9.11:1")
+	if idA == idB {
+		t.Fatal("the second registration reused the first helper")
+	}
+
+	helpers, err := st.ListHelpers(ctx)
+	if err != nil || len(helpers) != 2 {
+		t.Fatalf("helpers = %+v (%v), want both registrations", helpers, err)
+	}
+	a, err := st.HelperFor(ctx, hostA, "pve1")
+	if err != nil || a.ID != idA || a.AccessSecret != "secret-a" || a.Address != "10.0.0.11" {
+		t.Fatalf("cluster-a pve1 = %+v (%v)", a, err)
+	}
+	b, err := st.HelperFor(ctx, otherHost.ID, "pve1")
+	if err != nil || b.ID != idB || b.AccessSecret != "secret-b" || b.Address != "10.9.9.11" {
+		t.Fatalf("cluster-b pve1 = %+v (%v)", b, err)
+	}
+}
+
+// A registration with no host is reported as unassigned however healthy it
+// looks, because nothing can say which cluster's node it is.
+func TestUnassignedHelperStatusOutranksLiveness(t *testing.T) {
+	now := time.Now()
+	if got := helpermgr.Status(&store.NodeHelper{LastSeen: &now}); got != store.HelperUnassigned {
+		t.Fatalf("a heartbeating helper with no host is %q, want %q", got, store.HelperUnassigned)
+	}
+	if got := helpermgr.Status(&store.NodeHelper{HostID: "h1", LastSeen: &now}); got != "online" {
+		t.Fatalf("an assigned, heartbeating helper is %q", got)
 	}
 }
 
@@ -163,7 +253,7 @@ func TestOnlineWindow(t *testing.T) {
 	if helpermgr.Online(nil) {
 		t.Fatal("a nil helper is online")
 	}
-	if helpermgr.Status(&store.NodeHelper{}) != "offline" {
+	if helpermgr.Status(&store.NodeHelper{HostID: "h1"}) != "offline" {
 		t.Fatal("a never-seen helper is not offline")
 	}
 	// Two missed 30 s heartbeats are still within tolerance; a helper unseen for
@@ -180,10 +270,10 @@ func TestOnlineWindow(t *testing.T) {
 
 func TestHeartbeatMovesLastSeen(t *testing.T) {
 	ctx := context.Background()
-	m, st := newManager(t)
+	m, st, hostID := newManager(t)
 	old := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
 	h, err := st.CreateHelper(ctx, &store.NodeHelper{
-		Node: "pve2", Address: "10.0.0.12", Version: "0.3.0",
+		HostID: hostID, Node: "pve2", Address: "10.0.0.12", Version: "0.3.0",
 		AccessSecret: "s", APIKeyHash: "h", LastSeen: &old,
 	})
 	if err != nil {

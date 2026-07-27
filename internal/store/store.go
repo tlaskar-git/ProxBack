@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -146,11 +147,13 @@ CREATE TABLE IF NOT EXISTS enroll_tokens (
 	created_at TEXT NOT NULL,
 	expires_at TEXT NOT NULL,
 	used_at    TEXT,
-	purpose    TEXT NOT NULL DEFAULT 'agent'
+	purpose    TEXT NOT NULL DEFAULT 'agent',
+	host_id    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS helpers (
 	id                TEXT PRIMARY KEY,
+	host_id           TEXT NOT NULL DEFAULT '',
 	node              TEXT NOT NULL,
 	address           TEXT NOT NULL,
 	port              INTEGER NOT NULL DEFAULT 8007,
@@ -189,7 +192,8 @@ CREATE TABLE IF NOT EXISTS job_runs (
 	dedup_ratio     REAL NOT NULL DEFAULT 0,
 	error           TEXT,
 	progress_pct    REAL NOT NULL DEFAULT 0,
-	current_step    TEXT NOT NULL DEFAULT ''
+	current_step    TEXT NOT NULL DEFAULT '',
+	restore_meta    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_runs_job ON job_runs(job_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON job_runs(started_at DESC);
@@ -199,6 +203,9 @@ CREATE TABLE IF NOT EXISTS run_sources (
 	seq             INTEGER NOT NULL,
 	name            TEXT NOT NULL,
 	kind            TEXT NOT NULL,
+	source_id       TEXT NOT NULL DEFAULT '',
+	host_id         TEXT NOT NULL DEFAULT '',
+	host_name       TEXT NOT NULL DEFAULT '',
 	node            TEXT NOT NULL DEFAULT '',
 	status          TEXT NOT NULL DEFAULT 'pending',
 	size_bytes      INTEGER NOT NULL DEFAULT 0,
@@ -226,13 +233,18 @@ CREATE TABLE IF NOT EXISTS backups (
 	source_kind    TEXT NOT NULL,
 	source_id      TEXT NOT NULL,
 	source_name    TEXT NOT NULL,
+	host_id        TEXT NOT NULL DEFAULT '',
+	host_name      TEXT NOT NULL DEFAULT '',
 	target_id      TEXT NOT NULL,
 	created_at     TEXT NOT NULL,
 	size_bytes     INTEGER NOT NULL DEFAULT 0,
 	uploaded_bytes INTEGER NOT NULL DEFAULT 0,
 	kind           TEXT NOT NULL DEFAULT 'full',
 	parent_id      TEXT,
-	disks          TEXT NOT NULL DEFAULT '[]'
+	disks          TEXT NOT NULL DEFAULT '[]',
+	last_verified_at   TEXT,
+	last_verify_result TEXT NOT NULL DEFAULT '',
+	verified_bytes     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_backups_source ON backups(source_kind, source_id, target_id, created_at DESC);
 
@@ -264,7 +276,47 @@ var addedColumns = []struct{ table, column, definition string }{
 	// When a chunk was uploaded. Orphan collection uses it to spare recent
 	// uploads, which is what makes an interrupted backup resumable.
 	{"chunk_index", "added_at", "TEXT NOT NULL DEFAULT ''"},
+	// A helper belongs to a Proxmox host: two clusters can each contain a node
+	// called "pve1". Registrations written before this column existed migrate to
+	// the empty string and are reported as "unassigned" — never used for routing.
+	{"helpers", "host_id", "TEXT NOT NULL DEFAULT ''"},
+	// A helper enrollment token is minted for one host, so the helper inherits
+	// its cluster identity at registration.
+	{"enroll_tokens", "host_id", "TEXT NOT NULL DEFAULT ''"},
+	// Restore points carry the cluster their workload lived in. Existing rows are
+	// backfilled from the "<hostId>_<vmid>" source id, which already encodes it.
+	{"backups", "host_id", "TEXT NOT NULL DEFAULT ''"},
+	{"backups", "host_name", "TEXT NOT NULL DEFAULT ''"},
+	// Verification evidence attached to the restore point rather than only to
+	// run history.
+	{"backups", "last_verified_at", "TEXT"},
+	{"backups", "last_verify_result", "TEXT NOT NULL DEFAULT ''"},
+	{"backups", "verified_bytes", "INTEGER NOT NULL DEFAULT 0"},
+	// Which workload a run source row backed up, and where it lived.
+	{"run_sources", "source_id", "TEXT NOT NULL DEFAULT ''"},
+	{"run_sources", "host_id", "TEXT NOT NULL DEFAULT ''"},
+	{"run_sources", "host_name", "TEXT NOT NULL DEFAULT ''"},
+	// The structured destination of a restore run (mode, host, node, vmid,
+	// storage) as JSON, so run history can show where a VM went.
+	{"job_runs", "restore_meta", "TEXT NOT NULL DEFAULT ''"},
+	// A job's GFS retention as JSON. The original integer column stays as the
+	// keep-last mirror; rows written before this column existed hold the empty
+	// string and are migrated into the object form on open.
+	{"jobs", "retention_policy", "TEXT NOT NULL DEFAULT ''"},
+	// A job's optional protection policy as JSON. Empty — which is what every
+	// existing row holds — means the defaults, i.e. exactly the behaviour a job
+	// had before policies existed.
+	{"jobs", "policy", "TEXT NOT NULL DEFAULT ''"},
 }
+
+// helperIdentitySQL enforces the (host_id, node) identity of a node helper. It
+// runs after the column migration above, because a database written by an
+// earlier release only grows host_id at that point. Unassigned rows all carry
+// host_id = ”, and the pre-migration code already kept at most one row per
+// node, so no existing database can violate it.
+const helperIdentitySQL = `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_helpers_host_node ON helpers(host_id, node);
+`
 
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
@@ -275,13 +327,98 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if _, err := s.db.ExecContext(ctx, helperIdentitySQL); err != nil {
+		return fmt.Errorf("apply helper identity index: %w", err)
+	}
 	if err := s.backfillChunkAddedAt(ctx); err != nil {
+		return err
+	}
+	if err := s.backfillBackupHostIdentity(ctx); err != nil {
 		return err
 	}
 	if err := s.migrateJobSchedules(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateJobRetention(ctx); err != nil {
+		return err
+	}
 	return s.normalizeTimestamps(ctx)
+}
+
+// backfillBackupHostIdentity gives restore points written before they carried a
+// cluster identity the host they belong to. A VM restore point's source id is
+// "<hostId>_<vmid>", so the host is already encoded there and nothing has to be
+// guessed; the display name comes from the pve_hosts row when it still exists.
+// Agent restore points have no host and are left alone. The pass is idempotent:
+// it only touches rows whose host_id is still empty.
+func (s *Store) backfillBackupHostIdentity(ctx context.Context) error {
+	names := map[string]string{}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name FROM pve_hosts`)
+	if err != nil {
+		return fmt.Errorf("backfill backup host identity: %w", err)
+	}
+	for rows.Next() {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill backup host identity: %w", err)
+		}
+		names[id] = name
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return fmt.Errorf("backfill backup host identity: %w", err)
+	}
+
+	type fix struct{ id, hostID, hostName string }
+	// The whole set is collected before anything is written: the pool is limited
+	// to a single connection, so updating while a query is still open deadlocks.
+	var fixes []fix
+	rows, err = s.db.QueryContext(ctx,
+		`SELECT id, source_id FROM backups WHERE source_kind = ? AND host_id = ''`, SourceVM)
+	if err != nil {
+		return fmt.Errorf("backfill backup host identity: %w", err)
+	}
+	for rows.Next() {
+		var id, sourceID string
+		if err := rows.Scan(&id, &sourceID); err != nil {
+			rows.Close()
+			return fmt.Errorf("backfill backup host identity: %w", err)
+		}
+		hostID, ok := HostIDFromSourceID(sourceID)
+		if !ok {
+			continue
+		}
+		fixes = append(fixes, fix{id: id, hostID: hostID, hostName: names[hostID]})
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return fmt.Errorf("backfill backup host identity: %w", err)
+	}
+	for _, f := range fixes {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE backups SET host_id = ?, host_name = ? WHERE id = ?`,
+			f.hostID, f.hostName, f.id); err != nil {
+			return fmt.Errorf("backfill backup host identity: %w", err)
+		}
+	}
+	return nil
+}
+
+// HostIDFromSourceID recovers the Proxmox host from a VM source id of the form
+// "<hostId>_<vmid>". The second result is false when the id does not have that
+// shape (an agent source id, for instance).
+func HostIDFromSourceID(sourceID string) (string, bool) {
+	i := strings.LastIndex(sourceID, "_")
+	if i <= 0 || i == len(sourceID)-1 {
+		return "", false
+	}
+	if _, err := strconv.Atoi(sourceID[i+1:]); err != nil {
+		return "", false
+	}
+	return sourceID[:i], true
 }
 
 // migrateJobSchedules converts jobs written before v0.4.0, whose schedule column
@@ -324,6 +461,58 @@ func (s *Store) migrateJobSchedules(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx,
 			`UPDATE jobs SET schedule = ? WHERE id = ?`, c.schedule, c.id); err != nil {
 			return fmt.Errorf("migrate job schedules: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateJobRetention converts jobs written before v0.5.0, whose retention was
+// a bare "keep the last N" integer, into the GFS object. The conversion is
+// exact — {"keepLast":N} prunes precisely what N pruned — so no job's retention
+// changes across the upgrade, and the integer column is left in place as the
+// keep-last mirror. Rows that already hold an object are skipped, which makes
+// the pass idempotent: it runs on every open.
+func (s *Store) migrateJobRetention(ctx context.Context) error {
+	type conversion struct {
+		id       string
+		policy   string
+		keepLast int
+	}
+	// The whole set is collected before anything is written: the pool is limited
+	// to a single connection, so updating while a query is still open deadlocks.
+	var pending []conversion
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, retention, retention_policy FROM jobs`)
+	if err != nil {
+		return fmt.Errorf("migrate job retention: %w", err)
+	}
+	for rows.Next() {
+		var id, object string
+		var legacy int
+		if err := rows.Scan(&id, &legacy, &object); err != nil {
+			rows.Close()
+			return fmt.Errorf("migrate job retention: %w", err)
+		}
+		if strings.HasPrefix(strings.TrimSpace(object), "{") {
+			continue
+		}
+		encoded, err := encodeRetention(KeepLast(legacy))
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, conversion{id: id, policy: encoded, keepLast: legacy})
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return fmt.Errorf("migrate job retention: %w", err)
+	}
+	for _, c := range pending {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE jobs SET retention_policy = ?, retention = ? WHERE id = ?`,
+			c.policy, c.keepLast, c.id); err != nil {
+			return fmt.Errorf("migrate job retention: %w", err)
 		}
 	}
 	return nil

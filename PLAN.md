@@ -107,6 +107,90 @@ available uplink, because nothing was read or hashed while a chunk was in flight
 Backup flow (agentless): snapshot VM → export each disk stream through the engine → delete
 snapshot → write manifest per disk (one backupID covers all disks of the VM).
 
+## v0.5.0 — trust, policy depth, and identity
+
+Driven by an external product review. Three classes of work: correctness defects that
+undermine trust, protection-policy depth, and the product shell.
+
+### Identity (correctness — highest severity)
+
+A helper is currently keyed by **node name alone**, so two clusters that each contain a
+`pve1` collide: registering the second deletes the first, and backup/restore traffic can
+be routed to the wrong physical node. Helpers must be keyed by **(hostID, node)**.
+
+- `helpers` gains `host_id`; uniqueness becomes `(host_id, node)`.
+- Registration carries the host the helper belongs to. The enrollment token is minted for a
+  specific host (`POST /api/helpers/enroll-token {"hostId"}`), so the helper inherits it —
+  the node never has to know its own cluster identity.
+- Lookup is `HelperFor(hostID, node)`. No global by-node resolution anywhere.
+- Existing helpers migrate to `host_id = ''` and are reported as `"unassigned"`; they are
+  **not** used for routing. The UI asks the operator to bind or re-deploy them. Never guess
+  when more than one host could match.
+- Workload identity is `cluster / name (vmid) / node` everywhere a source is chosen or
+  displayed: VM inventory, job sources, restore points, run sources.
+  `Backup` gains `hostId` + `hostName`; `vmDTO` already carries them.
+
+### Protection posture (replaces the dashboard's optimistic verdict)
+
+`GET /api/posture` → per-workload evaluation, rolled up:
+```
+{"verdict":"protected"|"at_risk"|"unprotected"|"unknown",
+ "counts":{"protected":N,"atRisk":N,"unprotected":N},
+ "reasons":[{"code","workloads":N,"detail"}],
+ "workloads":[{"kind","id","name","hostName","node","policy"?,"enabled",
+   "rpoHours"?,"lastSuccessAt"?,"ageHours"?,"withinRpo"?,"lastFailureAt"?,
+   "lastVerifiedAt"?,"restorePoints","status":"protected"|"at_risk"|"unprotected"}]}
+```
+- A workload is `at_risk` when its own last success is older than its schedule's RPO plus a
+  grace window, or its last run failed. Never derived from "the newest success anywhere".
+- Empty estate reports `unknown`, not `0/0 — all guests in a job`.
+- **Data-reduction metrics are defined once**: `reductionPct = 1 - uploaded/processed`
+  (0 when processed is 0) and `reductionRatio = processed/uploaded` (omitted when uploaded
+  is 0 — an infinite ratio is not displayed as `1.0×`). A run that read 32 MiB and uploaded
+  nothing is "100% avoided", never "1.0×".
+
+### Verification evidence
+
+Verification results attach to the restore point, not just to run history.
+`Backup` gains `lastVerifiedAt`, `lastVerifyResult` (`"passed"|"failed"`), `verifiedBytes`.
+The UI distinguishes **integrity verified** (chunks re-hashed) from **restore tested**
+(not yet implemented) and never claims the latter.
+
+### Recovery safety
+
+`POST /api/restores` gains an explicit `mode`: `"alongside"` (default) | `"overwrite"`.
+- `alongside` requires a target VMID that does not exist; the server suggests a free one via
+  `GET /api/hosts/{id}/free-vmid` → `{"vmid":N}`.
+- `overwrite` requires `"confirmName"` matching the destination VM's current name, and is
+  refused otherwise (409). It is never the default and never preselected.
+- Restore run metadata persists the destination (`host`, `node`, `vmid`, `storage`, `mode`)
+  and is shown in run detail, not only in a log line.
+
+### Protection policy (`job.policy`, all fields optional with safe defaults)
+
+```
+{"quiesce":"none"|"guest-agent",           // freeze via qemu-guest-agent
+ "excludeDisks":["scsi1"],                 // vm jobs
+ "excludePaths":["**/node_modules"],       // agent jobs
+ "retryCount":0-5,"retryDelayMinutes":1-120,
+ "maxDurationMinutes":0=unlimited,
+ "window":{"start":"22:00","end":"06:00"}|null,   // may only start inside this window
+ "preScript":"","postScript":"",           // run on the helper/agent, output captured
+ "scriptTimeoutSeconds":30,
+ "uploadLimitMbpsOverride":0}              // 0 = inherit global
+```
+Presented as an optional **Advanced protection** step; defaults keep the six-VM case simple.
+
+### GFS retention
+
+`job.retention` becomes an object (a bare integer still accepted = keep-last-N):
+```
+{"keepLast":7,"keepDaily":0,"keepWeekly":4,"keepMonthly":6,"keepYearly":1}
+```
+A restore point survives if any rule retains it. `GET /api/jobs/{id}/retention-preview`
+→ `{"keeps":[{"backupId","createdAt","reasons":["last","weekly"]}],"prunes":[...]}` so the
+UI can show what a policy would keep before saving.
+
 ## Node helper (real-PVE agentless backup; v0.3.0)
 
 Real Proxmox has no disk-export API, so agentless image backup of a real host runs through

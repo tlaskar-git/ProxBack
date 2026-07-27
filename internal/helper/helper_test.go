@@ -608,3 +608,141 @@ func TestInstructionsMentionEveryStep(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------- policy scripts
+
+// scriptAnswer is what POST /script returns.
+type scriptAnswer struct {
+	OK     bool   `json:"ok"`
+	Output string `json:"output"`
+	Error  string `json:"error"`
+}
+
+func postScript(t *testing.T, srv *httptest.Server, secret string, body any) (*http.Response, scriptAnswer) {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("encode script request: %v", err)
+	}
+	resp := request(t, http.MethodPost, srv.URL+"/script", secret, bytes.NewReader(raw))
+	if resp.StatusCode != http.StatusOK {
+		return resp, scriptAnswer{}
+	}
+	defer resp.Body.Close()
+	var out scriptAnswer
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode script answer: %v", err)
+	}
+	return resp, out
+}
+
+// TestScriptRunsThroughTheShellAndCapturesOutput covers the contract a job
+// policy's pre/post script relies on: the command line is handed to a shell on
+// the node, and both stdout and stderr come back so the run log can show what
+// the script said.
+func TestScriptRunsThroughTheShellAndCapturesOutput(t *testing.T) {
+	runner := &fakeRunner{stdout: []byte("frozen\n"), stderr: "warning: slow"}
+	_, srv := enrolled(t, runner)
+
+	_, answer := postScript(t, srv, testSecret, map[string]any{
+		"script": "/usr/local/bin/freeze.sh --db", "timeoutSeconds": 45, "phase": "pre",
+	})
+	if !answer.OK {
+		t.Fatalf("script answer = %+v, want ok", answer)
+	}
+	if !strings.Contains(answer.Output, "frozen") || !strings.Contains(answer.Output, "warning: slow") {
+		t.Fatalf("script output = %q, want the combined stdout and stderr", answer.Output)
+	}
+	calls := runner.took()
+	if len(calls) != 1 {
+		t.Fatalf("the helper ran %d commands, want 1", len(calls))
+	}
+	if calls[0].Name != helper.ScriptShell {
+		t.Fatalf("script ran as %q, want %q", calls[0].Name, helper.ScriptShell)
+	}
+	if len(calls[0].Args) != 2 || calls[0].Args[0] != "-c" ||
+		calls[0].Args[1] != "/usr/local/bin/freeze.sh --db" {
+		t.Fatalf("script args = %q", calls[0].Args)
+	}
+}
+
+// A non-zero exit is reported in the body, not as a transport failure: the
+// output of a script that failed is exactly what the operator needs.
+func TestScriptFailureIsReportedWithItsOutput(t *testing.T) {
+	runner := &fakeRunner{stdout: []byte("locking\n"), stderr: "database is locked", err: fmt.Errorf("exit status 1")}
+	_, srv := enrolled(t, runner)
+
+	resp, answer := postScript(t, srv, testSecret, map[string]any{
+		"script": "/usr/local/bin/freeze.sh", "timeoutSeconds": 5, "phase": "pre",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /script = %d, want 200 with a failure body", resp.StatusCode)
+	}
+	if answer.OK {
+		t.Fatal("a failing script reported ok")
+	}
+	if !strings.Contains(answer.Error, "exit status 1") {
+		t.Fatalf("script error = %q", answer.Error)
+	}
+	if !strings.Contains(answer.Output, "database is locked") {
+		t.Fatalf("script output = %q, want the stderr tail", answer.Output)
+	}
+}
+
+// blockingRunner runs until its context is cancelled, which is what a script
+// that outlives its timeout does.
+type blockingRunner struct{}
+
+func (blockingRunner) Run(ctx context.Context, _ helper.Command) (string, error) {
+	<-ctx.Done()
+	return "", fmt.Errorf("signal: killed")
+}
+
+// TestScriptTimeoutKillsTheProcess: the timeout is enforced on the node, and
+// the answer says the script was killed rather than reporting a bare signal.
+func TestScriptTimeoutKillsTheProcess(t *testing.T) {
+	_, srv := enrolled(t, blockingRunner{})
+
+	started := time.Now()
+	_, answer := postScript(t, srv, testSecret, map[string]any{
+		"script": "sleep 600", "timeoutSeconds": 1, "phase": "post",
+	})
+	if answer.OK {
+		t.Fatal("a script that never returned reported ok")
+	}
+	if !strings.Contains(answer.Error, "timed out after 1s") {
+		t.Fatalf("timeout answer = %q, want it to say the script timed out", answer.Error)
+	}
+	if took := time.Since(started); took > 30*time.Second {
+		t.Fatalf("the timeout took %s to bite", took)
+	}
+}
+
+func TestScriptRequiresTheAccessSecret(t *testing.T) {
+	runner := &fakeRunner{}
+	_, srv := enrolled(t, runner)
+
+	resp, _ := postScript(t, srv, "wrong-secret", map[string]any{"script": "id"})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("POST /script with a bad secret = %d, want 401", resp.StatusCode)
+	}
+	if got := errorBody(t, resp); !strings.Contains(got, "invalid access secret") {
+		t.Fatalf("unauthorised body = %q", got)
+	}
+	if len(runner.took()) != 0 {
+		t.Fatal("an unauthorised request still ran a command")
+	}
+}
+
+func TestScriptRejectsAnEmptyBody(t *testing.T) {
+	runner := &fakeRunner{}
+	_, srv := enrolled(t, runner)
+
+	resp, _ := postScript(t, srv, testSecret, map[string]any{"script": "   "})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST /script with no script = %d, want 400", resp.StatusCode)
+	}
+	if len(runner.took()) != 0 {
+		t.Fatal("an empty script still ran a command")
+	}
+}

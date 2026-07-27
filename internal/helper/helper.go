@@ -470,6 +470,7 @@ func (h *Helper) Handler() http.Handler {
 	mux.HandleFunc("/healthz", h.handleHealth)
 	mux.HandleFunc("/export/", h.handleExport)
 	mux.HandleFunc("/import/", h.handleImport)
+	mux.HandleFunc("/script", h.handleScript)
 	return mux
 }
 
@@ -602,6 +603,124 @@ func (h *Helper) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 	h.log.Info("import finished", "vmid", vmid)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ---------------------------------------------------------------- policy scripts
+
+// ScriptShell is the interpreter a job policy's pre/post script is handed to.
+// The script is a shell command line, exactly as it would be typed on the node.
+const ScriptShell = "/bin/sh"
+
+// ScriptOutputTail bounds how much of a script's combined output is returned.
+// A chatty script keeps its last words and cannot exhaust the helper's memory.
+const ScriptOutputTail = 16 << 10
+
+// MaxScriptTimeout bounds what a caller may ask for, so a runaway script cannot
+// hold a node's helper open indefinitely.
+const MaxScriptTimeout = time.Hour
+
+// DefaultScriptTimeout applies when the request does not say.
+const DefaultScriptTimeout = 30 * time.Second
+
+// scriptRequest is the body of POST /script.
+type scriptRequest struct {
+	Script         string `json:"script"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
+	// Phase is "pre" or "post". It is used for logging only; the helper runs
+	// whatever it is handed.
+	Phase string `json:"phase"`
+}
+
+// scriptResponse is what the server reads back. Output is the combined
+// stdout/stderr tail — the point of running a script through ProxBack is that
+// what it said ends up in the run log.
+type scriptResponse struct {
+	OK     bool   `json:"ok"`
+	Output string `json:"output"`
+	Error  string `json:"error,omitempty"`
+}
+
+// handleScript runs one protection-policy script on the node and answers with
+// its combined output. Failure is reported in the body rather than as a
+// transport error, because the output of a script that failed is exactly what
+// the operator needs to see.
+//
+// The script body is never logged: it belongs to the operator and can carry
+// credentials. Only its output, its exit status and its duration are recorded.
+func (h *Helper) handleScript(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.authorized(r) {
+		writeErr(w, http.StatusUnauthorized, "invalid access secret")
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read request: "+err.Error())
+		return
+	}
+	var req scriptRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "decode request: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Script) == "" {
+		writeErr(w, http.StatusBadRequest, "script is required")
+		return
+	}
+	timeout := time.Duration(req.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = DefaultScriptTimeout
+	}
+	if timeout > MaxScriptTimeout {
+		timeout = MaxScriptTimeout
+	}
+	phase := req.Phase
+	if phase == "" {
+		phase = "script"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	out := &tailBuffer{max: ScriptOutputTail}
+	started := time.Now()
+	h.log.Info("policy script started", "phase", phase, "timeout", timeout)
+	stderr, runErr := h.runner.Run(ctx, Command{
+		Name: ScriptShell, Args: []string{"-c", req.Script}, Stdout: out,
+	})
+	took := time.Since(started).Round(time.Millisecond)
+	combined := joinOutput(out.String(), stderr)
+	if runErr != nil {
+		msg := runErr.Error()
+		// A killed process reports a bare "signal: killed"; say what killed it.
+		if ctx.Err() != nil {
+			msg = fmt.Sprintf("timed out after %s and was killed", timeout)
+		}
+		h.log.Error("policy script failed", "phase", phase, "took", took, "error", msg)
+		writeJSON(w, http.StatusOK, scriptResponse{Output: combined, Error: msg})
+		return
+	}
+	h.log.Info("policy script finished", "phase", phase, "took", took)
+	writeJSON(w, http.StatusOK, scriptResponse{OK: true, Output: combined})
+}
+
+// joinOutput merges what a script printed on stdout with what it printed on
+// stderr, keeping only the tail of the result.
+func joinOutput(stdout, stderr string) string {
+	parts := make([]string, 0, 2)
+	if s := strings.TrimSpace(stdout); s != "" {
+		parts = append(parts, s)
+	}
+	if s := strings.TrimSpace(stderr); s != "" {
+		parts = append(parts, s)
+	}
+	combined := strings.Join(parts, "\n")
+	if len(combined) > ScriptOutputTail {
+		combined = combined[len(combined)-ScriptOutputTail:]
+	}
+	return combined
 }
 
 // commandError renders a failed command as one operator-readable line.

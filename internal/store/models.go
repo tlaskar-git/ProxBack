@@ -141,9 +141,13 @@ type Agent struct {
 }
 
 // EnrollToken is a single-use enrollment token. Purpose is "agent" or "helper".
+// A helper token also carries the Proxmox host it was minted for, which is what
+// lets a node helper inherit its cluster identity at registration: the node
+// itself never has to know which cluster it belongs to.
 type EnrollToken struct {
 	Token     string     `json:"token"`
 	Purpose   string     `json:"-"`
+	HostID    string     `json:"-"`
 	CreatedAt time.Time  `json:"-"`
 	ExpiresAt time.Time  `json:"expiresAt"`
 	UsedAt    *time.Time `json:"-"`
@@ -152,12 +156,26 @@ type EnrollToken struct {
 // DefaultHelperPort is the port a node helper listens on unless told otherwise.
 const DefaultHelperPort = 8007
 
+// HelperUnassigned is the status of a node helper that is not bound to a
+// Proxmox host. Registrations written before helpers carried a host identity
+// migrate into it. Such a helper is never used to route backup or restore
+// traffic: two clusters can each contain a node called "pve1", so a bare node
+// name cannot say which physical machine is meant.
+const HelperUnassigned = "unassigned"
+
 // NodeHelper is an enrolled ProxBack node helper: the root daemon on a Proxmox
 // node that wraps vzdump/qmrestore for agentless VM image backup. AccessSecret
 // is the credential the server presents to the helper and is only populated by
 // accessors that decrypt it; it is never serialised.
+//
+// A helper is identified by (HostID, Node): the node name alone is ambiguous
+// across clusters. An empty HostID means the registration predates host
+// identity (or has been unbound) and must not be used for routing.
 type NodeHelper struct {
-	ID           string     `json:"id"`
+	ID string `json:"id"`
+	// HostID is the Proxmox host (cluster) the helper's node belongs to. Empty
+	// means unassigned.
+	HostID       string     `json:"hostId"`
 	Node         string     `json:"node"`
 	Address      string     `json:"address"`
 	Port         int        `json:"port"`
@@ -224,10 +242,16 @@ type Job struct {
 	TargetID string `json:"targetId"`
 	// Schedule is the structured schedule; the cron expression the scheduler
 	// runs on is derived from it by Schedule.Cron().
-	Schedule  Schedule   `json:"schedule"`
-	Retention int        `json:"retention"`
-	Enabled   bool       `json:"enabled"`
-	Sources   JobSources `json:"sources"`
+	Schedule Schedule `json:"schedule"`
+	// Retention is the GFS policy. A bare integer is still accepted on the wire
+	// and means keep-last-N.
+	Retention RetentionPolicy `json:"retention"`
+	// Policy is the optional protection policy. A job that never opened the
+	// Advanced protection step carries the defaults, which behave exactly as a
+	// job did before the policy existed.
+	Policy  JobPolicy  `json:"policy"`
+	Enabled bool       `json:"enabled"`
+	Sources JobSources `json:"sources"`
 	// TagFilter makes a vm job's membership dynamic: at run start it resolves to
 	// every cached guest carrying the tag, and Sources may then be empty. Empty
 	// means the job uses its static Sources.
@@ -250,6 +274,33 @@ const (
 	RunKindVerify  = "verify"
 )
 
+// RestoreMeta is where a restore run put (or was asked to put) its data. It is
+// persisted with the run so history can answer "where did this VM go?" without
+// reading a log line.
+type RestoreMeta struct {
+	// Mode is RestoreAlongside or RestoreOverwrite.
+	Mode     string `json:"mode"`
+	HostID   string `json:"hostId,omitempty"`
+	HostName string `json:"hostName,omitempty"`
+	Node     string `json:"node,omitempty"`
+	VMID     int    `json:"vmid,omitempty"`
+	Storage  string `json:"storage,omitempty"`
+	AgentID  string `json:"agentId,omitempty"`
+	DestPath string `json:"destPath,omitempty"`
+}
+
+// Restore modes. Overwrite is never the default: a restore that lands on an
+// existing guest destroys it.
+const (
+	RestoreAlongside = "alongside"
+	RestoreOverwrite = "overwrite"
+)
+
+// ValidRestoreMode reports whether v names a supported restore mode.
+func ValidRestoreMode(v string) bool {
+	return v == RestoreAlongside || v == RestoreOverwrite
+}
+
 // JobRun is one execution of a job (or a restore operation).
 type JobRun struct {
 	ID             string     `json:"id"`
@@ -261,10 +312,44 @@ type JobRun struct {
 	FinishedAt     *time.Time `json:"finishedAt,omitempty"`
 	BytesProcessed int64      `json:"bytesProcessed"`
 	BytesUploaded  int64      `json:"bytesUploaded"`
-	DedupRatio     float64    `json:"dedupRatio"`
-	Error          string     `json:"error,omitempty"`
-	ProgressPct    float64    `json:"progressPct"`
-	CurrentStep    string     `json:"currentStep"`
+	// DedupRatio is the reduction expressed as a fraction (0–1). It is kept for
+	// wire compatibility and is always ReductionPct/100 — the same source of
+	// truth, never an independently computed number.
+	DedupRatio float64 `json:"dedupRatio"`
+	// ReductionPct is the percentage of processed bytes that did not have to be
+	// uploaded, 0–100.
+	ReductionPct float64 `json:"reductionPct"`
+	// ReductionRatio is processed/uploaded, e.g. 4.0 for "4× reduction". It is
+	// absent when nothing was uploaded, because the ratio is then unbounded —
+	// which is exactly the case that used to be displayed as a nonsensical 1.0×.
+	ReductionRatio *float64 `json:"reductionRatio,omitempty"`
+	Error          string   `json:"error,omitempty"`
+	ProgressPct    float64  `json:"progressPct"`
+	CurrentStep    string   `json:"currentStep"`
+	// Restore is the persisted destination of a restore run; nil for every other
+	// kind of run.
+	Restore *RestoreMeta `json:"restore,omitempty"`
+}
+
+// applyReductionMetrics derives the data-reduction fields from the run's byte
+// counters. It is the single definition every reader sees: the API, the run
+// log and the dashboard all read numbers produced here rather than computing
+// their own, which is what stops a run from being 1.0× and 100% at once.
+//
+// Restores and verifications read only, so deduplication is meaningless for
+// them and all three fields stay zero/absent.
+func (r *JobRun) applyReductionMetrics() {
+	if r.Kind == RunKindRestore || r.Kind == RunKindVerify {
+		r.DedupRatio, r.ReductionPct, r.ReductionRatio = 0, 0, nil
+		return
+	}
+	r.ReductionPct = ReductionPct(r.BytesProcessed, r.BytesUploaded)
+	r.DedupRatio = r.ReductionPct / 100
+	if ratio, ok := ReductionRatio(r.BytesProcessed, r.BytesUploaded); ok {
+		r.ReductionRatio = &ratio
+	} else {
+		r.ReductionRatio = nil
+	}
 }
 
 // RunSource is one object a run walks — a VM for an agentless job, an agent for
@@ -275,9 +360,17 @@ type RunSource struct {
 	// appears nested inside its run.
 	RunID string `json:"-"`
 	// Seq is the source's position in the run, starting at 0.
-	Seq            int        `json:"seq"`
-	Name           string     `json:"name"`
-	Kind           string     `json:"kind"` // vm | agent
+	Seq  int    `json:"seq"`
+	Name string `json:"name"`
+	Kind string `json:"kind"` // vm | agent
+	// SourceID identifies the workload the row backed up: "<hostId>_<vmid>" for
+	// a guest, the agent id for a file backup. It is what makes a run source
+	// attributable to one workload when two clusters hold identically named VMs.
+	SourceID string `json:"sourceId,omitempty"`
+	// HostID and HostName name the cluster the guest lives in, so a row reads
+	// "cluster / name (vmid) / node" rather than just a node name.
+	HostID         string     `json:"hostId,omitempty"`
+	HostName       string     `json:"hostName,omitempty"`
 	Node           string     `json:"node,omitempty"`
 	Status         string     `json:"status"`
 	BytesProcessed int64      `json:"bytesProcessed"`
@@ -336,14 +429,28 @@ const (
 	SourceAgent = "agent"
 )
 
+// Verification results recorded on a restore point. A verification re-hashes
+// every stored chunk: it proves the stored data is intact, which is not the
+// same as proving a restore of it would boot. Nothing in ProxBack may claim
+// the latter until restore testing exists.
+const (
+	VerifyPassed = "passed"
+	VerifyFailed = "failed"
+)
+
 // Backup is a restore point.
 type Backup struct {
-	ID            string    `json:"id"`
-	JobID         string    `json:"jobId"`
-	RunID         string    `json:"-"`
-	SourceKind    string    `json:"sourceKind"`
-	SourceID      string    `json:"sourceId"`
-	SourceName    string    `json:"sourceName"`
+	ID         string `json:"id"`
+	JobID      string `json:"jobId"`
+	RunID      string `json:"-"`
+	SourceKind string `json:"sourceKind"`
+	SourceID   string `json:"sourceId"`
+	SourceName string `json:"sourceName"`
+	// HostID and HostName identify the Proxmox host (cluster) the guest lived
+	// in. Two clusters can hold identically named VMs, so a restore point is
+	// only unambiguous with them. Empty for agent restore points.
+	HostID        string    `json:"hostId,omitempty"`
+	HostName      string    `json:"hostName,omitempty"`
 	TargetID      string    `json:"targetId"`
 	CreatedAt     time.Time `json:"createdAt"`
 	SizeBytes     int64     `json:"sizeBytes"`
@@ -351,6 +458,12 @@ type Backup struct {
 	Kind          string    `json:"kind"`
 	ParentID      string    `json:"parentId,omitempty"`
 	Disks         []Disk    `json:"disks"`
+	// LastVerifiedAt, LastVerifyResult and VerifiedBytes are the evidence left
+	// by the most recent verification of this point. They describe integrity
+	// only — the chunks were re-read and re-hashed — never recoverability.
+	LastVerifiedAt   *time.Time `json:"lastVerifiedAt,omitempty"`
+	LastVerifyResult string     `json:"lastVerifyResult,omitempty"`
+	VerifiedBytes    int64      `json:"verifiedBytes"`
 }
 
 // Notification policies for the run webhook.

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Fingerprint, ServerCog, ShieldQuestion, Terminal } from 'lucide-react'
 import { deployFingerprintOf, deployHelper, errorMessage } from '../api'
+import type { Host } from '../api'
 import { Modal } from './Modal'
 import { useToast } from './Toast'
 import { Button, Field, Input, SectionNote, Select } from './ui'
@@ -18,18 +19,22 @@ export function DeployHelperModal({
   open,
   onClose,
   onDeployed,
-  nodes,
+  hosts,
+  nodesByHost,
   defaultAddress,
 }: {
   open: boolean
   onClose: () => void
   onDeployed: () => void
-  /** Node names discovered from the VM inventory, for the picker. */
-  nodes: string[]
+  /** Clusters this helper could belong to. A helper is keyed by (host, node). */
+  hosts: Host[]
+  /** Node names discovered from the inventory, per host id. */
+  nodesByHost: Record<string, string[]>
   /** Best-guess address (the Proxmox host's own address) to prefill. */
   defaultAddress?: string
 }) {
   const toast = useToast()
+  const [hostId, setHostId] = useState<string>('')
   const [node, setNode] = useState('')
   const [address, setAddress] = useState('')
   const [port, setPort] = useState('22')
@@ -43,7 +48,9 @@ export function DeployHelperModal({
 
   useEffect(() => {
     if (!open) return
-    setNode(nodes[0] ?? '')
+    const firstHost = String(hosts[0]?.id ?? '')
+    setHostId(firstHost)
+    setNode(nodesByHost[firstHost]?.[0] ?? '')
     setAddress(defaultAddress ?? '')
     setPort('22')
     setUsername('root')
@@ -53,12 +60,13 @@ export function DeployHelperModal({
     setError(null)
     setLog([])
     setSubmitting(false)
-  }, [open, nodes, defaultAddress])
+  }, [open, hosts, nodesByHost, defaultAddress])
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setError(null)
 
+    if (!hostId) return setError('Choose which cluster this node belongs to.')
     if (!node.trim()) return setError('Choose which Proxmox node to deploy to.')
     if (!address.trim()) return setError("Enter the node's SSH address.")
     if (!username.trim()) return setError('Enter the SSH username (usually root).')
@@ -67,6 +75,7 @@ export function DeployHelperModal({
     setSubmitting(true)
     try {
       const result = await deployHelper({
+        hostId,
         node: node.trim(),
         address: address.trim(),
         port: Number(port) || 22,
@@ -125,12 +134,35 @@ export function DeployHelperModal({
       }
     >
       <form id="deploy-helper-form" className="space-y-4" onSubmit={(e) => void submit(e)} noValidate>
+        {/* Cluster first: a helper is identified by (cluster, node), because
+            two clusters can each contain a node called pve1. */}
+        <Field label="Cluster">
+          {({ id }) => (
+            <Select
+              id={id}
+              value={hostId}
+              onChange={(event) => {
+                const next = event.target.value
+                setHostId(next)
+                setNode(nodesByHost[next]?.[0] ?? '')
+              }}
+            >
+              <option value="">Select a host…</option>
+              {hosts.map((host) => (
+                <option key={String(host.id)} value={String(host.id)}>
+                  {host.name}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Proxmox node" hint="Matched against the node names in your inventory.">
+          <Field label="Proxmox node">
             {({ id }) =>
-              nodes.length > 0 ? (
+              (nodesByHost[hostId] ?? []).length > 0 ? (
                 <Select id={id} value={node} onChange={(event) => setNode(event.target.value)}>
-                  {nodes.map((name) => (
+                  {(nodesByHost[hostId] ?? []).map((name) => (
                     <option key={name} value={name}>
                       {name}
                     </option>
@@ -140,7 +172,7 @@ export function DeployHelperModal({
                 <Input
                   id={id}
                   value={node}
-                  placeholder="pve-node-1"
+                  placeholder="pve1"
                   onChange={(event) => setNode(event.target.value)}
                 />
               )
@@ -204,16 +236,16 @@ export function DeployHelperModal({
         </Field>
 
         {fingerprint ? (
-          <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3">
-            <p className="flex items-center gap-2 text-sm font-medium text-amber-200">
+          <div className="space-y-2 rounded-lg border border-warn-500/30 bg-warn-500/10 px-4 py-3">
+            <p className="flex items-center gap-2 text-sm font-medium text-warn-200">
               <ShieldQuestion className="size-4" aria-hidden />
               Confirm this node’s SSH host key
             </p>
-            <p className="flex items-center gap-2 font-mono text-xs break-all text-amber-100">
+            <p className="flex items-center gap-2 font-mono text-xs break-all text-warn-100">
               <Fingerprint className="size-3.5 shrink-0" aria-hidden />
               {fingerprint}
             </p>
-            <p className="text-xs text-amber-300/90">
+            <p className="text-xs text-warn-300/90">
               Compare it with the node’s own key (run{' '}
               <code className="font-mono">ssh-keyscan -t ed25519 {address || 'node'}</code> or check
               the Proxmox console), then press Trust and install. Nothing has been executed yet.
@@ -230,7 +262,7 @@ export function DeployHelperModal({
         )}
 
         {error ? (
-          <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+          <p className="rounded-lg border border-fail-500/30 bg-fail-500/10 px-3.5 py-2.5 text-xs text-fail-300">
             {error}
           </p>
         ) : null}

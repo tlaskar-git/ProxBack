@@ -1,7 +1,14 @@
 import type { ReactNode } from 'react'
-import { ShieldCheck } from 'lucide-react'
+import { BrandMark } from '../components/Brand'
+import { ThemeToggle } from '../theme'
 
-/** Centred card used by the Setup and Login screens. */
+/**
+ * Centred card used by the Setup and Login screens.
+ *
+ * No glow behind it. The mark and one rule carry the identity — a sign-in
+ * screen dressed as a product landing page was a large part of why this
+ * console read as anonymous.
+ */
 export function AuthShell({
   title,
   subtitle,
@@ -14,22 +21,20 @@ export function AuthShell({
   footer?: ReactNode
 }) {
   return (
-    <div className="relative flex min-h-full items-center justify-center overflow-hidden bg-slate-950 px-4 py-12">
-      <div
-        className="pointer-events-none absolute -top-40 left-1/2 size-[36rem] -translate-x-1/2 rounded-full bg-accent-500/10 blur-3xl"
-        aria-hidden
-      />
-      <div className="relative w-full max-w-md">
+    <div className="relative flex min-h-full items-center justify-center bg-slate-950 px-4 py-12">
+      <div className="absolute top-4 right-4">
+        <ThemeToggle />
+      </div>
+
+      <div className="w-full max-w-md">
         <div className="mb-7 flex flex-col items-center text-center">
-          <div className="mb-3.5 flex size-11 items-center justify-center rounded-xl bg-accent-500/15 text-accent-400 ring-1 ring-accent-500/30">
-            <ShieldCheck className="size-5" aria-hidden />
-          </div>
-          <p className="text-lg font-semibold tracking-tight text-white">ProxBack</p>
-          <p className="text-xs text-slate-500">Backup &amp; replication for Proxmox VE</p>
+          <BrandMark className="mb-3 size-8 text-accent-400" title="ProxBack" />
+          <p className="text-lg font-semibold tracking-tight text-slate-50">ProxBack</p>
+          <p className="text-xs text-slate-500">Backup and recovery for Proxmox VE</p>
         </div>
 
-        <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-6 shadow-2xl shadow-black/40 backdrop-blur-sm">
-          <h1 className="text-base font-semibold text-white">{title}</h1>
+        <div className="rounded-xl border border-slate-800 bg-slate-900 p-6 elev-2">
+          <h1 className="text-base font-semibold text-slate-50">{title}</h1>
           <p className="mt-1 text-sm text-slate-400">{subtitle}</p>
           <div className="mt-6">{children}</div>
         </div>

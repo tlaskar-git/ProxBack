@@ -29,6 +29,12 @@ var (
 )
 
 // Dispatch is a work item handed to an agent on heartbeat.
+//
+// The protection-policy fields travel with the work because the work happens
+// inside the guest: the file walk, the exclusions and the pre/post scripts all
+// run where the files are, and the server has no vantage point from which to
+// apply them. An agent that predates them ignores them, which is why the run
+// log records them as sent rather than as applied.
 type Dispatch struct {
 	RunID     string   `json:"runId"`
 	Type      string   `json:"type"` // backup | restore
@@ -37,6 +43,16 @@ type Dispatch struct {
 	Paths     []string `json:"paths,omitempty"`
 	DestPath  string   `json:"destPath,omitempty"`
 	ChunkSize int64    `json:"chunkSize"`
+	// ExcludePaths are glob patterns the walk must skip. The syntax is
+	// store.MatchGlob's: filepath.Match per segment, plus "**" for any number of
+	// segments.
+	ExcludePaths []string `json:"excludePaths,omitempty"`
+	// PreScript runs before the walk starts and PostScript after it finishes;
+	// a failing pre-script must abort the backup before any data is read.
+	PreScript  string `json:"preScript,omitempty"`
+	PostScript string `json:"postScript,omitempty"`
+	// ScriptTimeoutSeconds bounds each of them.
+	ScriptTimeoutSeconds int `json:"scriptTimeoutSeconds,omitempty"`
 }
 
 // Dispatch types.
@@ -93,7 +109,8 @@ func (m *Manager) CreateEnrollToken(ctx context.Context) (*store.EnrollToken, er
 	if err != nil {
 		return nil, err
 	}
-	return m.st.CreateEnrollToken(ctx, tok, store.EnrollPurposeAgent, auth.EnrollTokenTTL)
+	// An agent belongs to no Proxmox host, so its token carries none.
+	return m.st.CreateEnrollToken(ctx, tok, store.EnrollPurposeAgent, "", auth.EnrollTokenTTL)
 }
 
 // RegisterRequest is the body of POST /api/agents/register.
@@ -245,20 +262,30 @@ type BackupRequest struct {
 	JobID   string
 	JobName string
 	Paths   []string
-	Engine  *engine.Engine
-	Session *engine.Session
+	// ExcludePaths, PreScript, PostScript and ScriptTimeoutSeconds are the parts
+	// of the job's protection policy that only the agent can carry out.
+	ExcludePaths         []string
+	PreScript            string
+	PostScript           string
+	ScriptTimeoutSeconds int
+	Engine               *engine.Engine
+	Session              *engine.Session
 }
 
 // RunBackup dispatches a file backup to the agent and blocks until the agent
 // reports completion, failure, or the context is done.
 func (m *Manager) RunBackup(ctx context.Context, req BackupRequest) (Result, error) {
 	d := Dispatch{
-		RunID:     req.RunID,
-		Type:      DispatchBackup,
-		JobID:     req.JobID,
-		JobName:   req.JobName,
-		Paths:     req.Paths,
-		ChunkSize: engine.ChunkSize,
+		RunID:                req.RunID,
+		Type:                 DispatchBackup,
+		JobID:                req.JobID,
+		JobName:              req.JobName,
+		Paths:                req.Paths,
+		ChunkSize:            engine.ChunkSize,
+		ExcludePaths:         req.ExcludePaths,
+		PreScript:            req.PreScript,
+		PostScript:           req.PostScript,
+		ScriptTimeoutSeconds: req.ScriptTimeoutSeconds,
 	}
 	rs := &runState{dispatch: d, agentID: req.AgentID, eng: req.Engine, sess: req.Session, done: make(chan Result, 1)}
 	m.enqueue(req.AgentID, d, rs)

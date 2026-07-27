@@ -291,7 +291,7 @@ func TestJobScheduleRoundTrip(t *testing.T) {
 	} {
 		job, err := st.CreateJob(ctx, &store.Job{
 			Name: "sched-" + want.Kind, Kind: store.SourceVM, TargetID: "t1",
-			Schedule: want, Retention: 3, Enabled: true,
+			Schedule: want, Retention: store.KeepLast(3), Enabled: true,
 			Sources: store.JobSources{{HostID: "h1", VMID: 100}},
 		})
 		if err != nil {

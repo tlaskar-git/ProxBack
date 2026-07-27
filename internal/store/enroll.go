@@ -17,15 +17,17 @@ const (
 )
 
 // CreateEnrollToken stores a single-use enrollment token for one purpose.
-func (s *Store) CreateEnrollToken(ctx context.Context, token, purpose string, ttl time.Duration) (*EnrollToken, error) {
+// hostID binds a helper token to the Proxmox host the node belongs to; it is
+// empty for agent tokens.
+func (s *Store) CreateEnrollToken(ctx context.Context, token, purpose, hostID string, ttl time.Duration) (*EnrollToken, error) {
 	if purpose == "" {
 		purpose = EnrollPurposeAgent
 	}
 	now := Now()
-	et := &EnrollToken{Token: token, Purpose: purpose, CreatedAt: now, ExpiresAt: now.Add(ttl)}
+	et := &EnrollToken{Token: token, Purpose: purpose, HostID: hostID, CreatedAt: now, ExpiresAt: now.Add(ttl)}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO enroll_tokens (token, created_at, expires_at, used_at, purpose) VALUES (?,?,?,NULL,?)`,
-		et.Token, fmtTime(et.CreatedAt), fmtTime(et.ExpiresAt), et.Purpose)
+		`INSERT INTO enroll_tokens (token, created_at, expires_at, used_at, purpose, host_id) VALUES (?,?,?,NULL,?,?)`,
+		et.Token, fmtTime(et.CreatedAt), fmtTime(et.ExpiresAt), et.Purpose, et.HostID)
 	if err != nil {
 		return nil, fmt.Errorf("create enroll token: %w", err)
 	}
@@ -38,8 +40,8 @@ func (s *Store) EnrollTokenByValue(ctx context.Context, token string) (*EnrollTo
 	var created, expires string
 	var used sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT token, created_at, expires_at, used_at, purpose FROM enroll_tokens WHERE token = ?`, token).
-		Scan(&et.Token, &created, &expires, &used, &et.Purpose)
+		`SELECT token, created_at, expires_at, used_at, purpose, host_id FROM enroll_tokens WHERE token = ?`, token).
+		Scan(&et.Token, &created, &expires, &used, &et.Purpose, &et.HostID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -55,6 +57,14 @@ func (s *Store) EnrollTokenByValue(ctx context.Context, token string) (*EnrollTo
 // ConsumeEnrollToken atomically marks an unused, unexpired token of the given
 // purpose as used.
 func (s *Store) ConsumeEnrollToken(ctx context.Context, token, purpose string) error {
+	_, err := s.ConsumeEnrollTokenFor(ctx, token, purpose)
+	return err
+}
+
+// ConsumeEnrollTokenFor consumes a token and returns it, so the caller can read
+// what the token was minted for — for a helper token, the Proxmox host whose
+// identity the registering node inherits.
+func (s *Store) ConsumeEnrollTokenFor(ctx context.Context, token, purpose string) (*EnrollToken, error) {
 	if purpose == "" {
 		purpose = EnrollPurposeAgent
 	}
@@ -64,10 +74,10 @@ func (s *Store) ConsumeEnrollToken(ctx context.Context, token, purpose string) e
 		 WHERE token = ? AND purpose = ? AND used_at IS NULL AND expires_at > ?`,
 		now, token, purpose, now)
 	if err != nil {
-		return fmt.Errorf("consume enroll token: %w", err)
+		return nil, fmt.Errorf("consume enroll token: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
-	return nil
+	return s.EnrollTokenByValue(ctx, token)
 }

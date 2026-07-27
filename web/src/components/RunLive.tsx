@@ -1,5 +1,6 @@
-import { CheckCircle2, CircleDashed, Gauge, MinusCircle, Server, XCircle } from 'lucide-react'
+import { CheckCircle2, CircleDashed, Gauge, MinusCircle, XCircle } from 'lucide-react'
 import type { ReactNode } from 'react'
+import { reductionOf } from '../api'
 import type { RunDetail, RunSource, RunSourceStatus } from '../api'
 import { cn } from '../lib/cn'
 import {
@@ -8,9 +9,11 @@ import {
   formatBytes,
   formatDuration,
   formatRatio,
+  formatReduction,
   formatSeconds,
   formatThroughput,
 } from '../lib/format'
+import { WorkloadIdentity } from './Identity'
 import { ArcProgress, LiveDot, Num, ProgressBar, Sparkline } from './ui'
 import type { PillTone } from './ui'
 
@@ -31,25 +34,25 @@ export function appendSample(samples: number[] | undefined, value: number): numb
 }
 
 /* ---------------------------------------------------------------------------
- * Per-source rows — the "objects in this session" view
+ * Per-workload rows — the "workloads in this run" view
  * ------------------------------------------------------------------------- */
 
 const SOURCE_TONE: Record<RunSourceStatus, PillTone> = {
-  pending: 'slate',
-  running: 'blue',
-  success: 'green',
-  failed: 'red',
-  skipped: 'slate',
+  pending: 'neutral',
+  running: 'brand',
+  success: 'ok',
+  failed: 'fail',
+  skipped: 'neutral',
 }
 
 function SourceGlyph({ status }: { status: RunSourceStatus }) {
   switch (status) {
     case 'success':
-      return <CheckCircle2 className="size-4 text-emerald-400" aria-hidden />
+      return <CheckCircle2 className="size-4 text-ok-400" aria-hidden />
     case 'failed':
-      return <XCircle className="size-4 text-red-400" aria-hidden />
+      return <XCircle className="size-4 text-fail-400" aria-hidden />
     case 'running':
-      return <LiveDot tone="blue" className="mx-1" />
+      return <LiveDot tone="brand" className="mx-1" />
     case 'skipped':
       return <MinusCircle className="size-4 text-slate-600" aria-hidden />
     default:
@@ -78,7 +81,7 @@ function SourceRow({ source }: { source: RunSource }) {
         running
           ? 'border-l-accent-400 bg-accent-500/[0.06]'
           : source.status === 'failed'
-            ? 'border-l-red-500/60'
+            ? 'border-l-fail-500/60'
             : 'border-l-transparent',
         // Queued work is present but recessive — the eye should land on the
         // object currently moving, not on the six waiting behind it.
@@ -90,22 +93,17 @@ function SourceRow({ source }: { source: RunSource }) {
           <span className="flex size-4 shrink-0 items-center justify-center">
             <SourceGlyph status={source.status} />
           </span>
-          <div className="min-w-0">
-            <p
-              className={cn(
-                'truncate text-[13px] leading-4',
-                running ? 'font-medium text-white' : 'text-slate-200',
-              )}
-            >
-              {source.name}
-            </p>
-            {source.node ? (
-              <p className="mt-0.5 flex items-center gap-1 text-micro text-slate-500">
-                <Server className="size-2.5" aria-hidden />
-                <span className="truncate font-mono">{source.node}</span>
-              </p>
-            ) : null}
-          </div>
+          {/* Canonical identity, so a run spanning two clusters never shows
+              two rows that look like the same guest. */}
+          <WorkloadIdentity
+            emphasis={running ? 'strong' : 'normal'}
+            workload={{
+              hostName: source.hostName,
+              name: source.name,
+              vmid: source.vmid,
+              node: source.node,
+            }}
+          />
         </div>
       </td>
 
@@ -127,7 +125,7 @@ function SourceRow({ source }: { source: RunSource }) {
           </Num>
         </div>
         {source.error ? (
-          <p className="mt-1 truncate text-micro text-red-400/90" title={source.error}>
+          <p className="mt-1 truncate text-micro text-fail-400/90" title={source.error}>
             {source.error}
           </p>
         ) : null}
@@ -140,7 +138,7 @@ function SourceRow({ source }: { source: RunSource }) {
         <Num className="text-meta text-slate-300">{formatBytes(source.bytesProcessed)}</Num>
       </td>
       <td className="px-3 py-2 text-right align-middle whitespace-nowrap">
-        <Num className={cn('text-meta', done && saved > 0 ? 'text-emerald-400' : 'text-slate-500')}>
+        <Num className={cn('text-meta', done && saved > 0 ? 'text-ok-400' : 'text-slate-500')}>
           {done || running ? formatBytes(saved) : '—'}
         </Num>
       </td>
@@ -149,9 +147,9 @@ function SourceRow({ source }: { source: RunSource }) {
           className={cn(
             'text-meta',
             source.status === 'failed'
-              ? 'text-red-300'
+              ? 'text-fail-300'
               : source.status === 'success'
-                ? 'text-emerald-300'
+                ? 'text-ok-300'
                 : running
                   ? 'text-accent-300'
                   : 'text-slate-500',
@@ -179,7 +177,7 @@ export function SourceBreakdown({
   if (sources.length === 0) {
     return (
       <p className={cn('well px-4 py-6 text-center text-meta text-slate-500', className)}>
-        No per-object breakdown for this run. Runs from earlier versions did not record one.
+        This run has not reported any workloads yet.
       </p>
     )
   }
@@ -192,7 +190,7 @@ export function SourceBreakdown({
         <thead>
           <tr className="border-b border-slate-800/80 text-left text-micro tracking-wide text-slate-600 uppercase">
             <th scope="col" className="py-2 pr-3 pl-3 font-semibold">
-              Object
+              Workload
             </th>
             <th scope="col" className="px-3 py-2 font-semibold">
               Progress
@@ -201,10 +199,10 @@ export function SourceBreakdown({
               Size
             </th>
             <th scope="col" className="px-3 py-2 text-right font-semibold">
-              Read
+              Source data processed
             </th>
             <th scope="col" className="px-3 py-2 text-right font-semibold">
-              Deduped
+              Avoided
             </th>
             <th scope="col" className="px-3 py-2 text-right font-semibold">
               State
@@ -243,7 +241,7 @@ function Figure({
           tone === 'accent'
             ? 'text-accent-300'
             : tone === 'positive'
-              ? 'text-emerald-400'
+              ? 'text-ok-400'
               : 'text-slate-100',
         )}
       >
@@ -289,6 +287,7 @@ export function LiveRunCard({
 
   const active = sources.find((source) => source.status === 'running')
   const peak = samples.length > 0 ? Math.max(...samples) : 0
+  const reduction = reductionOf(detail)
 
   return (
     <section className="overflow-hidden rounded-xl border border-slate-700/70 bg-slate-900/80 elev-2">
@@ -298,8 +297,8 @@ export function LiveRunCard({
 
       <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-slate-800/80 px-5 py-3">
         <div className="flex min-w-0 items-center gap-2.5">
-          <LiveDot tone="blue" />
-          <h2 className="truncate text-[15px] leading-5 font-semibold tracking-tight text-white">
+          <LiveDot tone="brand" />
+          <h2 className="truncate text-[15px] leading-5 font-semibold tracking-tight text-slate-50">
             {detail.jobName}
           </h2>
         </div>
@@ -320,10 +319,10 @@ export function LiveRunCard({
       <div className="flex flex-col gap-6 px-5 py-5 lg:flex-row lg:items-center">
         <ArcProgress
           value={detail.progressPct}
-          tone={failed > 0 ? 'amber' : 'blue'}
+          tone={failed > 0 ? 'warn' : 'brand'}
           ariaLabel={`${detail.jobName} is ${clampPct(detail.progressPct).toFixed(0)} percent complete`}
           label={
-            <span className="figure-lg text-[34px] leading-9 text-white">
+            <span className="figure-lg text-[34px] leading-9 text-slate-50">
               {clampPct(detail.progressPct).toFixed(0)}
               <span className="ml-0.5 text-lg text-slate-500">%</span>
             </span>
@@ -354,7 +353,7 @@ export function LiveRunCard({
               </div>
               <p className="text-meta text-slate-500">
                 peak <Num className="text-slate-400">{formatThroughput(peak)}</Num>
-                <span className="mx-1.5 text-slate-700">·</span>
+                <span className="mx-1.5 text-slate-600" aria-hidden>&middot;</span>
                 last{' '}
                 <Num className="text-slate-400">
                   {Math.round((samples.length * sampleIntervalMs) / 1000)}
@@ -376,17 +375,19 @@ export function LiveRunCard({
               value={remaining === null ? 'estimating' : formatSeconds(remaining)}
               tone="accent"
             />
-            <Figure label="Read" value={formatBytes(detail.bytesProcessed)} />
+            <Figure label="Source data processed" value={formatBytes(detail.bytesProcessed)} />
             <Figure
-              label="Uploaded"
+              label="Transferred to target"
               value={
                 <>
                   {formatBytes(detail.bytesUploaded)}
-                  {detail.dedupRatio > 1 ? (
-                    <span className="ml-1.5 text-meta font-normal text-emerald-400">
-                      {formatRatio(detail.dedupRatio)}
-                    </span>
-                  ) : null}
+                  {/* The ratio only appears when one exists; a run that has
+                      uploaded nothing is 100% avoided, not "1.0×". */}
+                  <span className="ml-1.5 text-meta font-normal text-slate-500">
+                    {reduction.ratio === null
+                      ? formatReduction(reduction.pct)
+                      : formatRatio(reduction.ratio)}
+                  </span>
                 </>
               }
             />
@@ -396,14 +397,14 @@ export function LiveRunCard({
 
       <div className="border-t border-slate-800/80 bg-slate-950/30 px-5 py-4">
         <div className="mb-2.5 flex flex-wrap items-center gap-x-3 gap-y-1">
-          <h3 className="eyebrow text-slate-400">Objects in this session</h3>
+          <h3 className="eyebrow text-slate-400">Workloads in this run</h3>
           <span className="hidden h-px min-w-8 flex-1 bg-slate-800/80 sm:block" aria-hidden />
           {sources.length > 0 ? (
             <span className="text-meta text-slate-500">
               <Num className="text-slate-300">{finished}</Num> of{' '}
               <Num className="text-slate-300">{sources.length}</Num> complete
               {failed > 0 ? (
-                <span className="ml-2 text-red-400">
+                <span className="ml-2 text-fail-400">
                   <Num>{failed}</Num> failed
                 </span>
               ) : null}

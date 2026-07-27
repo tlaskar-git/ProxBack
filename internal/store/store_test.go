@@ -170,7 +170,7 @@ func TestJobSourcesAcceptObjectOrArray(t *testing.T) {
 	}
 
 	job, err := st.CreateJob(ctx, &store.Job{
-		Name: "j", Kind: store.SourceVM, TargetID: "t", Retention: 3, Enabled: true,
+		Name: "j", Kind: store.SourceVM, TargetID: "t", Retention: store.KeepLast(3), Enabled: true,
 		Sources: sources,
 	})
 	if err != nil {
@@ -460,13 +460,13 @@ func TestHelperCRUD(t *testing.T) {
 	if n, err := st.CountHelpers(ctx); err != nil || n != 0 {
 		t.Fatalf("CountHelpers on a fresh install = %d (%v)", n, err)
 	}
-	if _, err := st.HelperByNode(ctx, "pve1"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("HelperByNode on a fresh install = %v, want ErrNotFound", err)
+	if _, err := st.HelperFor(ctx, "host-a", "pve1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("HelperFor on a fresh install = %v, want ErrNotFound", err)
 	}
 
 	seen := time.Now().UTC().Truncate(time.Millisecond)
 	h, err := st.CreateHelper(ctx, &store.NodeHelper{
-		Node: "pve1", Address: "10.0.0.11", Port: 8007, Version: "0.3.0",
+		HostID: "host-a", Node: "pve1", Address: "10.0.0.11", Port: 8007, Version: "0.3.0",
 		AccessSecret: "helper-access-secret-abc", APIKeyHash: "hash-1", LastSeen: &seen,
 	})
 	if err != nil {
@@ -477,7 +477,7 @@ func TestHelperCRUD(t *testing.T) {
 	}
 	// A port left unset falls back to the well-known one.
 	other, err := st.CreateHelper(ctx, &store.NodeHelper{
-		Node: "pve2", Address: "10.0.0.12", Version: "0.3.0",
+		HostID: "host-a", Node: "pve2", Address: "10.0.0.12", Version: "0.3.0",
 		AccessSecret: "helper-access-secret-def", APIKeyHash: "hash-2",
 	})
 	if err != nil {
@@ -498,9 +498,13 @@ func TestHelperCRUD(t *testing.T) {
 		t.Fatalf("access secret round trip = %q", list[0].AccessSecret)
 	}
 
-	byNode, err := st.HelperByNode(ctx, "pve2")
+	byNode, err := st.HelperFor(ctx, "host-a", "pve2")
 	if err != nil || byNode.ID != other.ID {
-		t.Fatalf("HelperByNode = %+v (%v)", byNode, err)
+		t.Fatalf("HelperFor = %+v (%v)", byNode, err)
+	}
+	// The node name alone resolves nothing: it is only half of the identity.
+	if _, err := st.HelperFor(ctx, "", "pve2"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("HelperFor with no host = %v, want ErrNotFound", err)
 	}
 	byKey, err := st.HelperByKeyHash(ctx, "hash-1")
 	if err != nil || byKey.ID != h.ID || byKey.AccessSecret != "helper-access-secret-abc" {
@@ -526,9 +530,10 @@ func TestHelperCRUD(t *testing.T) {
 		t.Fatalf("lastSeen = %v, want %v", touched.LastSeen, beat)
 	}
 
-	// Re-enrolling a node replaces its registration rather than duplicating it.
+	// Re-enrolling a node of the same host replaces its registration rather than
+	// duplicating it.
 	replaced, err := st.CreateHelper(ctx, &store.NodeHelper{
-		Node: "pve1", Address: "10.0.0.99", Port: 8107, Version: "0.4.0",
+		HostID: "host-a", Node: "pve1", Address: "10.0.0.99", Port: 8107, Version: "0.4.0",
 		AccessSecret: "helper-access-secret-new", APIKeyHash: "hash-3",
 	})
 	if err != nil {
@@ -543,9 +548,34 @@ func TestHelperCRUD(t *testing.T) {
 	if _, err := st.HelperByKeyHash(ctx, "hash-1"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("old api key for pve1 still authenticates: %v", err)
 	}
-	current, err := st.HelperByNode(ctx, "pve1")
+	current, err := st.HelperFor(ctx, "host-a", "pve1")
 	if err != nil || current.ID != replaced.ID || current.Address != "10.0.0.99" || current.Port != 8107 {
 		t.Fatalf("pve1 helper after re-enrollment = %+v (%v)", current, err)
+	}
+
+	// A second cluster's identically named node is a different helper, and
+	// enrolling it leaves the first one alone. This is the collision that could
+	// otherwise send a backup to the wrong physical machine.
+	clusterB, err := st.CreateHelper(ctx, &store.NodeHelper{
+		HostID: "host-b", Node: "pve1", Address: "10.9.9.11", Port: 8007, Version: "0.5.0",
+		AccessSecret: "helper-access-secret-b", APIKeyHash: "hash-b",
+	})
+	if err != nil {
+		t.Fatalf("enroll the other cluster's pve1: %v", err)
+	}
+	if n, err := st.CountHelpers(ctx); err != nil || n != 3 {
+		t.Fatalf("CountHelpers with two clusters = %d (%v), want 3", n, err)
+	}
+	stillThere, err := st.HelperFor(ctx, "host-a", "pve1")
+	if err != nil || stillThere.ID != replaced.ID || stillThere.Address != "10.0.0.99" {
+		t.Fatalf("host-a pve1 after host-b enrolled its own pve1 = %+v (%v)", stillThere, err)
+	}
+	otherCluster, err := st.HelperFor(ctx, "host-b", "pve1")
+	if err != nil || otherCluster.ID != clusterB.ID || otherCluster.Address != "10.9.9.11" {
+		t.Fatalf("host-b pve1 = %+v (%v)", otherCluster, err)
+	}
+	if err := st.DeleteHelper(ctx, clusterB.ID); err != nil {
+		t.Fatalf("delete the other cluster's helper: %v", err)
 	}
 
 	if err := st.DeleteHelper(ctx, replaced.ID); err != nil {
@@ -572,14 +602,14 @@ func TestEnrollTokenPurposesAreSeparate(t *testing.T) {
 	ctx := context.Background()
 	st, _ := open(t)
 
-	agentTok, err := st.CreateEnrollToken(ctx, "tok-agent", store.EnrollPurposeAgent, time.Hour)
+	agentTok, err := st.CreateEnrollToken(ctx, "tok-agent", store.EnrollPurposeAgent, "", time.Hour)
 	if err != nil {
 		t.Fatalf("create agent token: %v", err)
 	}
 	if agentTok.Purpose != store.EnrollPurposeAgent || agentTok.ExpiresAt.Before(agentTok.CreatedAt) {
 		t.Fatalf("agent token = %+v", agentTok)
 	}
-	if _, err := st.CreateEnrollToken(ctx, "tok-helper", store.EnrollPurposeHelper, time.Hour); err != nil {
+	if _, err := st.CreateEnrollToken(ctx, "tok-helper", store.EnrollPurposeHelper, "host-a", time.Hour); err != nil {
 		t.Fatalf("create helper token: %v", err)
 	}
 
@@ -607,7 +637,7 @@ func TestEnrollTokenPurposesAreSeparate(t *testing.T) {
 	}
 
 	// Expired tokens are refused.
-	if _, err := st.CreateEnrollToken(ctx, "tok-stale", store.EnrollPurposeHelper, -time.Minute); err != nil {
+	if _, err := st.CreateEnrollToken(ctx, "tok-stale", store.EnrollPurposeHelper, "host-a", -time.Minute); err != nil {
 		t.Fatalf("create expired token: %v", err)
 	}
 	if err := st.ConsumeEnrollToken(ctx, "tok-stale", store.EnrollPurposeHelper); !errors.Is(err, store.ErrNotFound) {
@@ -796,8 +826,31 @@ func TestMigrationUpgradesOldDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load legacy job: %v", err)
 	}
-	if job.Name != "legacy-nightly" || job.Retention != 5 || !job.Enabled {
+	if job.Name != "legacy-nightly" || !job.Enabled {
 		t.Fatalf("legacy job changed: %+v", job)
+	}
+	// The integer retention becomes the GFS object that prunes exactly what it
+	// pruned before, and a job written before policies existed carries the
+	// defaults — i.e. behaves precisely as it did.
+	if job.Retention != (store.RetentionPolicy{KeepLast: 5}) {
+		t.Fatalf("legacy retention = %+v, want keepLast 5 and nothing else", job.Retention)
+	}
+	if !job.Policy.IsDefault() {
+		t.Fatalf("legacy policy = %+v, want the defaults", job.Policy)
+	}
+	if job.Policy.RetryDelayMinutes != store.DefaultRetryDelayMinutes ||
+		job.Policy.ScriptTimeoutSeconds != store.DefaultScriptTimeoutSecs ||
+		job.Policy.Quiesce != store.QuiesceNone || job.Policy.Window != nil {
+		t.Fatalf("legacy policy defaults = %+v", job.Policy)
+	}
+	// The object column really was written, so the next open has nothing to do.
+	var stored string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT retention_policy FROM jobs WHERE id = 'j1'`).Scan(&stored); err != nil {
+		t.Fatalf("read migrated retention column: %v", err)
+	}
+	if !strings.HasPrefix(stored, "{") || !strings.Contains(stored, `"keepLast":5`) {
+		t.Fatalf("migrated retention column = %q, want the object form", stored)
 	}
 	// "0 3 * * *" is a daily 03:00 backup, so it becomes the preset rather than
 	// a custom expression — and, crucially, keeps firing at exactly 03:00.
@@ -894,12 +947,12 @@ func TestMigrationUpgradesOldDatabase(t *testing.T) {
 	}
 	// And the new table is writable on the upgraded database.
 	if _, err := st.CreateHelper(ctx, &store.NodeHelper{
-		Node: "pve1", Address: "10.0.0.11", Version: "0.3.0",
+		HostID: "h1", Node: "pve1", Address: "10.0.0.11", Version: "0.3.0",
 		AccessSecret: "s", APIKeyHash: "h",
 	}); err != nil {
 		t.Fatalf("create helper on the upgraded database: %v", err)
 	}
-	if upgraded, err := st.HelperByNode(ctx, "pve1"); err != nil || upgraded.Port != store.DefaultHelperPort {
+	if upgraded, err := st.HelperFor(ctx, "h1", "pve1"); err != nil || upgraded.Port != store.DefaultHelperPort {
 		t.Fatalf("helper on the upgraded database = %+v (%v)", upgraded, err)
 	}
 	// A run on the upgraded database can log, and its log is readable back.

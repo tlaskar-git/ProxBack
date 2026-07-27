@@ -18,7 +18,12 @@ import (
 )
 
 type helperDTO struct {
-	ID           string     `json:"id"`
+	ID string `json:"id"`
+	// HostID and HostName name the Proxmox host the helper serves. They are
+	// empty for an "unassigned" helper — one registered before helpers carried a
+	// host identity — which is never used to route traffic.
+	HostID       string     `json:"hostId"`
+	HostName     string     `json:"hostName"`
 	Node         string     `json:"node"`
 	Address      string     `json:"address"`
 	Port         int        `json:"port"`
@@ -28,11 +33,26 @@ type helperDTO struct {
 	RegisteredAt time.Time  `json:"registeredAt"`
 }
 
-func toHelperDTO(h *store.NodeHelper) helperDTO {
+func toHelperDTO(h *store.NodeHelper, hostNames map[string]string) helperDTO {
 	return helperDTO{
-		ID: h.ID, Node: h.Node, Address: h.Address, Port: h.Port, Version: h.Version,
+		ID: h.ID, HostID: h.HostID, HostName: hostNames[h.HostID],
+		Node: h.Node, Address: h.Address, Port: h.Port, Version: h.Version,
 		Status: helpermgr.Status(h), LastSeen: h.LastSeen, RegisteredAt: h.RegisteredAt,
 	}
+}
+
+// hostNames maps host ids to their display names, for the DTOs that show a
+// workload's or a helper's cluster.
+func (s *Server) hostNames(r *http.Request) (map[string]string, error) {
+	hosts, err := s.st.ListPVEHosts(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(hosts))
+	for _, h := range hosts {
+		out[h.ID] = h.Name
+	}
+	return out, nil
 }
 
 func (s *Server) handleListHelpers(w http.ResponseWriter, r *http.Request) {
@@ -41,20 +61,82 @@ func (s *Server) handleListHelpers(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, err)
 		return
 	}
-	out := make([]helperDTO, 0, len(helpers))
-	for _, h := range helpers {
-		out = append(out, toHelperDTO(h))
-	}
-	writeJSON(w, http.StatusOK, out)
-}
-
-func (s *Server) handleCreateHelperEnrollToken(w http.ResponseWriter, r *http.Request) {
-	tok, err := s.helpers.CreateEnrollToken(r.Context())
+	names, err := s.hostNames(r)
 	if err != nil {
 		s.serverError(w, err)
 		return
 	}
+	out := make([]helperDTO, 0, len(helpers))
+	for _, h := range helpers {
+		out = append(out, toHelperDTO(h, names))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleCreateHelperEnrollToken mints an enrollment token for one Proxmox host.
+// The host is required: the token is what tells the registering helper which
+// cluster its node belongs to, and a helper without one cannot be routed to.
+func (s *Server) handleCreateHelperEnrollToken(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		HostID string `json:"hostId"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	tok, err := s.helpers.CreateEnrollToken(r.Context(), body.HostID)
+	if err != nil {
+		if errors.Is(err, helpermgr.ErrNoHost) {
+			writeError(w, http.StatusBadRequest,
+				"hostId is required and must name a configured Proxmox host: the enrollment token "+
+					"carries it, so the node helper inherits the cluster it belongs to")
+			return
+		}
+		s.serverError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"token": tok.Token, "expiresAt": tok.ExpiresAt})
+}
+
+// handleAssignHelper binds an unassigned (or misassigned) helper to a Proxmox
+// host, so an installation that predates host identity can be made routable
+// without redeploying it.
+func (s *Server) handleAssignHelper(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		HostID string `json:"hostId"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	hostID := strings.TrimSpace(body.HostID)
+	if hostID == "" {
+		writeError(w, http.StatusBadRequest, "hostId is required")
+		return
+	}
+	if _, err := s.st.PVEHostByID(r.Context(), hostID); err != nil {
+		s.notFoundOr(w, err, "host")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	if err := s.st.AssignHelperHost(r.Context(), id, hostID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "node helper not found")
+			return
+		}
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	h, err := s.st.HelperByID(r.Context(), id)
+	if err != nil {
+		s.notFoundOr(w, err, "node helper")
+		return
+	}
+	names, err := s.hostNames(r)
+	if err != nil {
+		s.serverError(w, err)
+		return
+	}
+	s.log.Info("node helper assigned to a host", "helper", id, "hostId", hostID, "node", h.Node)
+	writeJSON(w, http.StatusOK, toHelperDTO(h, names))
 }
 
 func (s *Server) handleDeleteHelper(w http.ResponseWriter, r *http.Request) {
@@ -74,6 +156,10 @@ const helperBinaryName = "proxback-helper-linux-amd64"
 // deployHelperRequest is the body of POST /api/helpers/deploy. The password is
 // used for one SSH connection and is never stored or logged.
 type deployHelperRequest struct {
+	// HostID is the Proxmox host the node belongs to. It is required because the
+	// enrollment token minted here carries it: without it the helper would
+	// register unassigned and could not be used.
+	HostID             string `json:"hostId"`
 	Node               string `json:"node"`
 	Address            string `json:"address"`
 	Port               int    `json:"port"`
@@ -92,11 +178,17 @@ func (s *Server) handleDeployHelper(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
+	hostID := strings.TrimSpace(body.HostID)
 	node := strings.TrimSpace(body.Node)
 	address := strings.TrimSpace(body.Address)
 	username := strings.TrimSpace(body.Username)
 	serverURL := strings.TrimSpace(body.ServerURL)
 	switch {
+	case hostID == "":
+		writeError(w, http.StatusBadRequest,
+			"hostId is required: a node helper is identified by the Proxmox host it belongs to "+
+				"together with its node name")
+		return
 	case node == "":
 		writeError(w, http.StatusBadRequest, "node is required")
 		return
@@ -117,6 +209,10 @@ func (s *Server) handleDeployHelper(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if _, err := s.st.PVEHostByID(r.Context(), hostID); err != nil {
+		s.notFoundOr(w, err, "host")
+		return
+	}
 	port := body.Port
 	if port <= 0 {
 		port = nodedeploy.DefaultSSHPort
@@ -135,10 +231,15 @@ func (s *Server) handleDeployHelper(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	// The token is minted here rather than by the operator: it only ever
-	// travels to the node on the remote command line. It is single use and
-	// expires in 24 h, so one left unused by a failed deployment is harmless.
-	tok, err := s.helpers.CreateEnrollToken(ctx)
+	// travels to the node on the remote command line. It is single use, carries
+	// the host the helper will belong to, and expires in 24 h, so one left
+	// unused by a failed deployment is harmless.
+	tok, err := s.helpers.CreateEnrollToken(ctx, hostID)
 	if err != nil {
+		if errors.Is(err, helpermgr.ErrNoHost) {
+			writeError(w, http.StatusBadRequest, "hostId must name a configured Proxmox host")
+			return
+		}
 		s.serverError(w, err)
 		return
 	}
@@ -176,12 +277,14 @@ func (s *Server) handleDeployHelper(w http.ResponseWriter, r *http.Request) {
 		logLines = []string{}
 	}
 	// The helper enrolls itself during --install, so its row normally exists by
-	// now; reporting it is best effort either way.
+	// now; reporting it is best effort either way. It is looked up by the pair
+	// that identifies it, never by node name alone.
 	online := false
-	if h, err := s.st.HelperByNode(ctx, node); err == nil {
+	if h, err := s.st.HelperFor(ctx, hostID, node); err == nil {
 		online = helpermgr.Online(h)
 	} else if !errors.Is(err, store.ErrNotFound) {
-		s.log.Warn("could not look up the deployed helper", "node", node, "error", err)
+		s.log.Warn("could not look up the deployed helper",
+			"hostId", hostID, "node", node, "error", err)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "log": logLines, "helperOnline": online,

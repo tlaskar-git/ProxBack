@@ -2,8 +2,22 @@
 
 /* ---------------------------------------------------------------------------
    ProxBack design tokens.
-   One dark palette (slate) plus a single accent ramp. Swapping the accent
-   values below re-themes the whole panel.
+
+   Two ramps do all the work and they mean different things:
+
+   - `accent`  — the BRAND. Selection, primary actions, focus, the mark. It is
+     an iris/indigo, deliberately not green, because in a backup product green
+     has to mean one thing only.
+   - `ok` / `warn` / `fail` — STATE, and nothing else. Green is reserved for
+     "verified healthy", amber for "at risk", red for "failed". No control, no
+     link, no brand surface is allowed to borrow them.
+
+   Both themes are driven from the same class names: `data-theme="light"` on
+   the root element re-points every ramp variable, so a utility such as
+   `text-slate-400` stays "secondary text" and `bg-slate-900` stays "card" in
+   either theme. The 500 stop of each accent/state ramp is the saturated pivot
+   and is *not* inverted — it is the one value that has to work as a solid fill
+   on a dark and on a light surface alike.
    --------------------------------------------------------------------------- */
 @theme {
   --font-sans:
@@ -13,19 +27,50 @@
     ui-monospace, 'JetBrains Mono', 'Cascadia Mono', Consolas, 'Courier New',
     monospace;
 
-  /* Emerald accent: green reads as "protected / healthy" in a backup product,
-     and doubles as the positive-state color on the deep slate surface. */
-  --color-accent-50: #ecfdf5;
-  --color-accent-100: #d1fae5;
-  --color-accent-200: #a7f3d0;
-  --color-accent-300: #6ee7b9;
-  --color-accent-400: #34d399;
-  --color-accent-500: #10b981;
-  --color-accent-600: #059669;
-  --color-accent-700: #047857;
-  --color-accent-800: #065f46;
-  --color-accent-900: #064e3b;
-  --color-accent-950: #022c22;
+  /* Brand — iris. Used for selection, primary action, focus, the mark. */
+  --color-accent-50: #eef0fe;
+  --color-accent-100: #dfe1fd;
+  --color-accent-200: #c3c4fa;
+  --color-accent-300: #a09ff5;
+  --color-accent-400: #817cef;
+  --color-accent-500: #5b4fd6;
+  --color-accent-600: #4f43c4;
+  --color-accent-700: #4136a3;
+  --color-accent-800: #372e84;
+  --color-accent-900: #302a69;
+  --color-accent-950: #1d193e;
+
+  /* Secondary, caption and dimmest ink. Tailwind's stock slate-400/500/600
+     land at 3.9:1 and 2.5:1 on this near-black surface — decorative rather
+     than readable. The three roles are kept a step apart from each other and
+     all three clear 4.5:1 on both the page and a card. */
+  --color-slate-400: #a3b0c2; /* secondary text */
+  --color-slate-500: #8b9aad; /* eyebrows, captions */
+  --color-slate-600: #74839a; /* dimmest text still meant to be read */
+
+  /* State — verified healthy. */
+  --color-ok-100: #d1fae5;
+  --color-ok-200: #a7f3d0;
+  --color-ok-300: #6ee7b7;
+  --color-ok-400: #34d399;
+  --color-ok-500: #10b981;
+  --color-ok-600: #059669;
+
+  /* State — at risk. */
+  --color-warn-100: #fef3c7;
+  --color-warn-200: #fde68a;
+  --color-warn-300: #fcd34d;
+  --color-warn-400: #fbbf24;
+  --color-warn-500: #f59e0b;
+  --color-warn-600: #d97706;
+
+  /* State — failed. */
+  --color-fail-100: #fee2e2;
+  --color-fail-200: #fecaca;
+  --color-fail-300: #fca5a5;
+  --color-fail-400: #f87171;
+  --color-fail-500: #ef4444;
+  --color-fail-600: #dc2626;
 
   /* ---------------------------------------------------------------------
      Type scale. Denser and more deliberate than Tailwind's defaults: the
@@ -38,9 +83,8 @@
   --text-meta--line-height: 1rem;
 
   /* ---------------------------------------------------------------------
-     Elevation. Three levels, used to say what matters — not for decoration.
-     Each carries a 1px inner highlight along the top edge, which is what
-     stops a dark card from reading as a flat rectangle.
+     Elevation. Two levels, used to say what matters — not for decoration.
+     Both are re-pointed for the light theme below.
      --------------------------------------------------------------------- */
   --shadow-level-1:
     inset 0 1px 0 0 rgb(255 255 255 / 0.03), 0 1px 2px 0 rgb(0 0 0 / 0.4);
@@ -50,8 +94,80 @@
   --shadow-level-3:
     inset 0 1px 0 0 rgb(255 255 255 / 0.06), 0 2px 4px 0 rgb(0 0 0 / 0.5),
     0 24px 48px -16px rgb(0 0 0 / 0.8);
-  /* Recessed wells — log panes, source lists, anything "inside" a card. */
+  /* Recessed wells — log panes, source lists, metric strips. */
   --shadow-well: inset 0 1px 2px 0 rgb(0 0 0 / 0.45);
+}
+
+/* ---------------------------------------------------------------------------
+   Theme surfaces that are not colour-ramp members.
+   --------------------------------------------------------------------------- */
+:root {
+  /* Dialog / drawer scrim. Never derived from the slate ramp: the ramp
+     inverts, and an inverted scrim would be a white veil over a white page. */
+  --pb-scrim: rgb(2 6 23 / 0.78);
+  /* One control height across buttons, inputs, selects and icon buttons. */
+  --pb-control-h: 2.25rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Light theme.
+
+   Every stop below 500 flips from "light ink on a dark surface" to "dark ink
+   on a light surface". 500 and 600 stay saturated because they are fills
+   (progress bars, dots, the primary button) that must read on either ground.
+   --------------------------------------------------------------------------- */
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --color-slate-950: #f1f5f9; /* page */
+  --color-slate-900: #ffffff; /* card */
+  --color-slate-800: #e2e8f0; /* hairline borders, dividers, tracks */
+  --color-slate-700: #cbd5e1; /* stronger borders */
+  --color-slate-600: #57626f; /* dimmest text still meant to be read */
+  --color-slate-500: #5a6675; /* eyebrows, captions */
+  --color-slate-400: #475569; /* secondary text */
+  --color-slate-300: #334155; /* body */
+  --color-slate-200: #1e293b;
+  --color-slate-100: #0f172a; /* headings */
+  --color-slate-50: #020617; /* the strongest ink */
+
+  --color-accent-50: #302a69;
+  --color-accent-100: #372e84;
+  --color-accent-200: #4136a3;
+  --color-accent-300: #4136a3;
+  --color-accent-400: #4f43c4;
+  --color-accent-500: #5449cf;
+  --color-accent-600: #4136a3;
+
+  --color-ok-100: #14532d;
+  --color-ok-200: #14532d;
+  --color-ok-300: #166534;
+  --color-ok-400: #15803d;
+  --color-ok-500: #16a34a;
+  --color-ok-600: #15803d;
+
+  --color-warn-100: #713f12;
+  --color-warn-200: #854d0e;
+  --color-warn-300: #92400e;
+  --color-warn-400: #b45309;
+  --color-warn-500: #d97706;
+  --color-warn-600: #b45309;
+
+  --color-fail-100: #7f1d1d;
+  --color-fail-200: #7f1d1d;
+  --color-fail-300: #b91c1c;
+  --color-fail-400: #dc2626;
+  --color-fail-500: #dc2626;
+  --color-fail-600: #b91c1c;
+
+  --pb-scrim: rgb(15 23 42 / 0.42);
+
+  --shadow-level-1: 0 1px 2px 0 rgb(15 23 42 / 0.06);
+  --shadow-level-2:
+    0 1px 2px 0 rgb(15 23 42 / 0.06), 0 8px 20px -12px rgb(15 23 42 / 0.24);
+  --shadow-level-3:
+    0 2px 4px 0 rgb(15 23 42 / 0.07), 0 20px 40px -16px rgb(15 23 42 / 0.28);
+  --shadow-well: inset 0 1px 2px 0 rgb(15 23 42 / 0.06);
 }
 
 @layer base {
@@ -111,7 +227,7 @@
     color: var(--color-slate-50);
   }
 
-  /* Slim, unobtrusive scrollbars that match the dark surface. */
+  /* Slim, unobtrusive scrollbars that follow the theme. */
   * {
     scrollbar-width: thin;
     scrollbar-color: var(--color-slate-700) transparent;
@@ -158,6 +274,11 @@
   box-shadow: var(--shadow-well);
 }
 
+/* The one scrim behind a dialog or drawer. */
+@utility scrim {
+  background-color: var(--pb-scrim);
+}
+
 /* Elevation levels — see the token block above. */
 @utility elev-1 {
   box-shadow: var(--shadow-level-1);
@@ -188,6 +309,11 @@
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.02em;
   font-weight: 600;
+}
+
+/* One control height for every button, input, select and icon button. */
+@utility control-h {
+  height: var(--pb-control-h);
 }
 
 @keyframes pb-toast-in {

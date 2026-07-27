@@ -1,19 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { AlertTriangle, Ban, RotateCcw, ScrollText, Trash2 } from 'lucide-react'
-import { cancelRun, deleteRun, errorMessage, getRun, getRunLog, retryRun } from '../api'
+import { cancelRun, deleteRun, errorMessage, getRun, getRunLog, reductionOf, retryRun } from '../api'
 import type { ID, RunDetail, RunLogLine } from '../api'
 import { Modal } from './Modal'
 import { useConfirm } from './Confirm'
 import { SourceBreakdown } from './RunLive'
 import { useToast } from './Toast'
-import { Button, Num, ProgressBar, RunStatusPill, Spinner } from './ui'
+import {
+  Button,
+  DefinitionList,
+  DefinitionRow,
+  Num,
+  ProgressBar,
+  RunStatusPill,
+  Spinner,
+} from './ui'
 import {
   clampPct,
   formatBytes,
   formatDateTime,
   formatDuration,
   formatRatio,
+  formatReduction,
   formatRelative,
   formatThroughput,
   formatTime,
@@ -150,6 +159,9 @@ export function RunDetailModal({
     }
   }
 
+  const reduction = reductionOf(
+    run ?? { bytesProcessed: 0, bytesUploaded: 0 },
+  )
   const running = run?.status === 'running'
   const failed = run?.status === 'failed' || run?.status === 'canceled'
 
@@ -210,7 +222,7 @@ export function RunDetailModal({
           Loading run detail…
         </div>
       ) : error && !run ? (
-        <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+        <p className="rounded-lg border border-fail-500/30 bg-fail-500/10 px-3.5 py-2.5 text-xs text-fail-300">
           {error}
         </p>
       ) : run ? (
@@ -235,26 +247,76 @@ export function RunDetailModal({
           ) : null}
 
           <dl className="well grid grid-cols-2 gap-4 px-4 py-3 sm:grid-cols-4">
-            <Figure label="Read" value={formatBytes(run.bytesProcessed)} />
-            <Figure label="Uploaded" value={formatBytes(run.bytesUploaded)} />
-            <Figure label="Dedup" value={formatRatio(run.dedupRatio)} />
+            <Figure label="Source data processed" value={formatBytes(run.bytesProcessed)} />
+            <Figure label="Transferred to target" value={formatBytes(run.bytesUploaded)} />
+            <Figure
+              label="Data reduction"
+              value={
+                <span className="inline-flex items-baseline gap-1.5">
+                  {formatReduction(reduction.pct)}
+                  {reduction.ratio === null ? null : (
+                    <span className="text-meta font-normal text-slate-500">
+                      {formatRatio(reduction.ratio)}
+                    </span>
+                  )}
+                </span>
+              }
+            />
             <Figure label="Duration" value={formatDuration(run.startedAt, run.finishedAt)} />
           </dl>
 
+          {/* Where a restore actually put the data — persisted with the run,
+              so it is a record rather than a line that scrolls out of a log. */}
+          {run.destination ? (
+            <div>
+              <p className="eyebrow mb-2 text-slate-400">Restored to</p>
+              <DefinitionList>
+                <DefinitionRow
+                  label="Mode"
+                  tone={run.destination.mode === 'overwrite' ? 'warn' : 'normal'}
+                >
+                  {run.destination.mode === 'overwrite'
+                    ? 'Overwrite original'
+                    : 'Restore alongside'}
+                </DefinitionRow>
+                {run.destination.destPath ? (
+                  <DefinitionRow label="Destination">
+                    <span className="font-mono text-xs">{run.destination.destPath}</span>
+                  </DefinitionRow>
+                ) : (
+                  <DefinitionRow label="Destination">
+                    {[
+                      run.destination.host,
+                      run.destination.vmid === undefined
+                        ? null
+                        : `VMID ${run.destination.vmid}`,
+                      run.destination.node,
+                    ]
+                      .filter(Boolean)
+                      .join(' / ') || '—'}
+                  </DefinitionRow>
+                )}
+                {run.destination.storage ? (
+                  <DefinitionRow label="Storage">{run.destination.storage}</DefinitionRow>
+                ) : null}
+              </DefinitionList>
+            </div>
+          ) : null}
+
           {run.error ? (
-            <div className="space-y-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3">
-              <p className="flex items-center gap-2 text-meta font-medium text-red-200">
+            <div className="space-y-1.5 rounded-lg border border-fail-500/30 bg-fail-500/10 px-4 py-3">
+              <p className="flex items-center gap-2 text-meta font-medium text-fail-200">
                 <AlertTriangle className="size-3.5" aria-hidden />
                 Failure
               </p>
-              <p className="font-mono text-xs leading-relaxed break-all whitespace-pre-wrap text-red-300">
+              <p className="font-mono text-xs leading-relaxed break-all whitespace-pre-wrap text-fail-300">
                 {run.error}
               </p>
             </div>
           ) : null}
 
           <div>
-            <p className="eyebrow mb-2 text-slate-400">Objects in this session</p>
+            <p className="eyebrow mb-2 text-slate-400">Workloads in this run</p>
             <SourceBreakdown sources={run.sources} />
           </div>
 
@@ -265,7 +327,7 @@ export function RunDetailModal({
             </p>
             {lines.length === 0 ? (
               <p className="well px-4 py-3 text-meta text-slate-500">
-                No log entries for this run. Runs from earlier versions have no stored log.
+                This run has not written any log lines yet.
               </p>
             ) : (
               <div className="well max-h-72 space-y-1 overflow-y-auto px-4 py-3">

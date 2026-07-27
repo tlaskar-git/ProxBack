@@ -6,7 +6,7 @@ import type {
   SelectHTMLAttributes,
 } from 'react'
 import { useId } from 'react'
-import { Loader2, TriangleAlert } from 'lucide-react'
+import { ChevronRight, Loader2, TriangleAlert } from 'lucide-react'
 import { cn } from '../lib/cn'
 
 /* ---------------------------------------------------------------------------
@@ -23,22 +23,28 @@ export type ButtonVariant =
   | 'success'
 export type ButtonSize = 'sm' | 'md' | 'lg'
 
+/**
+ * `primary` is the brand, and the brand is not a status colour. Its label is
+ * kept literal white rather than a ramp stop because the 500 accent stays
+ * saturated in both themes — it is the one place a fixed colour is correct.
+ */
 const VARIANTS: Record<ButtonVariant, string> = {
-  primary:
-    'bg-accent-500 text-white shadow-lg shadow-accent-500/20 hover:bg-accent-400 active:bg-accent-600',
+  primary: 'bg-accent-500 text-white hover:bg-accent-600 active:bg-accent-700',
   secondary:
-    'border border-slate-700 bg-slate-800/70 text-slate-200 hover:border-slate-600 hover:bg-slate-800 hover:text-white',
+    'border border-slate-700 bg-slate-800/70 text-slate-200 hover:border-slate-600 hover:bg-slate-800 hover:text-slate-50',
   ghost: 'text-slate-400 hover:bg-slate-800/70 hover:text-slate-100',
   danger:
-    'border border-red-500/40 bg-red-500/10 text-red-300 hover:border-red-500/60 hover:bg-red-500/20 hover:text-red-200',
-  dangerQuiet: 'text-slate-500 hover:bg-red-500/10 hover:text-red-300',
+    'border border-fail-500/40 bg-fail-500/10 text-fail-300 hover:border-fail-500/60 hover:bg-fail-500/20 hover:text-fail-200',
+  dangerQuiet: 'text-slate-500 hover:bg-fail-500/10 hover:text-fail-300',
   success:
-    'border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:border-emerald-500/60 hover:bg-emerald-500/20 hover:text-emerald-200',
+    'border border-ok-500/40 bg-ok-500/10 text-ok-300 hover:border-ok-500/60 hover:bg-ok-500/20 hover:text-ok-200',
 }
 
+/* One control height, shared with Input/Select/IconButton, so a toolbar never
+   staircases. `lg` exists only for the two full-width auth submits. */
 const SIZES: Record<ButtonSize, string> = {
   sm: 'h-8 gap-1.5 px-3 text-xs',
-  md: 'h-[38px] gap-2 px-4 text-sm',
+  md: 'control-h gap-2 px-3.5 text-[13px]',
   lg: 'h-11 gap-2 px-5 text-sm',
 }
 
@@ -92,7 +98,7 @@ export function IconButton({
       type="button"
       disabled={disabled || loading}
       className={cn(
-        'inline-flex size-[34px] shrink-0 items-center justify-center rounded-lg transition-colors duration-150 disabled:pointer-events-none disabled:opacity-45',
+        'control-h inline-flex aspect-square shrink-0 items-center justify-center rounded-lg transition-colors duration-150 disabled:pointer-events-none disabled:opacity-45',
         VARIANTS[variant],
         className,
       )}
@@ -186,7 +192,7 @@ export function PageHeader({
   return (
     <header className="mb-5 flex flex-wrap items-end justify-between gap-x-6 gap-y-3 border-b border-slate-800/70 pb-4">
       <div className="min-w-0">
-        <h1 className="text-xl leading-7 font-semibold tracking-tight text-white">{title}</h1>
+        <h1 className="text-xl leading-7 font-semibold tracking-tight text-slate-50">{title}</h1>
         {description ? (
           <p className="mt-1 max-w-2xl text-[13px] leading-5 text-slate-400">{description}</p>
         ) : null}
@@ -238,8 +244,21 @@ export function SectionHeading({
  * reflow as a polled value ticks over.
  * ------------------------------------------------------------------------- */
 
-export function Num({ children, className }: { children: ReactNode; className?: string }) {
-  return <span className={cn('font-mono tabular-nums', className)}>{children}</span>
+export function Num({
+  children,
+  className,
+  title,
+}: {
+  children: ReactNode
+  className?: string
+  /** Absolute value behind a relative one, e.g. the timestamp under "4 min ago". */
+  title?: string
+}) {
+  return (
+    <span className={cn('font-mono tabular-nums', className)} title={title}>
+      {children}
+    </span>
+  )
 }
 
 /* ---------------------------------------------------------------------------
@@ -378,22 +397,32 @@ export function Segmented<T extends string>({
  * Status pill
  * ------------------------------------------------------------------------- */
 
-export type PillTone = 'green' | 'amber' | 'red' | 'blue' | 'slate'
+/**
+ * Tones are named for what they mean, not for the pigment they happen to use.
+ *
+ * - `ok`      — verified healthy. Green, and green is spent on nothing else.
+ * - `warn`    — at risk, needs a human before it becomes a failure.
+ * - `fail`    — failed.
+ * - `brand`   — in flight, selected, or otherwise "this is the thing you
+ *               picked". The brand hue, deliberately not green.
+ * - `neutral` — no state to report.
+ */
+export type PillTone = 'ok' | 'warn' | 'fail' | 'brand' | 'neutral'
 
 const TONES: Record<PillTone, string> = {
-  green: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300',
-  amber: 'border-amber-500/30 bg-amber-500/10 text-amber-300',
-  red: 'border-red-500/30 bg-red-500/10 text-red-300',
-  blue: 'border-accent-500/30 bg-accent-500/10 text-accent-300',
-  slate: 'border-slate-700 bg-slate-800/60 text-slate-400',
+  ok: 'border-ok-500/30 bg-ok-500/10 text-ok-300',
+  warn: 'border-warn-500/30 bg-warn-500/10 text-warn-300',
+  fail: 'border-fail-500/30 bg-fail-500/10 text-fail-300',
+  brand: 'border-accent-500/30 bg-accent-500/10 text-accent-300',
+  neutral: 'border-slate-700 bg-slate-800/60 text-slate-400',
 }
 
 const DOTS: Record<PillTone, string> = {
-  green: 'bg-emerald-400',
-  amber: 'bg-amber-400',
-  red: 'bg-red-400',
-  blue: 'bg-accent-400',
-  slate: 'bg-slate-500',
+  ok: 'bg-ok-400',
+  warn: 'bg-warn-400',
+  fail: 'bg-fail-400',
+  brand: 'bg-accent-400',
+  neutral: 'bg-slate-500',
 }
 
 export function StatusPill({
@@ -424,16 +453,24 @@ export function StatusPill({
   )
 }
 
-/** Maps free-form server status strings onto pill tones. */
+/**
+ * Maps free-form server status strings onto pill tones.
+ *
+ * `running` is deliberately *not* green: a run in flight is activity, not
+ * evidence of health, so it carries the brand tone.
+ */
 export function toneForStatus(status: string | null | undefined): PillTone {
   switch ((status ?? '').toLowerCase()) {
     case 'online':
     case 'ok':
     case 'success':
-    case 'running':
     case 'connected':
     case 'healthy':
-      return 'green'
+    case 'passed':
+    case 'verified':
+      return 'ok'
+    case 'running':
+      return 'brand'
     case 'stopped':
     case 'offline':
     case 'paused':
@@ -441,18 +478,19 @@ export function toneForStatus(status: string | null | undefined): PillTone {
     case 'canceled':
     case 'cancelled':
     case 'disabled':
-      return 'slate'
+      return 'neutral'
     case 'error':
     case 'failed':
     case 'unreachable':
-      return 'red'
+      return 'fail'
     case 'warning':
     case 'degraded':
     case 'pending':
     case 'limited':
-      return 'amber'
+    case 'unassigned':
+      return 'warn'
     default:
-      return 'slate'
+      return 'neutral'
   }
 }
 
@@ -460,12 +498,12 @@ export function toneForStatus(status: string | null | undefined): PillTone {
 export function RunStatusPill({ status }: { status: string }) {
   const tone: PillTone =
     status === 'success'
-      ? 'green'
+      ? 'ok'
       : status === 'failed'
-        ? 'red'
+        ? 'fail'
         : status === 'running'
-          ? 'blue'
-          : 'slate'
+          ? 'brand'
+          : 'neutral'
   return <StatusPill tone={tone} label={status} pulse={status === 'running'} />
 }
 
@@ -475,7 +513,7 @@ export function RunStatusPill({ status }: { status: string }) {
 
 export function ProgressBar({
   value,
-  tone = 'blue',
+  tone = 'brand',
   active = false,
   className,
 }: {
@@ -486,11 +524,11 @@ export function ProgressBar({
 }) {
   const pct = Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0))
   const fill: Record<PillTone, string> = {
-    green: 'bg-emerald-500',
-    amber: 'bg-amber-500',
-    red: 'bg-red-500',
-    blue: 'bg-accent-500',
-    slate: 'bg-slate-600',
+    ok: 'bg-ok-500',
+    warn: 'bg-warn-500',
+    fail: 'bg-fail-500',
+    brand: 'bg-accent-500',
+    neutral: 'bg-slate-600',
   }
   return (
     <div
@@ -518,16 +556,16 @@ export function ProgressBar({
  * ------------------------------------------------------------------------- */
 
 const ARC_STROKE: Record<PillTone, string> = {
-  green: 'stroke-emerald-400',
-  amber: 'stroke-amber-400',
-  red: 'stroke-red-400',
-  blue: 'stroke-accent-400',
-  slate: 'stroke-slate-600',
+  ok: 'stroke-ok-400',
+  warn: 'stroke-warn-400',
+  fail: 'stroke-fail-400',
+  brand: 'stroke-accent-400',
+  neutral: 'stroke-slate-600',
 }
 
 export function ArcProgress({
   value,
-  tone = 'blue',
+  tone = 'brand',
   size = 148,
   thickness = 9,
   label,
@@ -606,18 +644,18 @@ export function Sparkline({
   values,
   width = 220,
   height = 44,
-  tone = 'blue',
+  tone = 'brand',
   ariaLabel,
   className,
 }: {
   values: number[]
   width?: number
   height?: number
-  tone?: 'blue' | 'green'
+  tone?: 'brand' | 'ok'
   ariaLabel: string
   className?: string
 }) {
-  const stroke = tone === 'green' ? 'var(--color-emerald-400)' : 'var(--color-accent-400)'
+  const stroke = tone === 'ok' ? 'var(--color-ok-400)' : 'var(--color-accent-400)'
   const clean = values.filter((value) => Number.isFinite(value) && value >= 0)
   const padding = 3
   const usableH = height - padding * 2
@@ -685,15 +723,15 @@ export function Sparkline({
    dot's background class — written out rather than derived, because Tailwind
    only ships classes it can see in the source. */
 const DOT_HALOS: Record<PillTone, string> = {
-  green: 'text-emerald-400',
-  amber: 'text-amber-400',
-  red: 'text-red-400',
-  blue: 'text-accent-400',
-  slate: 'text-slate-500',
+  ok: 'text-ok-400',
+  warn: 'text-warn-400',
+  fail: 'text-fail-400',
+  brand: 'text-accent-400',
+  neutral: 'text-slate-500',
 }
 
 /** Pulsing dot for anything genuinely live. Motion is muted by the reduced-motion block. */
-export function LiveDot({ tone = 'blue', className }: { tone?: PillTone; className?: string }) {
+export function LiveDot({ tone = 'brand', className }: { tone?: PillTone; className?: string }) {
   return (
     <span className={cn('relative flex size-2 shrink-0', className)} aria-hidden>
       <span className={cn('pb-ping absolute inset-0 rounded-full', DOT_HALOS[tone])} />
@@ -750,9 +788,9 @@ export function SkeletonRows({ count = 5 }: { count?: number }) {
 }
 
 /**
- * Empty states are a designed surface, not a fallback: a faint dot grid so the
- * area still reads as a panel, a bordered glyph, one line of explanation, one
- * action. `hint` carries the secondary route out when there is one.
+ * Empty states: a bordered glyph, one line that says what this state actually
+ * is, one action. No decorative grid — an empty table is information, not a
+ * surface that needs dressing up.
  */
 export function EmptyState({
   icon,
@@ -772,21 +810,11 @@ export function EmptyState({
   return (
     <div
       className={cn(
-        'relative isolate overflow-hidden rounded-xl border border-slate-800/90 bg-slate-900/40 px-6 py-14 text-center',
+        'rounded-xl border border-slate-800 bg-slate-900/40 px-6 py-12 text-center',
         className,
       )}
     >
-      <span
-        className="pointer-events-none absolute inset-0 -z-10 opacity-60"
-        aria-hidden
-        style={{
-          backgroundImage: 'radial-gradient(var(--color-slate-800) 1px, transparent 1px)',
-          backgroundSize: '18px 18px',
-          maskImage: 'radial-gradient(ellipse 70% 60% at 50% 45%, #000 20%, transparent 75%)',
-          WebkitMaskImage: 'radial-gradient(ellipse 70% 60% at 50% 45%, #000 20%, transparent 75%)',
-        }}
-      />
-      <div className="mx-auto mb-4 flex size-11 items-center justify-center rounded-xl border border-slate-700/70 bg-slate-900 text-accent-400 elev-1">
+      <div className="mx-auto mb-4 flex size-10 items-center justify-center rounded-lg border border-slate-800 bg-slate-950/50 text-slate-500">
         {icon}
       </div>
       <h3 className="text-[15px] leading-6 font-semibold tracking-tight text-slate-100">{title}</h3>
@@ -809,12 +837,12 @@ export function ErrorBlock({
   title?: string
 }) {
   return (
-    <div className="flex items-start gap-3.5 rounded-xl border border-red-500/25 bg-red-500/[0.06] px-5 py-4 elev-1">
-      <span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg border border-red-500/30 bg-red-500/10 text-red-300">
+    <div className="flex items-start gap-3.5 rounded-xl border border-fail-500/25 bg-fail-500/[0.06] px-5 py-4 elev-1">
+      <span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg border border-fail-500/30 bg-fail-500/10 text-fail-300">
         <TriangleAlert className="size-4" aria-hidden />
       </span>
       <div className="min-w-0 flex-1">
-        <p className="text-sm font-medium text-red-200">{title}</p>
+        <p className="text-sm font-medium text-fail-200">{title}</p>
         <p className="mt-1 text-[13px] leading-relaxed break-words text-slate-400">{message}</p>
         {onRetry ? (
           <Button size="sm" className="mt-3" onClick={onRetry}>
@@ -852,7 +880,7 @@ export function Field({
       </label>
       {children({ id, describedBy: hintId })}
       {error ? (
-        <p id={hintId} className="text-xs text-red-400">
+        <p id={hintId} className="text-xs text-fail-400">
           {error}
         </p>
       ) : hint ? (
@@ -864,8 +892,9 @@ export function Field({
   )
 }
 
+/* Same height as a `md` Button, so a filter row lines up on one baseline. */
 const CONTROL_CLASS =
-  'w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 transition-colors duration-150 placeholder:text-slate-600 hover:border-slate-600 focus:border-accent-500 focus:outline-none disabled:opacity-50'
+  'control-h w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 text-[13px] text-slate-100 transition-colors duration-150 placeholder:text-slate-600 hover:border-slate-600 focus:border-accent-500 focus:outline-none disabled:opacity-50'
 
 export function Input({ className, ...rest }: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={cn(CONTROL_CLASS, className)} {...rest} />
@@ -943,9 +972,11 @@ export function Toggle({
         checked ? 'border-accent-400/60 bg-accent-500/80' : 'border-slate-700 bg-slate-800',
       )}
     >
+      {/* The knob takes the strongest ink of whichever theme is active, so it
+          stays visible against both the brand track and the neutral one. */}
       <span
         className={cn(
-          'ml-0.5 size-4 rounded-full bg-white shadow transition-transform',
+          'ml-0.5 size-4 rounded-full bg-slate-50 shadow transition-transform',
           checked ? 'translate-x-[18px]' : 'translate-x-0',
         )}
       />
@@ -981,10 +1012,115 @@ export function Mono({ children, className }: { children: ReactNode; className?:
   )
 }
 
+/**
+ * A note is guidance, not an action and not a state — so it is neutral. It
+ * used to be tinted with the accent, which made every explanatory paragraph
+ * look like something you were meant to click.
+ */
 export function SectionNote({ children }: { children: ReactNode }) {
   return (
-    <p className="rounded-lg border border-accent-500/20 bg-accent-500/5 px-3.5 py-2.5 text-xs leading-relaxed text-accent-200/80">
+    <p className="rounded-lg border border-slate-800 bg-slate-950/40 px-3.5 py-2.5 text-xs leading-relaxed text-slate-400">
       {children}
     </p>
+  )
+}
+
+/**
+ * Inline hint attached to a control. The one-line replacement for the
+ * explanatory paragraph that used to sit under everything: it is small, it is
+ * quiet, and anything longer belongs in an Advanced disclosure instead.
+ */
+export function Hint({ children, className }: { children: ReactNode; className?: string }) {
+  return <p className={cn('text-meta leading-relaxed text-slate-500', className)}>{children}</p>
+}
+
+/* ---------------------------------------------------------------------------
+ * Disclosure
+ *
+ * Native <details>: keyboard operable and focusable for free, and collapsed
+ * markup that assistive tech already understands. Everything the review called
+ * "explanatory paragraphs under nearly every control" moves in here.
+ * ------------------------------------------------------------------------- */
+
+export function Disclosure({
+  summary,
+  hint,
+  children,
+  defaultOpen = false,
+  className,
+}: {
+  summary: string
+  hint?: ReactNode
+  children: ReactNode
+  defaultOpen?: boolean
+  className?: string
+}) {
+  return (
+    <details
+      className={cn('group rounded-lg border border-slate-800 bg-slate-950/30', className)}
+      open={defaultOpen}
+    >
+      <summary className="flex list-none items-center gap-2 rounded-lg px-3.5 py-2.5 text-[13px] text-slate-300 transition-colors duration-150 hover:text-slate-100 [&::-webkit-details-marker]:hidden">
+        <ChevronRight
+          className="size-3.5 shrink-0 text-slate-500 transition-transform duration-150 group-open:rotate-90"
+          aria-hidden
+        />
+        <span className="font-medium">{summary}</span>
+        {hint ? <span className="ml-auto text-meta text-slate-500">{hint}</span> : null}
+      </summary>
+      <div className="border-t border-slate-800/80 px-3.5 py-3.5">{children}</div>
+    </details>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Definition rows
+ *
+ * Reviews, summaries and destination panels are all the same shape: a label
+ * column and a value column. One primitive stops each of them inventing its
+ * own nested rounded box.
+ * ------------------------------------------------------------------------- */
+
+export function DefinitionList({
+  children,
+  className,
+}: {
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <dl
+      className={cn(
+        'divide-y divide-slate-800/80 overflow-hidden rounded-lg border border-slate-800',
+        className,
+      )}
+    >
+      {children}
+    </dl>
+  )
+}
+
+export function DefinitionRow({
+  label,
+  children,
+  tone = 'normal',
+}: {
+  label: string
+  children: ReactNode
+  /** `warn` marks the row an operator must read before continuing. */
+  tone?: 'normal' | 'warn'
+}) {
+  return (
+    <div className="flex flex-wrap gap-x-4 gap-y-1 px-4 py-2.5">
+      <dt className="w-32 shrink-0 text-xs text-slate-500">{label}</dt>
+      <dd
+        className={cn(
+          'min-w-0 flex-1 text-[13px] break-words',
+          tone === 'warn' ? 'text-warn-300' : 'text-slate-200',
+        )}
+      >
+        {children}
+      </dd>
+    </div>
   )
 }

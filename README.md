@@ -115,6 +115,38 @@ with the time picked directly. The console confirms in plain language — *"Runs
 and Saturday at 02:00. Next run Saturday 1 Aug, 02:00"* — and states the server's time zone.
 Cron remains available under Advanced for unusual cadences.
 
+## Protection policy
+
+Beyond sources, target, schedule and retention, a job can carry an optional protection
+policy: guest-agent quiescing, disk or path exclusions, automatic retry, a maximum run
+duration, a permitted backup window, and pre/post scripts run where the data lives.
+Defaults are safe and the whole step is collapsed — a six-VM estate never needs to open it.
+
+Retention supports GFS: keep-last plus daily, weekly, monthly and yearly copies. Before
+saving, the console shows exactly which restore points a policy would keep and which it
+would prune, and why each survivor was kept.
+
+## Windows and Linux agents
+
+For file-level protection inside a guest, install the agent and register it as a service in
+one elevated command:
+
+```powershell
+proxback-agent.exe --server https://proxback:8443 --token <enrollment-token> --install
+```
+
+```bash
+sudo proxback-agent --server https://proxback:8443 --token <enrollment-token> --install
+```
+
+The installer registers a real system service (Windows service or systemd unit), sets it to
+start automatically, restarts it on failure, and verifies it reached running state before
+reporting success. On Windows it logs to the Event Log, so a service that will not start
+can be diagnosed. Remove with `--uninstall`; `--print-install` prints the manual steps.
+
+The agent does not require the guest to run on Proxmox — any Windows or Linux machine that
+can reach the server works.
+
 ## Monitoring
 
 The Monitor page shows runs in flight as live sessions: overall progress, current

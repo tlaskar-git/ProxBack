@@ -28,7 +28,7 @@ func TestRunSourcesRecordABackupRun(t *testing.T) {
 
 	job, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "nightly-vms", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: store.ManualSchedule(), Retention: 2, Enabled: true,
+		Schedule: store.ManualSchedule(), Retention: store.KeepLast(2), Enabled: true,
 		Sources: store.JobSources{
 			{HostID: h.host.ID, VMID: 100, Name: "web-01"},
 			{HostID: h.host.ID, VMID: 101, Name: "db-01"},
@@ -139,7 +139,7 @@ func TestRunSourcesRecordAFailure(t *testing.T) {
 
 	job, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "broken-target", Kind: store.SourceVM, TargetID: broken.ID,
-		Schedule: store.ManualSchedule(), Retention: 2, Enabled: true,
+		Schedule: store.ManualSchedule(), Retention: store.KeepLast(2), Enabled: true,
 		Sources: store.JobSources{
 			{HostID: h.host.ID, VMID: 100, Name: "web-01"},
 			{HostID: h.host.ID, VMID: 101, Name: "db-01"},
@@ -227,7 +227,7 @@ func TestDeletingARunRemovesItsSources(t *testing.T) {
 
 	job, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "nightly-vms", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: store.ManualSchedule(), Retention: 2, Enabled: true,
+		Schedule: store.ManualSchedule(), Retention: store.KeepLast(2), Enabled: true,
 		Sources: store.JobSources{{HostID: h.host.ID, VMID: 100, Name: "web-01"}},
 	})
 	if err != nil {

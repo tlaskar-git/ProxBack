@@ -27,17 +27,19 @@ interface ToastApi {
 
 const ToastContext = createContext<ToastApi | null>(null)
 
+/* The card sits on an opaque surface so the tint stays a tint in both themes;
+   a translucent toast over a light page washed out to nothing. */
 const KIND_STYLES: Record<ToastKind, { ring: string; icon: ReactNode }> = {
   success: {
-    ring: 'border-emerald-500/40 bg-emerald-500/10',
-    icon: <CheckCircle2 className="size-4 shrink-0 text-emerald-400" aria-hidden />,
+    ring: 'border-ok-500/40 bg-slate-900',
+    icon: <CheckCircle2 className="size-4 shrink-0 text-ok-400" aria-hidden />,
   },
   error: {
-    ring: 'border-red-500/40 bg-red-500/10',
-    icon: <XCircle className="size-4 shrink-0 text-red-400" aria-hidden />,
+    ring: 'border-fail-500/40 bg-slate-900',
+    icon: <XCircle className="size-4 shrink-0 text-fail-400" aria-hidden />,
   },
   info: {
-    ring: 'border-accent-500/40 bg-accent-500/10',
+    ring: 'border-accent-500/40 bg-slate-900',
     icon: <Info className="size-4 shrink-0 text-accent-400" aria-hidden />,
   },
 }
@@ -80,7 +82,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           <div
             key={toast.id}
             className={cn(
-              'pb-toast-in pointer-events-auto flex items-start gap-3 rounded-xl border px-4 py-3 shadow-2xl shadow-black/40 backdrop-blur-md',
+              'pb-toast-in pointer-events-auto flex items-start gap-3 rounded-xl border px-4 py-3 elev-3',
               KIND_STYLES[toast.kind].ring,
             )}
           >
@@ -99,7 +101,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                     toast.action?.onClick()
                     dismiss(toast.id)
                   }}
-                  className="mt-2 inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-900/60 px-2 py-1 text-[11px] font-medium text-slate-200 transition-colors duration-150 hover:border-slate-600 hover:bg-slate-800 hover:text-white"
+                  className="mt-2 inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-900/60 px-2 py-1 text-[11px] font-medium text-slate-200 transition-colors duration-150 hover:border-slate-600 hover:bg-slate-800 hover:text-slate-50"
                 >
                   {toast.action.label}
                   <ArrowRight className="size-3" aria-hidden />
@@ -109,7 +111,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             <button
               type="button"
               onClick={() => dismiss(toast.id)}
-              className="-mr-1 -mt-0.5 rounded-md p-1 text-slate-500 transition-colors duration-150 hover:bg-white/5 hover:text-slate-300"
+              className="-mr-1 -mt-0.5 rounded-md p-1 text-slate-500 transition-colors duration-150 hover:bg-slate-800 hover:text-slate-300"
               aria-label="Dismiss notification"
             >
               <X className="size-3.5" aria-hidden />

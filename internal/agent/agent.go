@@ -35,6 +35,18 @@ const DefaultHeartbeatInterval = 15 * time.Second
 // ConfigFileName is the name of the agent's stored configuration.
 const ConfigFileName = "agent.json"
 
+// MaxRetryInterval caps the exponential backoff applied to a server that is not
+// answering. A guest whose ProxBack server is down for a weekend must keep
+// trying — quietly — and pick up again by itself, not exit and leave the
+// service manager to notice.
+const MaxRetryInterval = 5 * time.Minute
+
+// ErrServerUnreachable marks failures that never reached the server at all:
+// DNS, TCP, TLS or a timeout. They are transient by nature, so the agent
+// retries them instead of exiting, which is what a real HTTP error status
+// (a revoked key, a spent enrollment token) causes.
+var ErrServerUnreachable = errors.New("proxback server unreachable")
+
 // StreamName is the manifest stream name used for file backups.
 const StreamName = "files.tar"
 
@@ -103,8 +115,8 @@ func (a *Agent) loadConfig() error {
 }
 
 func (a *Agent) saveConfig() error {
-	if err := os.MkdirAll(a.cfg.ConfigDir, 0o700); err != nil {
-		return fmt.Errorf("agent: create config dir: %w", err)
+	if err := EnsureConfigDir(a.cfg.ConfigDir); err != nil {
+		return err
 	}
 	raw, err := json.MarshalIndent(a.self, "", "  ")
 	if err != nil {
@@ -120,26 +132,92 @@ func (a *Agent) saveConfig() error {
 func (a *Agent) AgentID() string { return a.self.AgentID }
 
 // Run enrolls if necessary and then loops until the context is cancelled.
+//
+// The loop is deliberately unkillable by the network: a heartbeat that fails —
+// server down, DNS gone, cable pulled — is logged and retried with exponential
+// backoff. Returning here would exit the process, which under a service manager
+// looks exactly like "the service starts and then stops".
 func (a *Agent) Run(ctx context.Context) error {
-	if err := a.Enroll(ctx); err != nil {
+	if err := a.enrollWithRetry(ctx); err != nil {
 		return err
 	}
 	a.log.Info("agent running", "server", a.self.ServerURL, "agentId", a.self.AgentID,
 		"interval", a.cfg.HeartbeatInterval.String())
-	ticker := time.NewTicker(a.cfg.HeartbeatInterval)
-	defer ticker.Stop()
+
+	fails := 0
 	for {
 		if err := a.pollOnce(ctx); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			a.log.Warn("heartbeat failed", "error", err)
+			fails++
+			a.log.Warn("heartbeat failed; will retry",
+				"error", err, "consecutiveFailures", fails,
+				"retryIn", backoffFor(a.cfg.HeartbeatInterval, fails).String())
+		} else {
+			if fails > 0 {
+				a.log.Info("server reachable again", "afterFailures", fails)
+			}
+			fails = 0
 		}
-		select {
-		case <-ctx.Done():
+		if err := sleepCtx(ctx, backoffFor(a.cfg.HeartbeatInterval, fails)); err != nil {
+			return err
+		}
+	}
+}
+
+// enrollWithRetry keeps trying to register while the failure is a transport
+// failure. A refused token or a missing --server is a configuration mistake and
+// fails immediately, because no amount of waiting will fix it.
+func (a *Agent) enrollWithRetry(ctx context.Context) error {
+	for attempt := 1; ; attempt++ {
+		err := a.Enroll(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case <-ticker.C:
 		}
+		if !errors.Is(err, ErrServerUnreachable) {
+			return err
+		}
+		delay := backoffFor(a.cfg.HeartbeatInterval, attempt)
+		a.log.Warn("enrollment could not reach the server; will retry",
+			"error", err, "attempt", attempt, "retryIn", delay.String())
+		if serr := sleepCtx(ctx, delay); serr != nil {
+			return serr
+		}
+	}
+}
+
+// backoffFor returns the wait before retry number fails (1-based). fails <= 0
+// means the last attempt succeeded, so the normal interval applies.
+func backoffFor(base time.Duration, fails int) time.Duration {
+	if base <= 0 {
+		base = DefaultHeartbeatInterval
+	}
+	if fails <= 1 {
+		return base
+	}
+	d := base
+	for i := 1; i < fails; i++ {
+		d *= 2
+		if d >= MaxRetryInterval {
+			return MaxRetryInterval
+		}
+	}
+	return d
+}
+
+// sleepCtx waits for d, or returns the context error if it is cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
@@ -154,6 +232,9 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 // Enroll loads the stored configuration, registering with the server when no API
 // key is present yet.
 func (a *Agent) Enroll(ctx context.Context) error {
+	if err := EnsureConfigDir(a.cfg.ConfigDir); err != nil {
+		return err
+	}
 	if err := a.loadConfig(); err != nil {
 		return err
 	}
@@ -182,6 +263,12 @@ func (a *Agent) Enroll(ctx context.Context) error {
 	}
 	var res agentmgr.RegisterResponse
 	if err := a.doJSON(ctx, http.MethodPost, "/api/agents/register", req, &res, false); err != nil {
+		if errors.Is(err, ErrServerUnreachable) {
+			return fmt.Errorf("agent: cannot reach the ProxBack server at %s: %w\n"+
+				"Check the URL, that the guest can route to it, and DNS. "+
+				"If the server uses a self-signed certificate, add --insecure",
+				a.self.ServerURL, err)
+		}
 		return fmt.Errorf("agent: register: %w", err)
 	}
 	a.self.AgentID = res.AgentID
@@ -378,7 +465,10 @@ func (a *Agent) doJSON(ctx context.Context, method, path string, body, out any, 
 	}
 	resp, err := a.hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("agent: %s %s: %w", method, path, err)
+		// Never reached the server: retryable. Kept distinct from an HTTP
+		// error status so callers can tell "come back later" from "this will
+		// never work".
+		return fmt.Errorf("agent: %s %s: %w: %w", method, path, ErrServerUnreachable, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))

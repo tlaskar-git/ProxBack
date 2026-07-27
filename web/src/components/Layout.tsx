@@ -18,6 +18,8 @@ import {
 import type { LucideIcon } from 'lucide-react'
 import { cn } from '../lib/cn'
 import { useSession } from '../session'
+import { ThemeToggle } from '../theme'
+import { BrandLockup } from './Brand'
 import { Button } from './ui'
 
 interface NavItem {
@@ -55,16 +57,10 @@ const NAV_GROUPS: { heading: string; items: NavItem[] }[] = [
   },
 ]
 
-function Brand() {
+function SidebarBrand() {
   return (
-    <div className="flex h-14 items-center gap-2.5 border-b border-slate-800/80 px-4">
-      <div className="flex size-7 items-center justify-center rounded-md bg-accent-500/15 text-accent-400 ring-1 ring-accent-500/30">
-        <ShieldCheck className="size-4" aria-hidden />
-      </div>
-      <div className="leading-none">
-        <p className="text-[13px] font-semibold tracking-tight text-white">ProxBack</p>
-        <p className="mt-1 text-micro text-slate-500">Proxmox VE backup</p>
-      </div>
+    <div className="flex h-14 items-center border-b border-slate-800/80 px-4">
+      <BrandLockup subtitle="Proxmox VE recovery" />
     </div>
   )
 }
@@ -96,7 +92,7 @@ function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
                     cn(
                       'group relative flex h-8 items-center gap-2.5 rounded-md px-2.5 text-[13px] transition-colors duration-150',
                       isActive
-                        ? 'bg-slate-800/80 font-medium text-white before:absolute before:top-1.5 before:bottom-1.5 before:-left-2.5 before:w-[3px] before:rounded-r-full before:bg-accent-400'
+                        ? 'bg-slate-800/80 font-medium text-slate-50 before:absolute before:top-1.5 before:bottom-1.5 before:-left-2.5 before:w-[3px] before:rounded-r-full before:bg-accent-400'
                         : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-100',
                     )
                   }
@@ -136,7 +132,7 @@ export function Layout() {
     <div className="flex min-h-full bg-slate-950">
       {/* Desktop sidebar */}
       <aside className="fixed inset-y-0 left-0 hidden w-56 flex-col border-r border-slate-800/90 bg-slate-900/45 lg:flex">
-        <Brand />
+        <SidebarBrand />
         <SidebarNav />
         <div className="flex items-center justify-between gap-2 border-t border-slate-800/80 px-4 py-2.5">
           <p className="truncate text-micro text-slate-600">Signed in as {user.username}</p>
@@ -155,10 +151,10 @@ export function Layout() {
             type="button"
             aria-label="Close navigation"
             onClick={() => setDrawerOpen(false)}
-            className="pb-overlay-in absolute inset-0 cursor-default bg-slate-950/80 backdrop-blur-sm"
+            className="scrim pb-overlay-in absolute inset-0 cursor-default"
           />
           <aside className="pb-modal-in relative flex h-full w-56 flex-col border-r border-slate-800 bg-slate-900">
-            <Brand />
+            <SidebarBrand />
             <SidebarNav onNavigate={() => setDrawerOpen(false)} />
           </aside>
         </div>
@@ -183,6 +179,7 @@ export function Layout() {
           </div>
 
           <div className="ml-auto flex items-center gap-2">
+            <ThemeToggle />
             <span className="hidden text-meta text-slate-500 sm:inline">{user.username}</span>
             <Button size="sm" icon={<LogOut className="size-3.5" aria-hidden />} onClick={signOut}>
               Sign out
@@ -193,8 +190,8 @@ export function Layout() {
         <main className="min-w-0 flex-1 px-4 py-6 sm:px-6 lg:px-8">
           <div className="mx-auto max-w-7xl">
             {mustChangePassword ? (
-              <div className="mb-5 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
-                <TriangleAlert className="size-4 shrink-0 text-amber-400" aria-hidden />
+              <div className="mb-5 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-warn-500/30 bg-warn-500/10 px-4 py-3 text-sm text-warn-200">
+                <TriangleAlert className="size-4 shrink-0 text-warn-400" aria-hidden />
                 <span className="min-w-0 flex-1">
                   This server still uses the default <span className="font-semibold">admin</span> /{' '}
                   <span className="font-semibold">admin</span> password. Anyone who can reach it can
@@ -202,7 +199,7 @@ export function Layout() {
                 </span>
                 <NavLink
                   to="/settings"
-                  className="rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-200 transition-colors duration-150 hover:bg-amber-500/15"
+                  className="rounded-lg border border-warn-500/40 px-3 py-1.5 text-xs font-medium text-warn-200 transition-colors duration-150 hover:bg-warn-500/15"
                 >
                   Change password
                 </NavLink>

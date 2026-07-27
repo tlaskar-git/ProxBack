@@ -16,9 +16,15 @@ import {
   agentSourceOf,
   allTagsOf,
   createJob,
+  DEFAULT_POLICY,
+  DEFAULT_RETENTION,
+  describeRetention,
   errorMessage,
+  parsePolicy,
+  parseRetention,
   parseSchedule,
   patchJob,
+  retentionRuleCount,
   tagsOf,
   vmSourcesOf,
   vmsWithTag,
@@ -30,7 +36,9 @@ import type {
   Job,
   JobCreate,
   JobKind,
+  JobPolicy,
   JobSources,
+  RetentionPolicy,
   Schedule,
   Target,
 } from '../api'
@@ -43,7 +51,10 @@ import {
   nextRunOf,
 } from '../lib/format'
 import { useServerTimezone } from '../lib/useServerTimezone'
+import { WorkloadIdentity } from './Identity'
 import { Modal } from './Modal'
+import { PolicyStep, PolicySummary } from './PolicyStep'
+import { RetentionStep } from './RetentionStep'
 import { isScheduleComplete, ScheduleEditor } from './ScheduleEditor'
 import { useToast } from './Toast'
 import {
@@ -61,7 +72,7 @@ import {
   toneForStatus,
 } from './ui'
 
-const STEPS = ['Sources', 'Target', 'Schedule', 'Retention', 'Review'] as const
+const STEPS = ['Sources', 'Target', 'Schedule', 'Retention', 'Protection', 'Review'] as const
 
 /** New jobs land on a nightly window rather than on nothing or on cron. */
 const DEFAULT_SCHEDULE: Schedule = { kind: 'daily', time: '02:00' }
@@ -84,7 +95,8 @@ interface WizardState {
   paths: string[]
   targetId: ID | ''
   schedule: Schedule
-  retention: number
+  retention: RetentionPolicy
+  policy: JobPolicy
   enabled: boolean
 }
 
@@ -111,7 +123,8 @@ function initialState(
       paths: agentSource?.paths ?? [],
       targetId: editJob.targetId,
       schedule: parseSchedule(editJob.schedule),
-      retention: editJob.retention,
+      retention: parseRetention(editJob.retention),
+      policy: parsePolicy(editJob.policy),
       enabled: editJob.enabled,
     }
   }
@@ -126,7 +139,8 @@ function initialState(
     paths: [],
     targetId: '',
     schedule: DEFAULT_SCHEDULE,
-    retention: 7,
+    retention: { ...DEFAULT_RETENTION },
+    policy: { ...DEFAULT_POLICY },
     enabled: true,
   }
 }
@@ -143,7 +157,7 @@ function StepRail({ step }: { step: number }) {
               className={cn(
                 'flex size-5 items-center justify-center rounded-full border text-[10px] font-semibold',
                 done
-                  ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                  ? 'border-ok-500/40 bg-ok-500/15 text-ok-300'
                   : active
                     ? 'border-accent-500/50 bg-accent-500/15 text-accent-300'
                     : 'border-slate-700 bg-slate-900 text-slate-500',
@@ -204,7 +218,7 @@ function SelectTile({
         {icon}
       </span>
       <span className="min-w-0">
-        <span className={cn('block text-sm font-medium', selected ? 'text-white' : 'text-slate-200')}>
+        <span className={cn('block text-sm font-medium', selected ? 'text-slate-50' : 'text-slate-200')}>
           {title}
         </span>
         <span className="mt-0.5 block text-xs leading-relaxed text-slate-500">{description}</span>
@@ -296,7 +310,8 @@ export function JobWizard({
       case 2:
         return isScheduleComplete(state.schedule)
       case 3:
-        return Number.isFinite(state.retention) && state.retention >= 1
+        // A policy that keeps nothing is not a policy.
+        return retentionRuleCount(state.retention) >= 1
       default:
         return true
     }
@@ -342,6 +357,7 @@ export function JobWizard({
       targetId: state.targetId as ID,
       schedule,
       retention: state.retention,
+      policy: state.policy,
       sources,
       enabled: state.enabled,
       // Only VM jobs carry a tag filter; "" clears one that was set before.
@@ -518,8 +534,15 @@ export function JobWizard({
                             className="flex items-center gap-2 px-1 py-1 text-xs"
                           >
                             <Laptop className="size-3.5 shrink-0 text-slate-600" aria-hidden />
-                            <span className="truncate text-slate-300">{vm.name}</span>
-                            <Num className="shrink-0 text-slate-500">#{vm.vmid}</Num>
+                            <WorkloadIdentity
+                              inline
+                              workload={{
+                                hostName: vm.hostName,
+                                name: vm.name,
+                                vmid: vm.vmid,
+                                node: vm.node,
+                              }}
+                            />
                             <span className="ml-auto flex shrink-0 items-center gap-1">
                               {tagsOf(vm)
                                 .filter((tag) => tag !== state.tagFilter)
@@ -531,7 +554,7 @@ export function JobWizard({
                           </li>
                         ))}
                         {tagMatches.length === 0 ? (
-                          <li className="px-1 py-2 text-xs text-amber-400/80">
+                          <li className="px-1 py-2 text-xs text-warn-300">
                             Nothing carries this tag yet — a run that resolves to zero VMs fails.
                           </li>
                         ) : null}
@@ -589,21 +612,24 @@ export function JobWizard({
                               className={cn(
                                 'flex size-4 shrink-0 items-center justify-center rounded border',
                                 selected
-                                  ? 'border-accent-400 bg-accent-500 text-white'
+                                  ? 'border-accent-400 bg-accent-500 text-slate-50'
                                   : 'border-slate-600',
                               )}
                             >
                               {selected ? <Check className="size-3" aria-hidden /> : null}
                             </span>
                             <span className="min-w-0 flex-1">
-                              <span className="block truncate text-sm text-slate-200">
-                                {vm.name}
-                                <span className="ml-2 font-mono text-xs text-slate-500">
-                                  #{vm.vmid}
-                                </span>
-                              </span>
-                              <span className="block truncate text-xs text-slate-500">
-                                {vm.hostName} · {vm.node} · {formatBytes(vm.maxdisk)} disk
+                              <WorkloadIdentity
+                                emphasis={selected ? 'strong' : 'normal'}
+                                workload={{
+                                  hostName: vm.hostName,
+                                  name: vm.name,
+                                  vmid: vm.vmid,
+                                  node: vm.node,
+                                }}
+                              />
+                              <span className="mt-0.5 block truncate text-micro text-slate-600">
+                                {formatBytes(vm.maxdisk)} disk
                               </span>
                             </span>
                             {tagsOf(vm).length > 0 ? (
@@ -729,7 +755,7 @@ export function JobWizard({
             </div>
           )}
           <SectionNote>
-            Chunks are deduplicated per target, so pointing several jobs at the same bucket shrinks
+            Data reduction happens per target, so pointing several jobs at the same bucket shrinks
             total storage.
           </SectionNote>
         </div>
@@ -746,45 +772,25 @@ export function JobWizard({
 
       {/* Step 4 — retention */}
       {step === 3 ? (
-        <div className="space-y-4">
-          <Field
-            label="Keep last N restore points"
-            hint="Older restore points are pruned after each successful run, and chunks referenced by no remaining manifest are garbage-collected."
-          >
-            {({ id }) => (
-              <Input
-                id={id}
-                type="number"
-                min={1}
-                max={9999}
-                value={String(state.retention)}
-                className="w-32"
-                onChange={(event) => patch({ retention: Number(event.target.value) })}
-              />
-            )}
-          </Field>
-
-          <div className="flex flex-wrap gap-2">
-            {[3, 7, 14, 30].map((value) => (
-              <Button
-                key={value}
-                size="sm"
-                variant={state.retention === value ? 'primary' : 'secondary'}
-                onClick={() => patch({ retention: value })}
-              >
-                Keep {value}
-              </Button>
-            ))}
-          </div>
-
-          {state.retention < 1 ? (
-            <p className="text-xs text-red-400">Keep at least one restore point.</p>
-          ) : null}
-        </div>
+        <RetentionStep
+          value={state.retention}
+          onChange={(retention) => patch({ retention })}
+          jobId={editJob?.id}
+        />
       ) : null}
 
-      {/* Step 5 — review */}
+      {/* Step 5 — advanced protection. Optional: every default here is the
+          behaviour of a job created without ever opening it. */}
       {step === 4 ? (
+        <PolicyStep
+          value={state.policy}
+          kind={state.kind}
+          onChange={(policy) => patch({ policy })}
+        />
+      ) : null}
+
+      {/* Step 6 — review */}
+      {step === 5 ? (
         <div className="space-y-4">
           <dl className="divide-y divide-slate-800 overflow-hidden rounded-lg border border-slate-800 bg-slate-950/40">
             {[
@@ -807,7 +813,22 @@ export function JobWizard({
                   state.selectedVMs.length === 0 ? (
                     '—'
                   ) : (
-                    state.selectedVMs.map((vm) => `${vm.name} (#${vm.vmid})`).join(', ')
+                    // Canonical identity, so a review never says "db-01" when
+                    // two clusters each hold one.
+                    <span className="flex flex-col gap-1">
+                      {state.selectedVMs.map((vm) => (
+                        <WorkloadIdentity
+                          key={vmKey(vm.hostId, vm.vmid)}
+                          inline
+                          workload={{
+                            hostName: vm.hostName,
+                            name: vm.name,
+                            vmid: vm.vmid,
+                            node: vm.node,
+                          }}
+                        />
+                      ))}
+                    </span>
                   )
                 ) : (
                   `${selectedAgent?.hostname ?? '—'} — ${state.paths.length} ${
@@ -830,7 +851,11 @@ export function JobWizard({
                   </span>
                 ),
               },
-              { label: 'Retention', value: `Keep last ${state.retention}` },
+              { label: 'Retention', value: describeRetention(state.retention) },
+              {
+                label: 'Protection',
+                value: <PolicySummary policy={state.policy} kind={state.kind} />,
+              },
             ].map((row) => (
               <div key={row.label} className="flex gap-4 px-4 py-2.5">
                 <dt className="w-28 shrink-0 text-xs text-slate-500">{row.label}</dt>
@@ -864,7 +889,7 @@ export function JobWizard({
           </div>
 
           {error ? (
-            <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+            <p className="rounded-lg border border-fail-500/30 bg-fail-500/10 px-3.5 py-2.5 text-xs text-fail-300">
               {error}
             </p>
           ) : null}

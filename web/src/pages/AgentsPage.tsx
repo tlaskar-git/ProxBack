@@ -188,7 +188,7 @@ function DeploySection() {
           <SectionNote>
             Generate a token to fill the commands below. The agent exchanges it once for a permanent
             API key, then heartbeats every 15 seconds. Agents never see your storage credentials —
-            chunks are uploaded through this server.
+            all data is transferred through this server.
           </SectionNote>
         )}
 

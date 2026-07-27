@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -233,6 +234,33 @@ func (s *Server) handleHostVMs(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toVMDTO(v, false))
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleFreeVMID suggests the lowest guest id a restore can safely land on:
+// the first id at or above 100 (or an optional ?after= hint) that no guest on
+// the host occupies. It is what makes "alongside" the easy choice rather than
+// the annoying one.
+func (s *Server) handleFreeVMID(w http.ResponseWriter, r *http.Request) {
+	host, err := s.st.PVEHostByID(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		s.notFoundOr(w, err, "host")
+		return
+	}
+	after := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("after")); v != "" {
+		n, convErr := strconv.Atoi(v)
+		if convErr != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "after must be a non-negative integer")
+			return
+		}
+		after = n
+	}
+	vmid, err := s.sched.FreeVMIDForHost(r.Context(), host.ID, after)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "could not query Proxmox host: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"vmid": vmid})
 }
 
 func (s *Server) handleListVMs(w http.ResponseWriter, r *http.Request) {

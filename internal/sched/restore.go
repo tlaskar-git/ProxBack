@@ -14,7 +14,8 @@ import (
 	"proxback/internal/store"
 )
 
-func (m *Manager) executeRestore(ctx context.Context, run *store.JobRun, backup *store.Backup, spec RestoreSpec) (*engine.Stats, error) {
+func (m *Manager) executeRestore(ctx context.Context, run *store.JobRun, backup *store.Backup,
+	spec RestoreSpec, plan restorePlan) (*engine.Stats, error) {
 	eng, _, err := m.engineFor(ctx, backup.TargetID)
 	if err != nil {
 		return nil, err
@@ -27,7 +28,7 @@ func (m *Manager) executeRestore(ctx context.Context, run *store.JobRun, backup 
 
 	switch backup.SourceKind {
 	case store.SourceVM:
-		if err := m.restoreVM(ctx, run.ID, sess, man, spec); err != nil {
+		if err := m.restoreVM(ctx, run.ID, sess, man, spec, plan); err != nil {
 			return statsPtr(sess), err
 		}
 	case store.SourceAgent:
@@ -42,8 +43,12 @@ func (m *Manager) executeRestore(ctx context.Context, run *store.JobRun, backup 
 	return statsPtr(sess), nil
 }
 
-// executeVerify re-reads every chunk of a restore point and validates it
-// against the manifest. Nothing is written: success means the point restores.
+// executeVerify re-reads every chunk of a restore point and validates its
+// SHA-256 and size against the manifest. Nothing is written.
+//
+// What success means is exactly this: the stored data is intact and complete.
+// It is evidence of integrity, not of recoverability — no guest has been booted
+// from it — and nothing in ProxBack may present it as a tested restore.
 func (m *Manager) executeVerify(ctx context.Context, run *store.JobRun, backup *store.Backup) (*engine.Stats, error) {
 	eng, _, err := m.engineFor(ctx, backup.TargetID)
 	if err != nil {
@@ -62,14 +67,43 @@ func (m *Manager) executeVerify(ctx context.Context, run *store.JobRun, backup *
 	}
 	sess.SetStep("Verified")
 	sess.Flush()
+	m.logRun(ctx, run.ID, "integrity verified: every stored chunk was re-read and its SHA-256 matched "+
+		"(%s). This proves the stored data is intact; it is not a restore test.",
+		humanBytes(sess.Stats().BytesProcessed))
 	return statsPtr(sess), nil
 }
 
-func (m *Manager) restoreVM(ctx context.Context, runID string, sess *engine.Session, man *engine.Manifest, spec RestoreSpec) error {
+// recordVerification attaches a verification's outcome to the restore point it
+// examined, so the evidence lives with the point rather than only in run
+// history. A cancelled verification proves nothing and is not recorded.
+func (m *Manager) recordVerification(backupID string, stats *engine.Stats, verifyErr error) {
+	if errors.Is(verifyErr, context.Canceled) {
+		return
+	}
+	result := store.VerifyPassed
+	if verifyErr != nil {
+		result = store.VerifyFailed
+	}
+	var verified int64
+	if stats != nil && verifyErr == nil {
+		verified = stats.BytesProcessed
+	}
+	if err := m.st.RecordBackupVerification(m.detached(), backupID, store.Now(), result, verified); err != nil {
+		m.log.Warn("could not record the verification result",
+			"backup", backupID, "result", result, "error", err)
+	}
+}
+
+func (m *Manager) restoreVM(ctx context.Context, runID string, sess *engine.Session,
+	man *engine.Manifest, spec RestoreSpec, plan restorePlan) error {
 	if spec.VM == nil {
 		return errors.New("sched: vm restore target required")
 	}
-	host, err := m.st.PVEHostByID(ctx, spec.VM.HostID)
+	hostID := spec.VM.HostID
+	if hostID == "" {
+		hostID = plan.meta.HostID
+	}
+	host, err := m.st.PVEHostByID(ctx, hostID)
 	if err != nil {
 		return fmt.Errorf("load proxmox host: %w", err)
 	}
@@ -78,21 +112,24 @@ func (m *Manager) restoreVM(ctx context.Context, runID string, sess *engine.Sess
 		return err
 	}
 	sourceVMID, sourceErr := vmidFromSourceID(man.SourceID)
-	vmid := spec.VM.VMID
+	// The destination was resolved and safety-checked before the run started.
+	vmid := plan.vmid
 	if vmid == 0 {
-		if sourceErr != nil {
-			return sourceErr
+		if vmid = spec.VM.VMID; vmid == 0 {
+			if sourceErr != nil {
+				return sourceErr
+			}
+			vmid = sourceVMID
 		}
-		vmid = sourceVMID
 	}
 	viaHelper := IsVMAManifest(man.Disks)
-	node := spec.VM.Node
+	node := plan.node
 	if node == "" {
 		node, err = client.FindNodeForVM(ctx, vmid)
 		if err != nil {
-			// Restoring a helper-backed point into a vmid that does not exist yet
-			// is the normal side-by-side case: fall back to the source's node.
-			if !viaHelper || sourceErr != nil {
+			// Restoring into a vmid that does not exist yet is the normal
+			// alongside case: fall back to the source's node.
+			if sourceErr != nil {
 				return err
 			}
 			if node, err = client.FindNodeForVM(ctx, sourceVMID); err != nil {
@@ -103,19 +140,18 @@ func (m *Manager) restoreVM(ctx context.Context, runID string, sess *engine.Sess
 	if viaHelper {
 		// A whole-guest archive can only go back through qmrestore, which only
 		// the node helper can run.
-		h, err := m.requireHelperForNode(ctx, node)
+		h, err := m.requireHelperForNode(ctx, host.ID, node)
 		if err != nil {
 			return err
 		}
-		m.logRun(ctx, runID, "restoring %s into vm %d on node %s via qmrestore on the node helper",
-			man.SourceName, vmid, node)
-		// --force overwrites an existing guest, which is only ever what the
-		// operator meant when restoring onto the same vmid it came from.
-		force := sourceErr == nil && vmid == sourceVMID
-		return m.restoreViaHelper(ctx, sess, man, h, vmid, spec.VM.Storage, force)
+		m.logRun(ctx, runID, "restoring %s into vm %d on %s/%s (%s) via qmrestore on the node helper",
+			man.SourceName, vmid, host.Name, node, plan.meta.Mode)
+		// --force overwrites an existing guest, so it is set only for a restore
+		// the operator explicitly confirmed as an overwrite.
+		return m.restoreViaHelper(ctx, sess, man, h, vmid, spec.VM.Storage, plan.force)
 	}
-	m.logRun(ctx, runID, "restoring %s into vm %d on node %s via per-disk import (%s)",
-		man.SourceName, vmid, node, countNoun(len(man.Disks), "disk"))
+	m.logRun(ctx, runID, "restoring %s into vm %d on %s/%s (%s) via per-disk import (%s)",
+		man.SourceName, vmid, host.Name, node, plan.meta.Mode, countNoun(len(man.Disks), "disk"))
 	for _, disk := range man.Disks {
 		if err := ctx.Err(); err != nil {
 			return err

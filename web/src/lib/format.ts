@@ -33,12 +33,54 @@ export function formatPct(pct: number | null | undefined, digits = 0): string {
 }
 
 /**
- * Dedup ratio as a multiplier, e.g. `3.4×`. The engine reports
- * processed ÷ uploaded, so 1 means nothing was deduplicated.
+ * Data-reduction ratio as a multiplier, e.g. `3.4×`.
+ *
+ * `null` is a real answer, not a missing one: a run that uploaded nothing has
+ * no finite ratio, and printing `1.0×` for it would claim the opposite of what
+ * happened. Callers render the percentage in that case.
  */
 export function formatRatio(ratio: number | null | undefined): string {
   if (ratio === null || ratio === undefined || !Number.isFinite(ratio) || ratio <= 0) return '—'
   return `${ratio.toFixed(ratio >= 10 ? 0 : 1)}×`
+}
+
+/** Share of source data that never had to travel, e.g. `100% avoided`. */
+export function formatReduction(pct: number | null | undefined): string {
+  return `${clampPct(pct).toFixed(0)}% avoided`
+}
+
+/**
+ * Age of a workload's last success against its RPO, phrased as evidence.
+ * `null` inputs mean the server did not state an RPO, and no verdict is
+ * invented locally.
+ */
+export function describeRpo(
+  ageHours: number | null | undefined,
+  rpoHours: number | null | undefined,
+): string | null {
+  if (
+    ageHours === null ||
+    ageHours === undefined ||
+    !Number.isFinite(ageHours) ||
+    rpoHours === null ||
+    rpoHours === undefined ||
+    !Number.isFinite(rpoHours) ||
+    rpoHours <= 0
+  ) {
+    return null
+  }
+  const over = ageHours - rpoHours
+  if (over <= 0) return `within ${formatHours(rpoHours)} RPO`
+  return `${formatHours(over)} over ${formatHours(rpoHours)} RPO`
+}
+
+/** Hours as a short human span: `90 min`, `6 h`, `2 d`. */
+export function formatHours(hours: number | null | undefined): string {
+  if (hours === null || hours === undefined || !Number.isFinite(hours)) return '—'
+  const value = Math.max(0, hours)
+  if (value < 1) return `${Math.round(value * 60)} min`
+  if (value < 48) return `${value < 10 ? value.toFixed(1).replace(/\.0$/, '') : Math.round(value)} h`
+  return `${Math.round(value / 24)} d`
 }
 
 function toDate(value: string | null | undefined): Date | null {

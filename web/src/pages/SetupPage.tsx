@@ -52,7 +52,7 @@ export function SetupPage({ onAuthenticated }: { onAuthenticated: (user: User) =
     <AuthShell
       title="Create the administrator account"
       subtitle="This is the first run of this server. The account you create here owns the console."
-      footer="Only one administrator can be created during setup. Additional users can be added later."
+      footer="This account is the only way into the console — there is no password recovery."
     >
       <form className="space-y-4" onSubmit={(event) => void onSubmit(event)} noValidate>
         <Field label="Username">
@@ -93,7 +93,7 @@ export function SetupPage({ onAuthenticated }: { onAuthenticated: (user: User) =
         </Field>
 
         {error ? (
-          <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+          <p className="rounded-lg border border-fail-500/30 bg-fail-500/10 px-3.5 py-2.5 text-xs text-fail-300">
             {error}
           </p>
         ) : (

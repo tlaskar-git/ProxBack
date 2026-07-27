@@ -17,17 +17,21 @@ import {
 import {
   agentSourceOf,
   deleteJob,
+  describeRetention,
   errorMessage,
   listAgents,
   listJobs,
   listTargets,
   listVMs,
+  parsePolicy,
   patchJob,
   runJob,
   vmSourcesOf,
 } from '../api'
-import type { Agent, CachedVM, Job, Target } from '../api'
+import type { Agent, CachedVM, ID, Job, Target } from '../api'
+import { identityText } from '../components/Identity'
 import { JobWizard } from '../components/JobWizard'
+import { PolicySummary } from '../components/PolicyStep'
 import { useConfirm } from '../components/Confirm'
 import { useToast } from '../components/Toast'
 import {
@@ -61,15 +65,28 @@ interface JobsData {
   agents: Agent[]
 }
 
-function sourceSummary(job: Job, agents: Agent[]): string {
+/**
+ * Sources, named the way the estate names them. A VM source carries a hostId
+ * but no host *name*, so the cluster is resolved through the cached inventory
+ * — without it two clusters' `db-01` read identically in this row.
+ */
+function sourceSummary(job: Job, agents: Agent[], vms: CachedVM[]): string {
   if (job.kind === 'vm') {
     const sources = vmSourcesOf(job)
     if (sources.length === 0) return 'No sources'
-    if (sources.length <= 3) return sources.map((source) => source.name).join(', ')
-    return `${sources
-      .slice(0, 2)
-      .map((source) => source.name)
-      .join(', ')} + ${sources.length - 2} more`
+    const label = (source: { hostId: ID; vmid: number; name: string }) => {
+      const vm = vms.find(
+        (item) => String(item.hostId) === String(source.hostId) && item.vmid === source.vmid,
+      )
+      return identityText({
+        hostName: vm?.hostName,
+        name: source.name,
+        vmid: source.vmid,
+        node: vm?.node,
+      })
+    }
+    if (sources.length <= 2) return sources.map(label).join(' · ')
+    return `${sources.slice(0, 2).map(label).join(' · ')} + ${sources.length - 2} more`
   }
   const source = agentSourceOf(job)
   if (!source) return 'No sources'
@@ -81,11 +98,13 @@ function sourceSummary(job: Job, agents: Agent[]): string {
 function JobRow({
   job,
   agents,
+  vms,
   onChanged,
   onEdit,
 }: {
   job: Job
   agents: Agent[]
+  vms: CachedVM[]
   onChanged: () => void
   onEdit: () => void
 }) {
@@ -168,10 +187,10 @@ function JobRow({
           <div className="flex flex-wrap items-center gap-2">
             <p className="truncate text-sm font-semibold text-slate-100">{job.name}</p>
             <StatusPill
-              tone={job.kind === 'vm' ? 'blue' : 'slate'}
+              tone={job.kind === 'vm' ? 'brand' : 'neutral'}
               label={job.kind === 'vm' ? 'VM image' : 'Agent files'}
             />
-            {!job.enabled ? <StatusPill tone="amber" label="disabled" /> : null}
+            {!job.enabled ? <StatusPill tone="warn" label="disabled" /> : null}
           </div>
 
           {job.kind === 'vm' && job.tagFilter ? (
@@ -182,7 +201,7 @@ function JobRow({
               <span>every VM carrying this tag, resolved at run time</span>
             </p>
           ) : (
-            <p className="mt-1 truncate text-xs text-slate-500">{sourceSummary(job, agents)}</p>
+            <p className="mt-1 truncate text-xs text-slate-500">{sourceSummary(job, agents, vms)}</p>
           )}
 
           <div className="mt-2.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs text-slate-500">
@@ -200,22 +219,26 @@ function JobRow({
               <Clock className="size-3.5 text-slate-600" aria-hidden />
               {describeNextRun(job.nextRun, job)}
             </span>
-            <span>
-              Keep last <Num>{job.retention}</Num>
-            </span>
+            <span>{describeRetention(job.retention)}</span>
             {lastRun ? (
               <span className="inline-flex items-center gap-2">
                 <RunStatusPill status={lastRun.status} />
                 <span>{formatRelative(lastRun.startedAt)}</span>
                 {lastRun.status !== 'running' ? (
                   <span className="text-slate-600">
-                    <Num>{formatBytes(lastRun.bytesUploaded)}</Num> uploaded
+                    <Num>{formatBytes(lastRun.bytesUploaded)}</Num> transferred
                   </span>
                 ) : null}
               </span>
             ) : (
               <span className="text-slate-600">Never run</span>
             )}
+          </div>
+
+          {/* The effective protection policy, so what a job actually does is
+              readable without opening the wizard. */}
+          <div className="mt-2">
+            <PolicySummary policy={parsePolicy(job.policy)} kind={job.kind} />
           </div>
 
           {running && lastRun ? (
@@ -229,7 +252,7 @@ function JobRow({
           ) : null}
 
           {lastRun?.status === 'failed' && lastRun.error ? (
-            <p className="mt-2 max-w-2xl rounded-md border border-red-500/25 bg-red-500/5 px-2.5 py-1.5 text-xs text-red-300/90">
+            <p className="mt-2 max-w-2xl rounded-md border border-fail-500/25 bg-fail-500/5 px-2.5 py-1.5 text-xs text-fail-300/90">
               {lastRun.error}
             </p>
           ) : null}
@@ -358,6 +381,7 @@ export function JobsPage() {
               key={String(job.id)}
               job={job}
               agents={data?.agents ?? []}
+              vms={data?.vms ?? []}
               onChanged={() => void refresh()}
               onEdit={() => openEdit(job)}
             />

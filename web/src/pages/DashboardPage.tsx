@@ -1,5 +1,4 @@
-import { lazy, Suspense, useCallback, useMemo } from 'react'
-import type { ReactNode } from 'react'
+import { lazy, Suspense, useCallback, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   Activity,
@@ -9,17 +8,25 @@ import {
   Laptop,
   RefreshCw,
   Server,
-  ShieldAlert,
   ShieldCheck,
-  Sparkles,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { getDashboard, listJobs, listVMs, tagsOf, vmSourcesOf } from '../api'
-import type { CachedVM, DashboardStats, Job, JobRun } from '../api'
+import { errorMessage, getDashboard, getPosture, listJobs, reductionOf } from '../api'
+import type {
+  DashboardStats,
+  Job,
+  JobRun,
+  Posture,
+  PostureVerdict,
+  PostureWorkload,
+  WorkloadStatus,
+} from '../api'
+import { WorkloadIdentity } from '../components/Identity'
 import {
   Button,
   Card,
   CardHeader,
+  ChipButton,
   EmptyState,
   ErrorBlock,
   LiveDot,
@@ -30,283 +37,393 @@ import {
   SectionHeading,
   SkeletonCards,
   Spinner,
+  StatusPill,
 } from '../components/ui'
 import type { PillTone } from '../components/ui'
 import { useAsync, usePolling } from '../lib/useAsync'
 import { cn } from '../lib/cn'
 import {
   clampPct,
+  describeRpo,
   formatBytes,
   formatCount,
   formatDateTime,
   formatDuration,
   formatRatio,
+  formatReduction,
   formatRelative,
 } from '../lib/format'
 
 interface DashboardData {
   stats: DashboardStats
   jobs: Job[]
-  vms: CachedVM[]
+  /** null when the server could not evaluate posture — never faked locally. */
+  posture: Posture | null
+  postureError: string | null
 }
 
 /* ---------------------------------------------------------------------------
- * Estate status strip
+ * Verdict
  *
- * The one thing an operator wants on opening a backup console is "is my estate
- * healthy?". The strip answers it above the fold in five cells, and colour is
- * spent only where it means something: the verdict, and the count of things
- * that need a human.
+ * The verdict is the server's, computed per workload against each workload's
+ * own RPO. The console's whole job here is to *show its working*: the
+ * headline, the counts behind it, and every reason that produced it. Nothing
+ * on this page asserts health the posture payload did not state.
  * ------------------------------------------------------------------------- */
 
-interface Verdict {
-  tone: PillTone
-  headline: string
-  detail: string
+const VERDICT_LABEL: Record<PostureVerdict, string> = {
+  protected: 'Protected',
+  at_risk: 'At risk',
+  unprotected: 'Unprotected',
+  unknown: 'Unknown',
 }
 
-/** Newest successful backup run, if any. */
-function lastSuccess(runs: JobRun[]): JobRun | null {
-  return (
-    runs
-      .filter((run) => run.status === 'success')
-      .sort(
-        (a, b) =>
-          new Date(b.finishedAt ?? b.startedAt).getTime() -
-          new Date(a.finishedAt ?? a.startedAt).getTime(),
-      )[0] ?? null
-  )
+const VERDICT_TONE: Record<PostureVerdict, PillTone> = {
+  protected: 'ok',
+  at_risk: 'warn',
+  unprotected: 'fail',
+  unknown: 'neutral',
 }
 
-/** Soonest upcoming fire time across enabled jobs. */
-function nextScheduled(jobs: Job[]): Job | null {
-  return (
-    jobs
-      .filter((job) => job.enabled && job.nextRun)
-      .sort(
-        (a, b) => new Date(a.nextRun as string).getTime() - new Date(b.nextRun as string).getTime(),
-      )[0] ?? null
-  )
+const VERDICT_WASH: Record<PillTone, string> = {
+  ok: 'border-ok-500/30 bg-ok-500/[0.07]',
+  warn: 'border-warn-500/30 bg-warn-500/[0.07]',
+  fail: 'border-fail-500/30 bg-fail-500/[0.07]',
+  brand: 'border-accent-500/30 bg-accent-500/[0.07]',
+  neutral: 'border-slate-800 bg-slate-900/60',
 }
 
-/**
- * How many VMs a job actually covers. Fixed lists are read straight off the
- * job; tag-filtered jobs resolve against the cached inventory, which is the
- * same set the server would resolve at run start.
- */
-function protectedVMKeys(jobs: Job[], vms: CachedVM[]): Set<string> {
-  const keys = new Set<string>()
-  for (const job of jobs) {
-    if (job.kind !== 'vm' || !job.enabled) continue
-    if (job.tagFilter) {
-      for (const vm of vms) {
-        if (tagsOf(vm).includes(job.tagFilter)) keys.add(`${String(vm.hostId)}:${vm.vmid}`)
-      }
-      continue
-    }
-    for (const source of vmSourcesOf(job)) keys.add(`${String(source.hostId)}:${source.vmid}`)
-  }
-  return keys
+const VERDICT_INK: Record<PillTone, string> = {
+  ok: 'text-ok-300',
+  warn: 'text-warn-300',
+  fail: 'text-fail-300',
+  brand: 'text-accent-300',
+  neutral: 'text-slate-300',
 }
 
-function verdictOf(data: DashboardData, unprotected: number, latest: JobRun | null): Verdict {
-  const { stats, jobs } = data
+const STATUS_TONE: Record<WorkloadStatus, PillTone> = {
+  protected: 'ok',
+  at_risk: 'warn',
+  unprotected: 'fail',
+}
 
-  if (stats.last24h.failed > 0) {
+const STATUS_LABEL: Record<WorkloadStatus, string> = {
+  protected: 'Protected',
+  at_risk: 'At risk',
+  unprotected: 'Unprotected',
+}
+
+/** What an operator should do next when there is nothing to evaluate. */
+function setupRoute(stats: DashboardStats): { label: string; to: string; hint: string } {
+  if (stats.hostCount === 0) {
     return {
-      tone: 'red',
-      headline: 'Attention needed',
-      detail:
-        stats.last24h.failed === 1
-          ? '1 run failed in the last 24 hours'
-          : `${stats.last24h.failed} runs failed in the last 24 hours`,
+      label: 'Add a Proxmox host',
+      to: '/hosts',
+      hint: 'No cluster is connected yet, so there is nothing to evaluate.',
     }
   }
-  if (stats.hostCount === 0 || stats.targetCount === 0 || jobs.length === 0) {
-    return { tone: 'amber', headline: 'Setup incomplete', detail: 'Nothing is being protected yet' }
-  }
-  if (!latest) {
-    return { tone: 'amber', headline: 'No backups yet', detail: 'No job has completed a run' }
-  }
-  const ageHours =
-    (Date.now() - new Date(latest.finishedAt ?? latest.startedAt).getTime()) / 3_600_000
-  if (ageHours > 36) {
+  if (stats.targetCount === 0) {
     return {
-      tone: 'amber',
-      headline: 'Backups are stale',
-      detail: `Last success ${formatRelative(latest.finishedAt ?? latest.startedAt)}`,
+      label: 'Add a storage target',
+      to: '/targets',
+      hint: 'Backups need somewhere to go before any workload can be protected.',
     }
   }
-  if (unprotected > 0) {
+  if (stats.jobCount === 0) {
     return {
-      tone: 'amber',
-      headline: 'Partially protected',
-      detail:
-        unprotected === 1
-          ? '1 virtual machine is in no backup job'
-          : `${unprotected} virtual machines are in no backup job`,
+      label: 'Create a backup job',
+      to: '/jobs',
+      hint: 'No workload is covered by a job, so no recovery point exists to evaluate.',
     }
   }
-  return { tone: 'green', headline: 'Protected', detail: 'Every guest is covered and current' }
+  return {
+    label: 'Review backup jobs',
+    to: '/jobs',
+    hint: 'No job has completed a run yet, so there is no evidence to report.',
+  }
 }
 
-const VERDICT_SKIN: Record<PillTone, string> = {
-  green: 'bg-emerald-500/[0.07] text-emerald-300',
-  amber: 'bg-amber-500/[0.07] text-amber-300',
-  red: 'bg-red-500/[0.07] text-red-300',
-  blue: 'bg-accent-500/[0.07] text-accent-300',
-  slate: 'bg-slate-800/40 text-slate-300',
-}
-
-const VERDICT_RULE: Record<PillTone, string> = {
-  green: 'bg-emerald-400',
-  amber: 'bg-amber-400',
-  red: 'bg-red-400',
-  blue: 'bg-accent-400',
-  slate: 'bg-slate-600',
-}
-
-function StripCell({
-  label,
-  value,
-  sub,
-  to,
-  tone,
+function VerdictPanel({
+  posture,
+  stats,
+  running,
 }: {
-  label: string
-  value: ReactNode
-  sub?: ReactNode
-  to?: string
-  tone?: 'default' | 'alert'
+  posture: Posture
+  stats: DashboardStats
+  running: number
 }) {
-  const body = (
-    <>
-      <p className="eyebrow">{label}</p>
-      <p
-        className={cn(
-          'figure-lg mt-1 truncate text-[19px] leading-6',
-          tone === 'alert' ? 'text-red-300' : 'text-slate-50',
-        )}
-      >
-        {value}
-      </p>
-      <p className="mt-0.5 truncate text-meta text-slate-500">{sub ?? ' '}</p>
-    </>
-  )
-
-  // Horizontal rules while the cells stack, vertical ones once they sit in a
-  // single row — so a rule never dangles at the start of a wrapped row.
-  const classes =
-    'block min-w-0 border-t border-slate-800/80 px-5 py-4 xl:border-t-0 xl:border-l'
-
-  return to ? (
-    <Link
-      to={to}
-      className={cn(classes, 'transition-colors duration-150 hover:bg-slate-800/30')}
-    >
-      {body}
-    </Link>
-  ) : (
-    <div className={classes}>{body}</div>
-  )
-}
-
-function EstateStrip({ data }: { data: DashboardData }) {
-  const { stats, jobs, vms } = data
-  const latest = lastSuccess(stats.recentRuns)
-  const upcoming = nextScheduled(jobs)
-  const covered = protectedVMKeys(jobs, vms)
-  const totalVMs = vms.length || stats.vmCount
-  const unprotected = Math.max(0, totalVMs - covered.size)
-  const verdict = verdictOf(data, unprotected, latest)
-  const failures = stats.last24h.failed
+  const tone = VERDICT_TONE[posture.verdict]
+  const { counts } = posture
+  const total = counts.protected + counts.atRisk + counts.unprotected
+  const empty = posture.verdict === 'unknown' || total === 0
+  const route = setupRoute(stats)
 
   return (
-    <section
-      className="overflow-hidden rounded-xl border border-slate-700/70 bg-slate-900/70 elev-2"
-      aria-label="Estate status"
-    >
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-[minmax(15rem,1.1fr)_repeat(4,minmax(0,1fr))]">
-        {/* Verdict. The only cell that carries a full colour wash. */}
-        <div className={cn('relative flex items-center gap-3.5 px-5 py-4', VERDICT_SKIN[verdict.tone])}>
-          <span
-            className={cn('absolute inset-y-0 left-0 w-0.5', VERDICT_RULE[verdict.tone])}
-            aria-hidden
-          />
-          <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-current/25 bg-slate-950/40">
-            {verdict.tone === 'green' ? (
-              <ShieldCheck className="size-4.5" aria-hidden />
-            ) : (
-              <ShieldAlert className="size-4.5" aria-hidden />
+    <section className={cn('rounded-xl border', VERDICT_WASH[tone])} aria-label="Protection posture">
+      <div className="flex flex-wrap items-start gap-x-6 gap-y-4 px-5 py-4">
+        <div className="min-w-0 flex-1">
+          <p className="eyebrow">Estate verdict</p>
+          <p
+            className={cn(
+              'mt-1 text-[22px] leading-7 font-semibold tracking-tight',
+              VERDICT_INK[tone],
             )}
-          </span>
-          <div className="min-w-0">
-            <p className="truncate text-[15px] leading-5 font-semibold tracking-tight">
-              {verdict.headline}
+          >
+            {VERDICT_LABEL[posture.verdict]}
+          </p>
+          {empty ? (
+            <p className="mt-1 max-w-xl text-[13px] leading-5 text-slate-400">{route.hint}</p>
+          ) : (
+            <p className="mt-1 text-[13px] text-slate-400">
+              <Num className="text-slate-200">{formatCount(counts.protected)}</Num> protected ·{' '}
+              <Num className={counts.atRisk > 0 ? 'text-warn-300' : 'text-slate-400'}>
+                {formatCount(counts.atRisk)}
+              </Num>{' '}
+              at risk ·{' '}
+              <Num className={counts.unprotected > 0 ? 'text-fail-300' : 'text-slate-400'}>
+                {formatCount(counts.unprotected)}
+              </Num>{' '}
+              unprotected
             </p>
-            <p className="mt-0.5 truncate text-meta text-slate-400">{verdict.detail}</p>
-          </div>
-          {stats.last24h.running > 0 ? (
-            <span className="ml-auto flex shrink-0 items-center gap-1.5 text-meta text-slate-400">
-              <LiveDot tone="blue" />
-              <Num>{stats.last24h.running}</Num> running
-            </span>
-          ) : null}
+          )}
         </div>
 
-        <StripCell
-          label="Protected VMs"
-          value={
-            <>
-              <Num>{formatCount(covered.size)}</Num>
-              <span className="text-slate-600"> / </span>
-              <Num className="text-slate-400">{formatCount(totalVMs)}</Num>
-            </>
-          }
-          sub={unprotected === 0 ? 'All guests in a job' : `${unprotected} not in any job`}
-          to="/vms"
-        />
+        {running > 0 ? (
+          <span className="flex shrink-0 items-center gap-2 text-meta text-slate-400">
+            <LiveDot tone="brand" />
+            <Num>{running}</Num> running now
+          </span>
+        ) : null}
 
-        <StripCell
-          label="Last successful backup"
-          value={latest ? formatRelative(latest.finishedAt ?? latest.startedAt) : 'never'}
-          sub={latest ? latest.jobName : 'No completed run yet'}
-          to="/monitor"
-        />
-
-        <StripCell
-          label="Next scheduled run"
-          value={upcoming?.nextRun ? formatRelative(upcoming.nextRun) : 'none'}
-          sub={
-            upcoming
-              ? `${upcoming.name} · ${upcoming.scheduleLabel ?? ''}`.replace(/ · $/, '')
-              : 'No enabled job has a schedule'
-          }
-          to="/jobs"
-        />
-
-        <StripCell
-          label={failures > 0 ? 'Needs attention' : 'Storage used'}
-          value={
-            failures > 0 ? (
-              <>
-                <Num>{formatCount(failures)}</Num>{' '}
-                <span className="text-[13px] font-normal">failed</span>
-              </>
-            ) : (
-              formatBytes(stats.storageBytes)
-            )
-          }
-          sub={
-            failures > 0
-              ? 'In the last 24 hours'
-              : `${formatBytes(stats.dedupSavedBytes)} saved by dedup`
-          }
-          to={failures > 0 ? '/monitor' : '/targets'}
-          tone={failures > 0 ? 'alert' : 'default'}
-        />
+        {empty ? (
+          <Link to={route.to} className="shrink-0">
+            <Button variant="primary">{route.label}</Button>
+          </Link>
+        ) : null}
       </div>
+
+      {posture.reasons.length > 0 ? (
+        <ul className="divide-y divide-slate-800/70 border-t border-slate-800/70">
+          {posture.reasons.map((reason) => (
+            <li
+              key={reason.code}
+              className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 px-5 py-2"
+            >
+              <Num className="shrink-0 text-[13px] font-semibold text-slate-100">
+                {formatCount(reason.workloads)}
+              </Num>
+              <span className="min-w-0 flex-1 text-[13px] text-slate-300">{reason.detail}</span>
+              <span className="shrink-0 font-mono text-micro text-slate-600">{reason.code}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </section>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Workload posture table
+ *
+ * One row per workload with the evidence that decided its status: the last
+ * success and how it sits against that workload's own RPO, the last integrity
+ * verification, and how many restore points stand behind it.
+ * ------------------------------------------------------------------------- */
+
+type PostureFilter = 'all' | WorkloadStatus
+
+const FILTERS: { value: PostureFilter; label: string }[] = [
+  { value: 'all', label: 'All' },
+  { value: 'at_risk', label: 'At risk' },
+  { value: 'unprotected', label: 'Unprotected' },
+  { value: 'protected', label: 'Protected' },
+]
+
+const STATUS_WEIGHT: Record<WorkloadStatus, number> = {
+  unprotected: 0,
+  at_risk: 1,
+  protected: 2,
+}
+
+function WorkloadTable({ workloads }: { workloads: PostureWorkload[] }) {
+  const [filter, setFilter] = useState<PostureFilter>('all')
+
+  const counts = useMemo(() => {
+    const map: Record<PostureFilter, number> = {
+      all: workloads.length,
+      protected: 0,
+      at_risk: 0,
+      unprotected: 0,
+    }
+    for (const workload of workloads) map[workload.status] += 1
+    return map
+  }, [workloads])
+
+  // Rows that need a human sort to the top; nothing else re-orders on poll.
+  const rows = useMemo(
+    () =>
+      (filter === 'all' ? workloads : workloads.filter((item) => item.status === filter))
+        .slice()
+        .sort((a, b) => {
+          if (STATUS_WEIGHT[a.status] !== STATUS_WEIGHT[b.status]) {
+            return STATUS_WEIGHT[a.status] - STATUS_WEIGHT[b.status]
+          }
+          return a.name.localeCompare(b.name)
+        }),
+    [workloads, filter],
+  )
+
+  return (
+    <Card elevation="flat">
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-slate-800/80 px-5 py-2.5">
+        {FILTERS.map((option) => (
+          <ChipButton
+            key={option.value}
+            selected={filter === option.value}
+            onClick={() => setFilter(option.value)}
+          >
+            {option.label}
+            <span className="ml-1 text-slate-600">{counts[option.value]}</span>
+          </ChipButton>
+        ))}
+      </div>
+
+      {rows.length === 0 ? (
+        <p className="px-5 py-10 text-center text-[13px] text-slate-500">
+          No workload is in this state.
+        </p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[62rem]">
+            <thead>
+              <tr className="border-b border-slate-800 text-left text-micro tracking-wide text-slate-500 uppercase">
+                <th scope="col" className="py-2 pr-4 pl-5 font-semibold">
+                  Workload
+                </th>
+                <th scope="col" className="px-4 py-2 font-semibold">
+                  Policy
+                </th>
+                <th scope="col" className="px-4 py-2 font-semibold">
+                  Last successful backup
+                </th>
+                <th scope="col" className="px-4 py-2 font-semibold">
+                  Last verification
+                </th>
+                <th scope="col" className="px-4 py-2 text-right font-semibold">
+                  Restore points
+                </th>
+                <th scope="col" className="px-4 py-2 font-semibold">
+                  Status
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/70">
+              {rows.map((workload) => {
+                const rpo = describeRpo(workload.ageHours, workload.rpoHours)
+                const overdue = workload.withinRpo === false
+                return (
+                  <tr
+                    key={`${workload.kind}:${String(workload.id)}`}
+                    className="align-top transition-colors duration-150 hover:bg-slate-800/30"
+                  >
+                    <td className="max-w-[20rem] py-2.5 pr-4 pl-5">
+                      <WorkloadIdentity
+                        emphasis="strong"
+                        workload={{
+                          hostName: workload.hostName,
+                          name: workload.name,
+                          vmid: workload.vmid ?? null,
+                          node: workload.node,
+                        }}
+                      />
+                    </td>
+
+                    <td className="px-4 py-2.5">
+                      {workload.policy ? (
+                        <>
+                          <p className="truncate text-[13px] text-slate-300">{workload.policy}</p>
+                          {workload.enabled ? null : (
+                            <p className="mt-0.5 text-micro text-warn-300">Disabled</p>
+                          )}
+                        </>
+                      ) : (
+                        <span className="text-[13px] text-fail-300">No policy</span>
+                      )}
+                    </td>
+
+                    <td className="px-4 py-2.5 whitespace-nowrap">
+                      {workload.lastSuccessAt ? (
+                        <>
+                          <Num
+                            className="block text-[13px] text-slate-200"
+                            title={formatDateTime(workload.lastSuccessAt)}
+                          >
+                            {formatRelative(workload.lastSuccessAt)}
+                          </Num>
+                          {rpo ? (
+                            <span
+                              className={cn(
+                                'mt-0.5 block text-micro',
+                                overdue ? 'text-warn-300' : 'text-slate-500',
+                              )}
+                            >
+                              {rpo}
+                            </span>
+                          ) : null}
+                        </>
+                      ) : (
+                        <span className="text-[13px] text-fail-300">Never</span>
+                      )}
+                      {workload.lastFailureAt ? (
+                        <span className="mt-0.5 block text-micro text-fail-300">
+                          Last run failed {formatRelative(workload.lastFailureAt)}
+                        </span>
+                      ) : null}
+                    </td>
+
+                    <td className="px-4 py-2.5 whitespace-nowrap">
+                      {workload.lastVerifiedAt ? (
+                        <Num
+                          className="text-[13px] text-slate-300"
+                          title={`Integrity verified ${formatDateTime(workload.lastVerifiedAt)}`}
+                        >
+                          {formatRelative(workload.lastVerifiedAt)}
+                        </Num>
+                      ) : (
+                        <span className="text-[13px] text-slate-500">Not verified</span>
+                      )}
+                    </td>
+
+                    <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                      <Num
+                        className={cn(
+                          'text-[13px]',
+                          workload.restorePoints === 0 ? 'text-fail-300' : 'text-slate-200',
+                        )}
+                      >
+                        {formatCount(workload.restorePoints)}
+                      </Num>
+                    </td>
+
+                    <td className="px-4 py-2.5 whitespace-nowrap">
+                      <StatusPill
+                        tone={STATUS_TONE[workload.status]}
+                        label={STATUS_LABEL[workload.status]}
+                      />
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <p className="border-t border-slate-800/80 px-5 py-2.5 text-meta text-slate-500">
+        Verified means the restore point was re-read from the target and re-hashed end to end.
+        Restore testing is not performed, and is never implied here.
+      </p>
+    </Card>
   )
 }
 
@@ -344,27 +461,28 @@ function CountTile({
 
 const OutcomeDonut = lazy(() => import('../components/OutcomeDonut'))
 
-const OUTCOME_COLORS = {
-  succeeded: '#10b981',
-  failed: '#ef4444',
-  running: '#0ea5e9',
-} as const
-
 function OutcomeChart({ stats }: { stats: DashboardStats }) {
+  // Slice colours come from the theme variables, so the chart follows the
+  // light/dark switch like everything else.
   const slices = useMemo(
     () => [
       {
         key: 'succeeded',
         name: 'Succeeded',
         value: stats.last24h.succeeded,
-        fill: OUTCOME_COLORS.succeeded,
+        fill: 'var(--color-ok-500)',
       },
-      { key: 'failed', name: 'Failed', value: stats.last24h.failed, fill: OUTCOME_COLORS.failed },
+      {
+        key: 'failed',
+        name: 'Failed',
+        value: stats.last24h.failed,
+        fill: 'var(--color-fail-500)',
+      },
       {
         key: 'running',
         name: 'Running',
         value: stats.last24h.running,
-        fill: OUTCOME_COLORS.running,
+        fill: 'var(--color-accent-500)',
       },
     ],
     [stats.last24h],
@@ -374,9 +492,9 @@ function OutcomeChart({ stats }: { stats: DashboardStats }) {
 
   return (
     <div className="flex flex-col gap-5 sm:flex-row sm:items-center">
-      <div className="relative h-36 w-36 shrink-0 self-center">
+      <div className="relative h-32 w-32 shrink-0 self-center">
         {total === 0 ? (
-          <div className="flex size-full items-center justify-center rounded-full border-[6px] border-slate-800/70 text-meta text-slate-600">
+          <div className="flex size-full items-center justify-center rounded-full border-[6px] border-slate-800/70 text-meta text-slate-500">
             No runs
           </div>
         ) : (
@@ -391,7 +509,7 @@ function OutcomeChart({ stats }: { stats: DashboardStats }) {
               <OutcomeDonut slices={slices} />
             </Suspense>
             <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-              <Num className="figure-lg text-2xl text-white">{formatCount(total)}</Num>
+              <Num className="figure-lg text-2xl text-slate-50">{formatCount(total)}</Num>
               <span className="eyebrow">runs</span>
             </div>
           </>
@@ -419,9 +537,9 @@ function OutcomeChart({ stats }: { stats: DashboardStats }) {
 
 function StorageCard({ stats }: { stats: DashboardStats }) {
   const stored = Math.max(0, stats.storageBytes)
-  const saved = Math.max(0, stats.dedupSavedBytes)
-  const logical = stored + saved
-  const savedPct = logical > 0 ? (saved / logical) * 100 : 0
+  const avoided = Math.max(0, stats.dedupSavedBytes)
+  const logical = stored + avoided
+  const avoidedPct = logical > 0 ? (avoided / logical) * 100 : 0
 
   return (
     <Card>
@@ -430,14 +548,14 @@ function StorageCard({ stats }: { stats: DashboardStats }) {
         <div className="grid gap-4 sm:grid-cols-2">
           <div>
             <p className="eyebrow">Stored on target</p>
-            <Num className="figure-lg mt-1 block text-[26px] leading-8 text-white">
+            <Num className="figure-lg mt-1 block text-[26px] leading-8 text-slate-50">
               {formatBytes(stored)}
             </Num>
           </div>
           <div>
-            <p className="eyebrow">Saved by deduplication</p>
-            <Num className="figure-lg mt-1 block text-[26px] leading-8 text-emerald-400">
-              {formatBytes(saved)}
+            <p className="eyebrow">Avoided by data reduction</p>
+            <Num className="figure-lg mt-1 block text-[26px] leading-8 text-slate-50">
+              {formatBytes(avoided)}
             </Num>
           </div>
         </div>
@@ -445,37 +563,54 @@ function StorageCard({ stats }: { stats: DashboardStats }) {
         <div>
           <div className="mb-2 flex items-center justify-between text-meta text-slate-500">
             <span>
-              Logical protected data <Num className="text-slate-400">{formatBytes(logical)}</Num>
+              Source data protected <Num className="text-slate-400">{formatBytes(logical)}</Num>
             </span>
-            <span className="text-emerald-400">
-              <Num>{clampPct(savedPct).toFixed(0)}%</Num> saved
+            <span>
+              <Num className="text-slate-300">{clampPct(avoidedPct).toFixed(0)}%</Num> avoided
             </span>
           </div>
           <div className="flex h-2 w-full overflow-hidden rounded-full bg-slate-800">
             <div
               className="h-full bg-accent-500"
-              style={{ width: `${100 - clampPct(savedPct)}%` }}
+              style={{ width: `${100 - clampPct(avoidedPct)}%` }}
               aria-hidden
             />
             <div
-              className="h-full bg-emerald-500/70"
-              style={{ width: `${clampPct(savedPct)}%` }}
+              className="h-full bg-slate-600"
+              style={{ width: `${clampPct(avoidedPct)}%` }}
               aria-hidden
             />
           </div>
           <div className="mt-2 flex items-center gap-4 text-meta text-slate-500">
             <span className="flex items-center gap-1.5">
               <span className="size-2 rounded-full bg-accent-500" aria-hidden />
-              Uploaded chunks
+              Transferred to target
             </span>
             <span className="flex items-center gap-1.5">
-              <span className="size-2 rounded-full bg-emerald-500/70" aria-hidden />
-              Deduplicated
+              <span className="size-2 rounded-full bg-slate-600" aria-hidden />
+              Avoided
             </span>
           </div>
         </div>
       </div>
     </Card>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Recent runs
+ * ------------------------------------------------------------------------- */
+
+/** The percentage always; the ratio only when the run actually has one. */
+function ReductionCell({ run }: { run: JobRun }) {
+  const reduction = reductionOf(run)
+  return (
+    <span className="inline-flex items-baseline gap-1.5">
+      <Num className="text-meta text-slate-200">{formatReduction(reduction.pct)}</Num>
+      {reduction.ratio === null ? null : (
+        <Num className="text-micro text-slate-500">{formatRatio(reduction.ratio)}</Num>
+      )}
+    </span>
   )
 }
 
@@ -486,7 +621,7 @@ function RecentRunsTable({ runs }: { runs: JobRun[] }) {
         className="rounded-none border-0 bg-transparent"
         icon={<Activity className="size-5" aria-hidden />}
         title="No backup runs yet"
-        description="Create a backup job and run it — every run, restore, and verification lands here."
+        description="Every run, restore and verification lands here the moment it starts."
         action={
           <Link to="/jobs">
             <Button variant="primary" icon={<CalendarClock className="size-4" aria-hidden />}>
@@ -500,16 +635,16 @@ function RecentRunsTable({ runs }: { runs: JobRun[] }) {
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[46rem]">
+      <table className="w-full min-w-[54rem]">
         <thead>
           <tr className="border-b border-slate-800 text-left text-micro tracking-wide text-slate-500 uppercase">
             <th className="py-2 pr-4 pl-5 font-semibold">Job</th>
             <th className="px-4 py-2 font-semibold">Status</th>
             <th className="px-4 py-2 font-semibold">Started</th>
             <th className="px-4 py-2 font-semibold">Duration</th>
-            <th className="px-4 py-2 text-right font-semibold">Read</th>
-            <th className="px-4 py-2 text-right font-semibold">Uploaded</th>
-            <th className="px-4 py-2 text-right font-semibold">Dedup</th>
+            <th className="px-4 py-2 text-right font-semibold">Source data processed</th>
+            <th className="px-4 py-2 text-right font-semibold">Transferred to target</th>
+            <th className="px-4 py-2 text-right font-semibold">Data reduction</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-800/70">
@@ -529,7 +664,7 @@ function RecentRunsTable({ runs }: { runs: JobRun[] }) {
                       </Num>
                     </>
                   ) : run.error ? (
-                    <span className="truncate text-micro text-red-400/90" title={run.error}>
+                    <span className="truncate text-micro text-fail-400" title={run.error}>
                       {run.error}
                     </span>
                   ) : null}
@@ -553,7 +688,7 @@ function RecentRunsTable({ runs }: { runs: JobRun[] }) {
                 <Num className="text-meta text-slate-300">{formatBytes(run.bytesUploaded)}</Num>
               </td>
               <td className="px-4 py-2.5 text-right whitespace-nowrap">
-                <Num className="text-meta text-emerald-400">{formatRatio(run.dedupRatio)}</Num>
+                <ReductionCell run={run} />
               </td>
             </tr>
           ))}
@@ -563,10 +698,23 @@ function RecentRunsTable({ runs }: { runs: JobRun[] }) {
   )
 }
 
+/* ---------------------------------------------------------------------------
+ * Page
+ * ------------------------------------------------------------------------- */
+
 export function DashboardPage() {
   const loader = useCallback(async (): Promise<DashboardData> => {
-    const [stats, jobs, vms] = await Promise.all([getDashboard(), listJobs(), listVMs()])
-    return { stats, jobs, vms }
+    const [stats, jobs, posture] = await Promise.all([
+      getDashboard(),
+      listJobs(),
+      // A server that cannot evaluate posture must not produce a green light
+      // by omission — the failure is surfaced instead of swallowed.
+      getPosture().then(
+        (value) => ({ value, error: null as string | null }),
+        (err: unknown) => ({ value: null, error: errorMessage(err) }),
+      ),
+    ])
+    return { stats, jobs, posture: posture.value, postureError: posture.error }
   }, [])
   const { data, loading, error, reload, refresh } = useAsync(loader)
 
@@ -576,11 +724,23 @@ export function DashboardPage() {
   )
   usePolling(() => void refresh(), 2000, hasRunning)
 
+  const nextRun = useMemo(() => {
+    const jobs = data?.jobs ?? []
+    return (
+      jobs
+        .filter((job) => job.enabled && job.nextRun)
+        .sort(
+          (a, b) =>
+            new Date(a.nextRun as string).getTime() - new Date(b.nextRun as string).getTime(),
+        )[0] ?? null
+    )
+  }, [data?.jobs])
+
   if (loading && !data) {
     return (
       <>
-        <PageHeader title="Dashboard" description="Protection status across your Proxmox estate." />
-        <div className="pb-skeleton mb-6 h-[5.5rem] rounded-xl border border-slate-800/70" />
+        <PageHeader title="Dashboard" description="Whether this estate is recoverable, and why." />
+        <div className="pb-skeleton mb-6 h-32 rounded-xl border border-slate-800/70" />
         <SkeletonCards count={5} height="h-16" />
       </>
     )
@@ -601,7 +761,7 @@ export function DashboardPage() {
     <>
       <PageHeader
         title="Dashboard"
-        description="Protection status across your Proxmox estate."
+        description="Whether this estate is recoverable, and why."
         actions={
           <Button
             icon={<RefreshCw className="size-4" aria-hidden />}
@@ -613,7 +773,33 @@ export function DashboardPage() {
         }
       />
 
-      <EstateStrip data={data} />
+      {data.posture ? (
+        <VerdictPanel posture={data.posture} stats={stats} running={stats.last24h.running} />
+      ) : (
+        <ErrorBlock
+          title="Protection posture could not be evaluated"
+          message={
+            data.postureError ??
+            'The server did not answer the posture request. Until it does, this console cannot state whether the estate is recoverable.'
+          }
+          onRetry={() => void reload()}
+        />
+      )}
+
+      {data.posture && data.posture.workloads.length > 0 ? (
+        <div className="mt-6">
+          <SectionHeading
+            title="Workload posture"
+            count={data.posture.workloads.length}
+            hint={
+              nextRun?.nextRun
+                ? `Next run ${formatRelative(nextRun.nextRun)} · ${nextRun.name}`
+                : 'No enabled job has a schedule'
+            }
+          />
+          <WorkloadTable workloads={data.posture.workloads} />
+        </div>
+      ) : null}
 
       <div className="mt-6">
         <SectionHeading title="Inventory" />
@@ -687,12 +873,12 @@ export function DashboardPage() {
             title={stats.hostCount === 0 ? 'Add your first Proxmox host' : 'Add a storage target'}
             description={
               stats.hostCount === 0
-                ? 'ProxBack needs an API token for at least one Proxmox VE host before it can inventory virtual machines.'
-                : 'Backups are written to S3-compatible storage — Backblaze B2, MinIO, or AWS S3. Add a target to start protecting data.'
+                ? 'ProxBack needs an API token for at least one Proxmox VE host before it can inventory workloads.'
+                : 'Backups are written to S3-compatible storage — Backblaze B2, MinIO, or AWS S3.'
             }
             action={
               <Link to={stats.hostCount === 0 ? '/hosts' : '/targets'}>
-                <Button variant="primary" icon={<Sparkles className="size-4" aria-hidden />}>
+                <Button variant="primary">
                   {stats.hostCount === 0 ? 'Add Proxmox host' : 'Add storage target'}
                 </Button>
               </Link>

@@ -78,7 +78,7 @@ function SoftwareUpdateCard() {
         ? `Install ${status.latestVersion} and cancel running work?`
         : `Install ProxBack ${status.latestVersion}?`,
       message: force
-        ? 'The runs in progress will be canceled by the restart. Chunks they already uploaded are kept, so a retry resumes cheaply — but the restore points from those runs are not created.'
+        ? 'The runs in progress will be canceled by the restart. Data they already transferred is kept, so a retry resumes cheaply — but the restore points from those runs are not created.'
         : 'The new server binary is downloaded, checksum-verified, and swapped in. The server then restarts itself — expect a few seconds of downtime.',
       confirmLabel: force ? 'Install anyway' : 'Install update',
       destructive: force,
@@ -151,7 +151,7 @@ function SoftwareUpdateCard() {
             </div>
 
             {status.checkError ? (
-              <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-300">
+              <p className="rounded-lg border border-warn-500/30 bg-warn-500/10 px-3.5 py-2.5 text-xs text-warn-300">
                 Could not reach the release repository: {status.checkError}
               </p>
             ) : status.updateAvailable ? (
@@ -165,7 +165,7 @@ function SoftwareUpdateCard() {
                   </p>
                 ) : null}
                 {!status.assetAvailable ? (
-                  <p className="text-xs text-amber-300">
+                  <p className="text-xs text-warn-300">
                     The release has no prebuilt binary for this platform — update manually from
                     source.
                   </p>
@@ -184,8 +184,8 @@ function SoftwareUpdateCard() {
             )}
 
             {blockedByRuns ? (
-              <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3">
-                <p className="text-sm text-amber-200">{blockedByRuns}</p>
+              <div className="space-y-2 rounded-lg border border-warn-500/30 bg-warn-500/10 px-4 py-3">
+                <p className="text-sm text-warn-200">{blockedByRuns}</p>
                 <div className="flex flex-wrap items-center gap-2">
                   <Button size="sm" onClick={() => setBlockedByRuns(null)}>
                     Wait
@@ -333,13 +333,13 @@ function NotificationsCard({
         </div>
 
         <SectionNote>
-          The payload is plain JSON — event, server, job, kind, status, bytes, dedup ratio, duration,
+          The payload is plain JSON — event, server, job, kind, status, bytes, data reduction, duration,
           and the error when there is one. It works as-is with ntfy, Gotify, a Discord webhook proxy,
           or any automation endpoint. Delivery has a 10-second timeout and never blocks a run.
         </SectionNote>
 
         {error ? (
-          <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+          <p className="rounded-lg border border-fail-500/30 bg-fail-500/10 px-3.5 py-2.5 text-xs text-fail-300">
             {error}
           </p>
         ) : null}
@@ -395,9 +395,9 @@ const COMPRESSION_OPTIONS: { value: Compression; label: string }[] = [
 ]
 
 /**
- * Throughput controls. Defaults are deliberate: 4 parallel chunk uploads and
+ * Throughput controls. Defaults are deliberate: four parallel transfers and
  * zstd compression roughly halve the time of a first full backup on a typical
- * home uplink, and neither affects deduplication.
+ * home uplink, and neither weakens data reduction.
  */
 function PerformanceCard({
   form,
@@ -420,7 +420,7 @@ function PerformanceCard({
     <Card className="mt-6 max-w-2xl">
       <CardHeader
         title="Performance"
-        subtitle="How hard the engine pushes your uplink and storage target."
+        subtitle="How hard ProxBack pushes your uplink and storage target."
       />
       <form
         className="space-y-5 px-5 py-5"
@@ -432,8 +432,8 @@ function PerformanceCard({
       >
         <div className="grid gap-4 sm:grid-cols-2">
           <Field
-            label="Parallel chunk uploads"
-            hint="Chunks in flight per stream. 1 – 16; 4 suits most links."
+            label="Parallel transfers"
+            hint="1 – 16. Four suits most links."
           >
             {({ id }) => (
               <Input
@@ -448,8 +448,8 @@ function PerformanceCard({
             )}
           </Field>
           <Field
-            label="Upload limit (Mbps)"
-            hint="0 leaves uploads unthrottled."
+            label="Transfer limit (Mbps)"
+            hint="0 leaves transfers unthrottled."
           >
             {({ id }) => (
               <Input
@@ -468,26 +468,25 @@ function PerformanceCard({
         <div className="space-y-1.5">
           <span className="block text-xs font-medium tracking-wide text-slate-400">Compression</span>
           <Segmented
-            label="Compress chunks before upload"
+            label="Compress before transfer"
             value={form.compression}
             options={COMPRESSION_OPTIONS}
             onChange={(compression) => patch({ compression })}
           />
           <p className="text-xs leading-relaxed text-slate-500">
             {form.compression === 'zstd'
-              ? 'Each chunk is zstd-compressed before upload — less bandwidth and less stored data.'
-              : 'Chunks upload as-is. Choose this only if your sources are already compressed or encrypted.'}
+              ? 'Data is zstd-compressed before it is sent — less bandwidth and less stored data.'
+              : 'Data is sent as it is read. Choose this only if your sources are already compressed or encrypted.'}
           </p>
         </div>
 
         <SectionNote>
-          Compression happens after chunking, so chunk boundaries stay on raw data and incremental
-          deduplication is unaffected. Chunks already on a target are never re-uploaded when you
-          change these settings, and both settings take effect on the next run — no restart needed.
+          Changing either setting never invalidates what is already on a target, and neither weakens
+          data reduction. Both take effect on the next run — no restart needed.
         </SectionNote>
 
         {error ? (
-          <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+          <p className="rounded-lg border border-fail-500/30 bg-fail-500/10 px-3.5 py-2.5 text-xs text-fail-300">
             {error}
           </p>
         ) : null}
@@ -613,7 +612,7 @@ function ChangePasswordCard() {
         </SectionNote>
 
         {error ? (
-          <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+          <p className="rounded-lg border border-fail-500/30 bg-fail-500/10 px-3.5 py-2.5 text-xs text-fail-300">
             {error}
           </p>
         ) : null}
@@ -697,7 +696,7 @@ export function SettingsPage() {
       form.uploadConcurrency < 1 ||
       form.uploadConcurrency > MAX_UPLOAD_CONCURRENCY
     ) {
-      return fail(`Parallel chunk uploads must be a whole number between 1 and ${MAX_UPLOAD_CONCURRENCY}.`)
+      return fail(`Parallel transfers must be a whole number between 1 and ${MAX_UPLOAD_CONCURRENCY}.`)
     }
     if (
       !Number.isInteger(form.uploadLimitMbps) ||
@@ -815,7 +814,7 @@ export function SettingsPage() {
             </SectionNote>
 
             {formError ? (
-              <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+              <p className="rounded-lg border border-fail-500/30 bg-fail-500/10 px-3.5 py-2.5 text-xs text-fail-300">
                 {formError}
               </p>
             ) : null}

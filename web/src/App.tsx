@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Route, Routes, useNavigate } from 'react-router-dom'
-import { ShieldCheck } from 'lucide-react'
 import {
   errorMessage,
   getMe,
@@ -11,6 +10,7 @@ import {
 } from './api'
 import type { User } from './api'
 import { Layout } from './components/Layout'
+import { BrandMark } from './components/Brand'
 import { Button, Spinner } from './components/ui'
 import { useToast } from './components/Toast'
 import { SessionProvider } from './session'
@@ -38,9 +38,7 @@ type Phase =
 function BootScreen({ message, onRetry }: { message?: string; onRetry?: () => void }) {
   return (
     <div className="flex min-h-full flex-col items-center justify-center gap-4 bg-slate-950 px-6 text-center">
-      <div className="flex size-11 items-center justify-center rounded-xl bg-accent-500/15 text-accent-400 ring-1 ring-accent-500/30">
-        <ShieldCheck className="size-5" aria-hidden />
-      </div>
+      <BrandMark className="size-8 text-accent-400" title="ProxBack" />
       {message ? (
         <>
           <div>

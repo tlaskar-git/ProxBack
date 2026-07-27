@@ -37,8 +37,87 @@ func statsPtr(sess *engine.Session) *engine.Stats {
 	return &s
 }
 
-func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *store.Job) (stats *engine.Stats, runErr error) {
-	eng, target, err := m.engineFor(ctx, job.TargetID)
+// executeBackup runs a job under its protection policy: inside the run's
+// maximum duration, retried as many times as the policy allows, and with the
+// policy's transfer ceiling in force.
+func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *store.Job) (*engine.Stats, error) {
+	policy := job.Policy.Normalized()
+	if policy.UploadLimitMbpsOverride > 0 {
+		m.logRun(ctx, run.ID, "policy: upload capped at %d Mbps for this run",
+			policy.UploadLimitMbpsOverride)
+		// Whatever happens to the run, the server-wide ceiling goes back.
+		defer m.applyGlobalUploadLimit(m.detached())
+	}
+
+	return m.runUnderPolicy(ctx, run.ID, policy, func(attemptCtx context.Context) (*engine.Stats, error) {
+		return m.backupAttempt(attemptCtx, run, job, policy)
+	})
+}
+
+// runUnderPolicy applies the run-control half of a protection policy to one
+// piece of work: the duration limit that bounds it and the retries that follow
+// a failure. It is separate from what the work *is* so the policy can be
+// exercised — and reasoned about — without a Proxmox host behind it.
+//
+// A cancellation is never retried. An operator who cancels a run means it, and
+// a run that hit its own duration limit has already been told to stop.
+func (m *Manager) runUnderPolicy(ctx context.Context, runID string, policy store.JobPolicy,
+	attempt func(context.Context) (*engine.Stats, error)) (*engine.Stats, error) {
+	runCtx := ctx
+	if policy.MaxDurationMinutes > 0 {
+		m.logRun(ctx, runID, "policy: this run is limited to %s",
+			countNoun(policy.MaxDurationMinutes, "minute"))
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, m.policyMinutes(policy.MaxDurationMinutes))
+		defer cancel()
+	}
+
+	attempts := policy.RetryCount + 1
+	var stats *engine.Stats
+	var err error
+	for n := 1; n <= attempts; n++ {
+		if n > 1 {
+			m.logRun(ctx, runID, "attempt %d of %d starting", n, attempts)
+		}
+		stats, err = attempt(runCtx)
+		if err == nil {
+			if n > 1 {
+				m.logRun(ctx, runID, "attempt %d of %d succeeded", n, attempts)
+			}
+			return stats, nil
+		}
+		if runCtx.Err() != nil || errors.Is(err, context.Canceled) {
+			break
+		}
+		if n == attempts {
+			if attempts > 1 {
+				m.logRun(ctx, runID, "attempt %d of %d failed: %v — no attempts left", n, attempts, err)
+			}
+			break
+		}
+		m.logRun(ctx, runID, "attempt %d of %d failed: %v — retrying in %s",
+			n, attempts, err, countNoun(policy.RetryDelayMinutes, "minute"))
+		if werr := m.retryWait(runCtx, m.policyMinutes(policy.RetryDelayMinutes)); werr != nil {
+			// The wait was cut short by cancellation or by the duration limit;
+			// the failure that prompted the retry is the one worth reporting.
+			break
+		}
+	}
+	// A run killed by its own duration limit says so, rather than surfacing as
+	// whatever the interrupted transfer happened to complain about.
+	if policy.MaxDurationMinutes > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		return stats, fmt.Errorf("%w of %s, so it was canceled",
+			ErrMaxDuration, countNoun(policy.MaxDurationMinutes, "minute"))
+	}
+	return stats, err
+}
+
+// backupAttempt is one attempt at a job: build the engine, run the policy's
+// pre-script where the data lives, back the sources up, run the post-script,
+// and collect orphan chunks if the attempt got all the way through.
+func (m *Manager) backupAttempt(ctx context.Context, run *store.JobRun, job *store.Job,
+	policy store.JobPolicy) (stats *engine.Stats, runErr error) {
+	eng, target, err := m.engineForJob(ctx, job.TargetID, policy.UploadLimitMbpsOverride)
 	if err != nil {
 		return nil, err
 	}
@@ -82,9 +161,9 @@ func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *sto
 
 	switch job.Kind {
 	case store.SourceVM:
-		return m.backupVMJob(ctx, run, job, eng)
+		return m.backupVMJob(ctx, run, job, policy, eng)
 	case store.SourceAgent:
-		return m.backupAgentJob(ctx, run, job, eng)
+		return m.backupAgentJob(ctx, run, job, policy, eng)
 	default:
 		return nil, fmt.Errorf("sched: unsupported job kind %q", job.Kind)
 	}
@@ -93,8 +172,11 @@ func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *sto
 // ---------------------------------------------------------------- vm backups
 
 type vmPlan struct {
-	client   *pve.Client
-	hostID   string
+	client *pve.Client
+	hostID string
+	// hostName is the cluster's display name, carried so restore points and run
+	// sources can identify a workload as "cluster / name (vmid) / node".
+	hostName string
 	node     string
 	vmid     int
 	name     string
@@ -102,7 +184,13 @@ type vmPlan struct {
 	disks    []pve.DiskInfo
 	// helper is the node helper that owns this guest's node, or nil when the node
 	// has none and the export extension has to be tried instead.
-	helper     *store.NodeHelper
+	helper *store.NodeHelper
+	// guestAgent records whether qemu-guest-agent is enabled in the guest's
+	// configuration, which is what decides whether a requested filesystem freeze
+	// can actually happen.
+	guestAgent bool
+	// excluded names the disks the policy left out of this guest's backup.
+	excluded   []string
 	totalBytes int64
 }
 
@@ -128,7 +216,33 @@ func (m *Manager) resolveTagFilter(ctx context.Context, job *store.Job) (store.J
 	return out, nil
 }
 
-func (m *Manager) planVMJob(ctx context.Context, job *store.Job) ([]vmPlan, int64, error) {
+// applyDiskExclusions removes the disks the policy leaves out and reports which
+// ones went. Excluding every disk is refused: a restore point with no data in
+// it is not a backup, and the operator meant something else.
+func applyDiskExclusions(disks []pve.DiskInfo, exclude []string, vmName string) ([]pve.DiskInfo, []string, error) {
+	if len(exclude) == 0 {
+		return disks, nil, nil
+	}
+	skip := make(map[string]struct{}, len(exclude))
+	for _, d := range exclude {
+		skip[strings.ToLower(strings.TrimSpace(d))] = struct{}{}
+	}
+	kept := make([]pve.DiskInfo, 0, len(disks))
+	var dropped []string
+	for _, d := range disks {
+		if _, off := skip[strings.ToLower(d.Name)]; off {
+			dropped = append(dropped, d.Name)
+			continue
+		}
+		kept = append(kept, d)
+	}
+	if len(kept) == 0 {
+		return nil, nil, fmt.Errorf("sched: policy.excludeDisks leaves %s with no disks to back up", vmName)
+	}
+	return kept, dropped, nil
+}
+
+func (m *Manager) planVMJob(ctx context.Context, job *store.Job, policy store.JobPolicy) ([]vmPlan, int64, error) {
 	sources := job.Sources
 	if job.TagFilter != "" {
 		resolved, err := m.resolveTagFilter(ctx, job)
@@ -143,6 +257,7 @@ func (m *Manager) planVMJob(ctx context.Context, job *store.Job) ([]vmPlan, int6
 	var total int64
 	plans := make([]vmPlan, 0, len(sources))
 	clients := map[string]*pve.Client{}
+	hostNames := map[string]string{}
 	for _, src := range sources {
 		if src.HostID == "" || src.VMID == 0 {
 			return nil, 0, errors.New("sched: vm job source needs hostId and vmid")
@@ -158,8 +273,12 @@ func (m *Manager) planVMJob(ctx context.Context, job *store.Job) ([]vmPlan, int6
 				return nil, 0, err
 			}
 			clients[src.HostID] = client
+			hostNames[src.HostID] = host.Name
 		}
-		p := vmPlan{client: client, hostID: src.HostID, vmid: src.VMID, name: src.Name}
+		p := vmPlan{
+			client: client, hostID: src.HostID, hostName: hostNames[src.HostID],
+			vmid: src.VMID, name: src.Name,
+		}
 		p.sourceID = VMSourceID(src.HostID, src.VMID)
 		if cached, err := m.st.CachedVM(ctx, src.HostID, src.VMID); err == nil {
 			p.node = cached.Node
@@ -189,13 +308,27 @@ func (m *Manager) planVMJob(ctx context.Context, job *store.Job) ([]vmPlan, int6
 		if len(p.disks) == 0 {
 			return nil, 0, fmt.Errorf("sched: vm %d has no backup-eligible disks", src.VMID)
 		}
+		p.guestAgent = guestAgentEnabled(cfg)
+		if p.disks, p.excluded, err = applyDiskExclusions(p.disks, policy.ExcludeDisks, p.name); err != nil {
+			return nil, 0, err
+		}
 		// The guest's disk sizes are the progress estimate for both paths; a
 		// vzdump archive's real size is only known once it has been produced.
 		for _, d := range p.disks {
 			p.totalBytes += d.SizeBytes
 		}
-		if p.helper, err = m.helperForNode(ctx, p.node); err != nil {
+		if p.helper, err = m.helperForNode(ctx, p.hostID, p.node); err != nil {
 			return nil, 0, err
+		}
+		// A helper streams the whole guest as one vzdump archive, so a per-disk
+		// exclusion cannot be expressed on that path. Rather than store an
+		// archive that quietly contains the disk the policy excludes, the run
+		// stops here and says what to do instead.
+		if p.helper != nil && len(policy.ExcludeDisks) > 0 {
+			return nil, 0, fmt.Errorf("%w: %s is backed up by the node helper on %s as a single "+
+				"whole-VM vzdump archive, which cannot leave %s out — exclude the disk in the guest's "+
+				"own configuration instead (set backup=0 on it in Proxmox), or drop policy.excludeDisks",
+				ErrExcludeDisksUnsupported, p.name, p.node, strings.Join(policy.ExcludeDisks, ", "))
 		}
 		total += p.totalBytes
 		plans = append(plans, p)
@@ -203,8 +336,9 @@ func (m *Manager) planVMJob(ctx context.Context, job *store.Job) ([]vmPlan, int6
 	return plans, total, nil
 }
 
-func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store.Job, eng *engine.Engine) (*engine.Stats, error) {
-	plans, total, err := m.planVMJob(ctx, job)
+func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store.Job,
+	policy store.JobPolicy, eng *engine.Engine) (*engine.Stats, error) {
+	plans, total, err := m.planVMJob(ctx, job, policy)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +364,8 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 		planned := make([]store.RunSource, 0, len(plans))
 		for i, p := range plans {
 			planned = append(planned, store.RunSource{
-				Seq: i, Name: p.name, Kind: store.SourceVM, Node: p.node,
+				Seq: i, Name: p.name, Kind: store.SourceVM,
+				SourceID: p.sourceID, HostID: p.hostID, HostName: p.hostName, Node: p.node,
 				Status: store.SourcePending, SizeBytes: p.totalBytes,
 			})
 		}
@@ -245,7 +380,7 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 		if mon != nil {
 			mon.begin(ctx, i, before)
 		}
-		err := m.backupOneVM(ctx, run, job, eng, sess, p, snapname, before)
+		err := m.backupOneVM(ctx, run, job, policy, eng, sess, p, snapname, before)
 		if mon != nil {
 			mon.finish(ctx, sourceOutcome(err), sess.Stats(), errText(err))
 		}
@@ -263,8 +398,18 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 // manifest, restore point, retention. before is the run's byte count when the
 // guest started, which is what makes the per-source figures deltas of the
 // session's shared counters.
-func (m *Manager) backupOneVM(ctx context.Context, run *store.JobRun, job *store.Job, eng *engine.Engine,
-	sess *engine.Session, p vmPlan, snapname string, before engine.Stats) error {
+func (m *Manager) backupOneVM(ctx context.Context, run *store.JobRun, job *store.Job, policy store.JobPolicy,
+	eng *engine.Engine, sess *engine.Session, p vmPlan, snapname string, before engine.Stats) error {
+	if len(p.excluded) > 0 {
+		m.logRun(ctx, run.ID, "%s: policy excludes %s — %s will be backed up",
+			p.name, strings.Join(p.excluded, ", "), countNoun(len(p.disks), "disk"))
+	}
+	m.logQuiesce(ctx, run.ID, policy, p)
+	// The pre-script runs before a single byte of this guest moves, so a
+	// failure here leaves the estate exactly as it was.
+	if err := m.runVMScript(ctx, run.ID, policy, p, phasePre); err != nil {
+		return err
+	}
 	var disks []engine.DiskManifest
 	if p.helper != nil {
 		// vzdump owns snapshot consistency, so ProxBack must not create one.
@@ -332,6 +477,8 @@ func (m *Manager) backupOneVM(ctx context.Context, run *store.JobRun, job *store
 		SourceKind:    store.SourceVM,
 		SourceID:      p.sourceID,
 		SourceName:    p.name,
+		HostID:        p.hostID,
+		HostName:      p.hostName,
 		TargetID:      eng.TargetID(),
 		CreatedAt:     man.CreatedAt,
 		SizeBytes:     size,
@@ -343,6 +490,14 @@ func (m *Manager) backupOneVM(ctx context.Context, run *store.JobRun, job *store
 		return err
 	}
 	m.logSourceDone(ctx, run.ID, p.name, after.BytesProcessed-before.BytesProcessed, uploaded, man.Kind)
+	// The post-script runs once the restore point exists. A failure fails the
+	// run — the operator asked for the script to matter — but the restore point
+	// stays: it is real, it is verifiable, and throwing it away would punish the
+	// data for the script's mistake.
+	if err := m.runVMScript(ctx, run.ID, policy, p, phasePost); err != nil {
+		m.logRun(ctx, run.ID, "%s: the restore point taken before the post-script is kept", p.name)
+		return err
+	}
 	return m.applyRetention(ctx, run.ID, eng, job, store.SourceVM, p.sourceID)
 }
 
@@ -407,7 +562,7 @@ func (m *Manager) exportDisks(ctx context.Context, runID string, sess *engine.Se
 // ---------------------------------------------------------------- agent backups
 
 func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *store.Job,
-	eng *engine.Engine) (stats *engine.Stats, runErr error) {
+	policy store.JobPolicy, eng *engine.Engine) (stats *engine.Stats, runErr error) {
 	if len(job.Sources) == 0 || job.Sources[0].AgentID == "" {
 		return nil, errors.New("sched: agent job needs an agentId source")
 	}
@@ -434,7 +589,8 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 	mon := m.monitorFor(run.ID)
 	if mon != nil {
 		mon.plan(ctx, []store.RunSource{{
-			Seq: 0, Name: agent.Hostname, Kind: store.SourceAgent, Status: store.SourcePending,
+			Seq: 0, Name: agent.Hostname, Kind: store.SourceAgent, SourceID: agent.ID,
+			Status: store.SourcePending,
 		}})
 		mon.begin(ctx, 0, sess.Stats())
 		defer func() {
@@ -443,18 +599,35 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 	}
 	m.logRun(ctx, run.ID, "%s: starting file backup via agent (%s: %s)",
 		agent.Hostname, countNoun(len(src.Paths), "path"), strings.Join(src.Paths, ", "))
+	// The walk, the exclusions and the scripts all happen inside the guest,
+	// where the files are: they travel with the dispatch and the agent applies
+	// them. The run log says "sent", not "applied", because this side of the
+	// wire cannot witness what the agent did with them.
+	if len(policy.ExcludePaths) > 0 {
+		m.logRun(ctx, run.ID, "%s: policy sends %s to exclude from the walk: %s",
+			agent.Hostname, countNoun(len(policy.ExcludePaths), "pattern"),
+			strings.Join(policy.ExcludePaths, ", "))
+	}
+	if policy.HasScripts() {
+		m.logRun(ctx, run.ID, "%s: policy scripts are dispatched to the agent to run in the guest (timeout %ds)",
+			agent.Hostname, policy.ScriptTimeoutSecondsOrDefault())
+	}
 	sess.SetStep("Dispatching to agent " + agent.Hostname)
 
 	dctx, cancel := context.WithTimeout(ctx, AgentDispatchTimeout)
 	defer cancel()
 	res, err := m.agents.RunBackup(dctx, agentmgr.BackupRequest{
-		RunID:   run.ID,
-		AgentID: agent.ID,
-		JobID:   job.ID,
-		JobName: job.Name,
-		Paths:   src.Paths,
-		Engine:  eng,
-		Session: sess,
+		RunID:                run.ID,
+		AgentID:              agent.ID,
+		JobID:                job.ID,
+		JobName:              job.Name,
+		Paths:                src.Paths,
+		ExcludePaths:         policy.ExcludePaths,
+		PreScript:            policy.PreScript,
+		PostScript:           policy.PostScript,
+		ScriptTimeoutSeconds: policy.ScriptTimeoutSecondsOrDefault(),
+		Engine:               eng,
+		Session:              sess,
 	})
 	if err != nil {
 		return statsPtr(sess), err
@@ -529,17 +702,14 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 // ---------------------------------------------------------------- shared
 
 // logSourceDone records the one line an operator reads to know what a source
-// actually cost: bytes seen, bytes that had to travel, and how much of it the
-// chunk index already knew.
+// actually cost: bytes seen, bytes that had to travel, and how much of the
+// traffic that saved. The reduction phrase comes from store.ReductionSummary,
+// the single definition the API reports too, so the log and the UI can never
+// describe the same run differently.
 func (m *Manager) logSourceDone(ctx context.Context, runID, name string, processed, uploaded int64, kind string) {
-	dedup := 0.0
-	if processed > 0 {
-		if dedup = (1 - float64(uploaded)/float64(processed)) * 100; dedup < 0 {
-			dedup = 0
-		}
-	}
-	m.logRun(ctx, runID, "%s: finished — %s processed, %s uploaded, %.0f%% deduplicated (%s restore point)",
-		name, humanBytes(processed), humanBytes(uploaded), dedup, kind)
+	m.logRun(ctx, runID, "%s: finished — %s processed, %s uploaded, %s (%s restore point)",
+		name, humanBytes(processed), humanBytes(uploaded),
+		store.ReductionSummary(processed, uploaded), kind)
 }
 
 // parentFor returns the id of the previous restore point for a source on a
@@ -556,10 +726,16 @@ func (m *Manager) parentFor(ctx context.Context, sourceKind, sourceID, targetID 
 	}
 }
 
-// applyRetention prunes restore points beyond the job's keep-last-N window.
+// applyRetention prunes the restore points of one source that the job's GFS
+// policy does not retain. The decision itself is store.EvaluateRetention — the
+// same pure function GET /api/jobs/{id}/retention-preview answers with — so
+// what an operator was shown before saving is what actually happens.
 func (m *Manager) applyRetention(ctx context.Context, runID string, eng *engine.Engine, job *store.Job, sourceKind, sourceID string) error {
-	keep := job.Retention
-	if keep <= 0 {
+	policy := job.Retention
+	if policy.Total() <= 0 {
+		// No rule retains anything. That is how a pre-v0.5.0 "retention 0"
+		// (which meant "never prune") reads, and it is also the one policy that
+		// would leave nothing to recover from, so nothing is pruned either way.
 		return nil
 	}
 	list, err := m.st.ListBackups(ctx, store.BackupFilter{
@@ -570,11 +746,33 @@ func (m *Manager) applyRetention(ctx context.Context, runID string, eng *engine.
 	if err != nil {
 		return err
 	}
-	if len(list) <= keep {
+	if len(list) == 0 {
+		return nil
+	}
+	points := make([]store.RetentionPoint, 0, len(list))
+	byID := make(map[string]*store.Backup, len(list))
+	for _, b := range list {
+		points = append(points, store.RetentionPoint{ID: b.ID, CreatedAt: b.CreatedAt})
+		byID[b.ID] = b
+	}
+	plan := store.EvaluateRetention(points, policy)
+	if len(plan.Prunes) == 0 {
+		return nil
+	}
+	if len(plan.Keeps) == 0 {
+		// A policy that retains none of the points it is shown would delete the
+		// last copy of this workload. Refuse, and say why: the operator can see
+		// the same verdict in the retention preview before saving.
+		m.logRun(ctx, runID, "%s: retention (%s) would keep no restore point at all, so nothing was pruned",
+			list[0].SourceName, policy.Describe())
 		return nil
 	}
 	pruned := 0
-	for _, b := range list[keep:] {
+	for _, decision := range plan.Prunes {
+		b := byID[decision.ID]
+		if b == nil {
+			continue
+		}
 		if err := eng.DeleteManifest(ctx, b.SourceKind, b.SourceID, b.ID); err != nil {
 			return err
 		}
@@ -586,11 +784,12 @@ func (m *Manager) applyRetention(ctx context.Context, runID string, eng *engine.
 		}
 		pruned++
 		m.log.Info("retention pruned restore point", "backup", b.ID,
-			"source", b.SourceName, "job", job.Name, "keep", keep)
+			"source", b.SourceName, "job", job.Name, "retention", policy.Describe())
 	}
 	if pruned > 0 {
-		m.logRun(ctx, runID, "%s: retention pruned %s (keeping the last %d)",
-			list[0].SourceName, countNoun(pruned, "restore point"), keep)
+		m.logRun(ctx, runID, "%s: retention (%s) pruned %s, %s kept",
+			list[0].SourceName, policy.Describe(), countNoun(pruned, "restore point"),
+			countNoun(len(plan.Keeps), "restore point"))
 	}
 	return nil
 }

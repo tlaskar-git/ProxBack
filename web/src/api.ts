@@ -79,6 +79,68 @@ export interface DashboardStats {
   recentRuns: JobRun[]
 }
 
+/* Protection posture (v0.5.0) ---------------------------------------------
+ *
+ * `GET /api/posture` is the console's evidence, not its opinion: the server
+ * evaluates every workload against its own schedule's RPO and returns the
+ * rolled-up verdict together with the reasons that produced it. The UI never
+ * derives a verdict of its own — it renders `reasons` and the per-workload
+ * rows underneath them.
+ * ------------------------------------------------------------------------- */
+
+export type PostureVerdict = 'protected' | 'at_risk' | 'unprotected' | 'unknown'
+
+/** Per-workload evaluation. `unknown` is a roll-up state only. */
+export type WorkloadStatus = 'protected' | 'at_risk' | 'unprotected'
+
+export interface PostureCounts {
+  protected: number
+  atRisk: number
+  unprotected: number
+}
+
+/** One explained contribution to the verdict, with how many workloads it covers. */
+export interface PostureReason {
+  code: string
+  workloads: number
+  detail: string
+}
+
+export interface PostureWorkload {
+  kind: SourceKind
+  id: ID
+  name: string
+  /**
+   * Guest id an operator recognises. Absent for agents. Show this — never the
+   * internal composite `id`, which is a storage key, not an identity.
+   */
+  vmid?: number
+  /** Cluster this workload belongs to — half of its canonical identity. */
+  hostName: string
+  node: string
+  /** Name of the protection policy (job) covering it, when there is one. */
+  policy?: string
+  enabled: boolean
+  /** Recovery point objective in hours, derived from the job's schedule. */
+  rpoHours?: number
+  lastSuccessAt?: string | null
+  /** Age of `lastSuccessAt` in hours, as the server measured it. */
+  ageHours?: number
+  withinRpo?: boolean
+  lastFailureAt?: string | null
+  /** Last time this workload's newest restore point passed integrity verification. */
+  lastVerifiedAt?: string | null
+  restorePoints: number
+  status: WorkloadStatus
+}
+
+export interface Posture {
+  verdict: PostureVerdict
+  counts: PostureCounts
+  reasons: PostureReason[]
+  workloads: PostureWorkload[]
+}
+
 /* Proxmox hosts ----------------------------------------------------------- */
 
 /** Server-reported health string. Unknown values render as a neutral pill. */
@@ -311,6 +373,228 @@ export interface AgentJobSource {
  */
 export type JobSources = VMJobSource[] | AgentJobSource | AgentJobSource[]
 
+/* Protection policy (v0.5.0) ----------------------------------------------
+ *
+ * Every field is optional on the wire and every default keeps the simple case
+ * simple: a six-guest estate never has to open this. `parsePolicy` fills the
+ * gaps so the rest of the app can read a complete object.
+ * ------------------------------------------------------------------------- */
+
+/** How the guest's filesystem is quiesced before the disk stream is read. */
+export type Quiesce = 'none' | 'guest-agent'
+
+/** Wall-clock window a run may *start* inside; `HH:MM`, server local time. */
+export interface BackupWindow {
+  start: string
+  end: string
+}
+
+export interface JobPolicy {
+  quiesce: Quiesce
+  /** VM jobs: Proxmox disk identifiers to leave out, e.g. `scsi1`. */
+  excludeDisks: string[]
+  /** Agent jobs: path globs to leave out, e.g. `**​/node_modules`. */
+  excludePaths: string[]
+  /** 0–5 automatic retries of a failed workload. */
+  retryCount: number
+  /** 1–120 minutes between retries. */
+  retryDelayMinutes: number
+  /** Abandon the run after this many minutes. 0 = no limit. */
+  maxDurationMinutes: number
+  /** null = may start at any time. */
+  window: BackupWindow | null
+  /** Run on the helper/agent before and after the workload; output captured. */
+  preScript: string
+  postScript: string
+  scriptTimeoutSeconds: number
+  /** Upload ceiling for this job in Mbps. 0 = inherit the global setting. */
+  uploadLimitMbpsOverride: number
+}
+
+export const DEFAULT_POLICY: JobPolicy = {
+  quiesce: 'none',
+  excludeDisks: [],
+  excludePaths: [],
+  retryCount: 0,
+  retryDelayMinutes: 5,
+  maxDurationMinutes: 0,
+  window: null,
+  preScript: '',
+  postScript: '',
+  scriptTimeoutSeconds: 30,
+  uploadLimitMbpsOverride: 0,
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+}
+
+function windowOf(value: unknown): BackupWindow | null {
+  if (typeof value !== 'object' || value === null) return null
+  const raw = value as Record<string, unknown>
+  const start = timeOf(raw.start, '')
+  const end = timeOf(raw.end, '')
+  if (!start || !end) return null
+  return { start, end }
+}
+
+/** Normalises anything the server holds in `job.policy` into a full object. */
+export function parsePolicy(value: unknown): JobPolicy {
+  if (typeof value !== 'object' || value === null) return { ...DEFAULT_POLICY }
+  const raw = value as Record<string, unknown>
+  return {
+    quiesce: raw.quiesce === 'guest-agent' ? 'guest-agent' : 'none',
+    excludeDisks: stringList(raw.excludeDisks),
+    excludePaths: stringList(raw.excludePaths),
+    retryCount: clampInt(raw.retryCount, 0, 5, 0),
+    retryDelayMinutes: clampInt(raw.retryDelayMinutes, 1, 120, 5),
+    maxDurationMinutes: clampInt(raw.maxDurationMinutes, 0, 10_080, 0),
+    window: windowOf(raw.window),
+    preScript: typeof raw.preScript === 'string' ? raw.preScript : '',
+    postScript: typeof raw.postScript === 'string' ? raw.postScript : '',
+    scriptTimeoutSeconds: clampInt(raw.scriptTimeoutSeconds, 1, 3600, 30),
+    uploadLimitMbpsOverride: clampInt(raw.uploadLimitMbpsOverride, 0, 10_000, 0),
+  }
+}
+
+/** True while nothing in the policy departs from the defaults. */
+export function isDefaultPolicy(policy: JobPolicy): boolean {
+  return (
+    policy.quiesce === DEFAULT_POLICY.quiesce &&
+    policy.excludeDisks.length === 0 &&
+    policy.excludePaths.length === 0 &&
+    policy.retryCount === DEFAULT_POLICY.retryCount &&
+    policy.maxDurationMinutes === DEFAULT_POLICY.maxDurationMinutes &&
+    policy.window === null &&
+    policy.preScript === '' &&
+    policy.postScript === '' &&
+    policy.uploadLimitMbpsOverride === DEFAULT_POLICY.uploadLimitMbpsOverride
+  )
+}
+
+/**
+ * The parts of a policy that differ from the defaults, phrased for an
+ * operator. Empty means "standard protection" — say that, do not list ten
+ * default values back at the reader.
+ */
+export function policyHighlights(policy: JobPolicy, kind: JobKind): string[] {
+  const out: string[] = []
+  if (policy.quiesce === 'guest-agent') out.push('Guest-agent quiescing')
+  if (kind === 'vm' && policy.excludeDisks.length > 0) {
+    out.push(`Excludes ${policy.excludeDisks.join(', ')}`)
+  }
+  if (kind === 'agent' && policy.excludePaths.length > 0) {
+    out.push(
+      policy.excludePaths.length === 1
+        ? `Excludes ${policy.excludePaths[0]}`
+        : `Excludes ${policy.excludePaths.length} path patterns`,
+    )
+  }
+  if (policy.retryCount > 0) {
+    out.push(
+      `Retries ${policy.retryCount}× after ${policy.retryDelayMinutes} min`,
+    )
+  }
+  if (policy.maxDurationMinutes > 0) out.push(`Stops after ${policy.maxDurationMinutes} min`)
+  if (policy.window) out.push(`Starts only ${policy.window.start}–${policy.window.end}`)
+  if (policy.preScript) out.push('Pre-backup script')
+  if (policy.postScript) out.push('Post-backup script')
+  if (policy.uploadLimitMbpsOverride > 0) {
+    out.push(`Upload capped at ${policy.uploadLimitMbpsOverride} Mbps`)
+  }
+  return out
+}
+
+/* GFS retention (v0.5.0) ---------------------------------------------------
+ *
+ * `job.retention` is an object; a bare integer is still accepted and means
+ * keep-last-N. A restore point survives if *any* rule retains it.
+ * ------------------------------------------------------------------------- */
+
+export interface RetentionPolicy {
+  keepLast: number
+  keepDaily: number
+  keepWeekly: number
+  keepMonthly: number
+  keepYearly: number
+}
+
+export type RetentionValue = number | RetentionPolicy
+
+export const DEFAULT_RETENTION: RetentionPolicy = {
+  keepLast: 7,
+  keepDaily: 0,
+  keepWeekly: 0,
+  keepMonthly: 0,
+  keepYearly: 0,
+}
+
+/** Normalises a bare integer or a partial object into a full policy. */
+export function parseRetention(value: RetentionValue | null | undefined): RetentionPolicy {
+  if (typeof value === 'number') {
+    return { ...DEFAULT_RETENTION, keepLast: clampInt(value, 0, 9999, 7) }
+  }
+  if (typeof value !== 'object' || value === null) return { ...DEFAULT_RETENTION }
+  const raw = value as unknown as Record<string, unknown>
+  return {
+    keepLast: clampInt(raw.keepLast, 0, 9999, 0),
+    keepDaily: clampInt(raw.keepDaily, 0, 9999, 0),
+    keepWeekly: clampInt(raw.keepWeekly, 0, 9999, 0),
+    keepMonthly: clampInt(raw.keepMonthly, 0, 9999, 0),
+    keepYearly: clampInt(raw.keepYearly, 0, 9999, 0),
+  }
+}
+
+/** True when only `keepLast` is in play — the simple case. */
+export function isSimpleRetention(retention: RetentionPolicy): boolean {
+  return (
+    retention.keepDaily === 0 &&
+    retention.keepWeekly === 0 &&
+    retention.keepMonthly === 0 &&
+    retention.keepYearly === 0
+  )
+}
+
+/** Total number of rules in force — used to warn about "keeps nothing". */
+export function retentionRuleCount(retention: RetentionPolicy): number {
+  return (
+    retention.keepLast +
+    retention.keepDaily +
+    retention.keepWeekly +
+    retention.keepMonthly +
+    retention.keepYearly
+  )
+}
+
+/** One-line English summary, e.g. `Keep last 7 · 4 weekly · 6 monthly`. */
+export function describeRetention(value: RetentionValue | null | undefined): string {
+  const retention = parseRetention(value)
+  const parts: string[] = []
+  if (retention.keepLast > 0) parts.push(`Keep last ${retention.keepLast}`)
+  if (retention.keepDaily > 0) parts.push(`${retention.keepDaily} daily`)
+  if (retention.keepWeekly > 0) parts.push(`${retention.keepWeekly} weekly`)
+  if (retention.keepMonthly > 0) parts.push(`${retention.keepMonthly} monthly`)
+  if (retention.keepYearly > 0) parts.push(`${retention.keepYearly} yearly`)
+  return parts.length === 0 ? 'Keeps nothing' : parts.join(' · ')
+}
+
+/** One entry of `GET /api/jobs/{id}/retention-preview`. */
+export interface RetentionPreviewEntry {
+  backupId: ID
+  createdAt: string
+  /** Which rules retained it — `last`, `daily`, `weekly`, `monthly`, `yearly`. */
+  reasons: string[]
+}
+
+export interface RetentionPreview {
+  keeps: RetentionPreviewEntry[]
+  prunes: RetentionPreviewEntry[]
+}
+
 export interface Job {
   id: ID
   name: string
@@ -327,8 +611,16 @@ export interface Job {
    * 03:00"). Display verbatim when present; `describeSchedule` is the fallback.
    */
   scheduleLabel?: string
-  /** Keep-last-N restore points. */
-  retention: number
+  /**
+   * v0.5.0 GFS object. Older servers still send a bare keep-last-N integer —
+   * read it through `parseRetention`.
+   */
+  retention: RetentionValue
+  /**
+   * v0.5.0 protection policy. Absent or partial on servers that predate it —
+   * read it through `parsePolicy`.
+   */
+  policy?: Partial<JobPolicy> | null
   enabled: boolean
   sources: JobSources
   /**
@@ -351,11 +643,14 @@ export interface JobCreate {
   targetId: ID
   /** Send the v0.4.0 object; a bare string is still accepted by the server. */
   schedule: ScheduleValue
-  retention: number
+  /** Send the v0.5.0 GFS object; a bare integer is still accepted. */
+  retention: RetentionValue
   sources: JobSources
   enabled: boolean
   /** VM jobs only. Empty string clears an existing tag filter. */
   tagFilter?: string
+  /** v0.5.0 protection policy. Omit to keep the server's defaults. */
+  policy?: JobPolicy
 }
 
 export type JobPatch = Partial<JobCreate>
@@ -374,9 +669,68 @@ export interface JobRun {
   bytesProcessed: number
   bytesUploaded: number
   dedupRatio: number
+  /**
+   * v0.5.0 data reduction, defined once by the contract:
+   * `reductionPct = 1 - uploaded/processed` (0 when processed is 0).
+   */
+  reductionPct?: number
+  /**
+   * `processed/uploaded`, and **omitted when uploaded is 0** — an infinite
+   * ratio is never rendered as `1.0×`. Read it through `reductionOf`.
+   */
+  reductionRatio?: number
   error?: string | null
   progressPct: number
   currentStep: string
+}
+
+/* ---------------------------------------------------------------------------
+ * Data reduction
+ *
+ * The contract defines these once so the console cannot invent a second
+ * definition. A run that read 32 MiB and uploaded nothing is "100% avoided",
+ * never "1.0×".
+ * ------------------------------------------------------------------------- */
+
+export interface DataReduction {
+  /** 0–100. How much of the source data did not have to travel. */
+  pct: number
+  /** processed ÷ uploaded, or null when nothing was uploaded. */
+  ratio: number | null
+}
+
+/**
+ * Reads the server's `reductionPct` / `reductionRatio` when present and
+ * otherwise derives them from the byte counters with the same formulas.
+ */
+export function reductionOf(run: {
+  bytesProcessed: number
+  bytesUploaded: number
+  reductionPct?: number
+  reductionRatio?: number
+}): DataReduction {
+  const processed = Number.isFinite(run.bytesProcessed) ? Math.max(0, run.bytesProcessed) : 0
+  const uploaded = Number.isFinite(run.bytesUploaded) ? Math.max(0, run.bytesUploaded) : 0
+
+  const pct =
+    typeof run.reductionPct === 'number' && Number.isFinite(run.reductionPct)
+      ? Math.max(0, Math.min(100, run.reductionPct))
+      : processed === 0
+        ? 0
+        : Math.max(0, Math.min(100, (1 - uploaded / processed) * 100))
+
+  // Only the server may assert a ratio; when it omits one and nothing was
+  // uploaded, there is no ratio to show.
+  const ratio =
+    typeof run.reductionRatio === 'number' &&
+    Number.isFinite(run.reductionRatio) &&
+    run.reductionRatio > 0
+      ? run.reductionRatio
+      : uploaded > 0 && processed > 0
+        ? processed / uploaded
+        : null
+
+  return { pct, ratio }
 }
 
 /** Per-object state inside a run — the "objects in this session" breakdown. */
@@ -389,6 +743,12 @@ export interface RunSource {
   kind: SourceKind
   /** Proxmox node for VM sources. */
   node?: string
+  /**
+   * v0.5.0 identity, when the server attributes the source to a cluster. A
+   * run can span clusters, and two of them can hold the same guest name.
+   */
+  hostName?: string
+  vmid?: number
   status: RunSourceStatus
   bytesProcessed: number
   bytesUploaded: number
@@ -408,6 +768,12 @@ export interface RunDetail extends JobRun {
   sources: RunSource[]
   /** Bytes per second over the server's last sample window. */
   throughputBps: number
+  /**
+   * v0.5.0: where a restore run actually put the data. Persisted with the run
+   * so the destination is a record, not a log line. Absent on backup and
+   * verification runs.
+   */
+  destination?: RestoreDestination | null
 }
 
 export interface RunRef {
@@ -441,12 +807,23 @@ export interface BackupDisk {
   sizeBytes: number
 }
 
+/** Outcome of the last integrity verification of a restore point. */
+export type VerifyResult = 'passed' | 'failed'
+
 export interface Backup {
   id: ID
   jobId: ID
   sourceKind: SourceKind
   sourceId: ID
   sourceName: string
+  /**
+   * v0.5.0 identity. Two clusters can hold identically named guests, so a
+   * restore point carries the cluster it came from.
+   */
+  hostId?: ID
+  hostName?: string
+  /** Proxmox node the source lived on, when the server records it. */
+  node?: string
   targetId: ID
   createdAt: string
   sizeBytes: number
@@ -454,6 +831,14 @@ export interface Backup {
   kind: BackupKind
   parentId?: ID | null
   disks: BackupDisk[]
+  /**
+   * v0.5.0 verification evidence, attached to the point itself rather than
+   * buried in run history. This is **integrity verified** — every chunk
+   * re-read and re-hashed — and never a claim that a restore was tested.
+   */
+  lastVerifiedAt?: string | null
+  lastVerifyResult?: VerifyResult | null
+  verifiedBytes?: number
 }
 
 export interface BackupQuery {
@@ -478,10 +863,40 @@ export interface RestoreAgentTarget {
   destPath: string
 }
 
+/**
+ * v0.5.0 recovery mode.
+ *
+ * - `alongside` — the default and the recommendation. Requires a VMID that
+ *   does not exist yet; the server suggests a free one.
+ * - `overwrite` — destroys what is on the destination. Requires
+ *   `confirmName` to match the destination VM's current name, and is refused
+ *   with 409 otherwise. Never preselected.
+ */
+export type RestoreMode = 'alongside' | 'overwrite'
+
 export interface RestoreRequest {
   backupId: ID
+  mode: RestoreMode
   vm?: RestoreVMTarget
   agent?: RestoreAgentTarget
+  /** Required for `overwrite`: the destination VM's current name, typed out. */
+  confirmName?: string
+}
+
+/** Where a restore run put the data, persisted with the run. */
+export interface RestoreDestination {
+  host?: string
+  node?: string
+  vmid?: number
+  storage?: string
+  mode?: RestoreMode
+  /** Agent restores record the unpack directory instead of a VMID. */
+  destPath?: string
+}
+
+/** `GET /api/hosts/{id}/free-vmid` — the next VMID nothing is using. */
+export interface FreeVMID {
+  vmid: number
 }
 
 /* Agents ------------------------------------------------------------------ */
@@ -511,16 +926,38 @@ export interface EnrollToken {
  * `vzdump --stdout` / `qmrestore` so agentless VM image backup works on real
  * hosts (which have no disk-export API).
  */
+/**
+ * `unassigned` is not a health state: it means the helper predates v0.5.0 and
+ * carries no host, so it is **not used for routing** and never guessed at.
+ */
+export type HelperStatus = 'online' | 'offline' | 'unassigned'
+
 export interface Helper {
   id: ID
-  /** Proxmox node name this helper serves (matched against VM inventory). */
+  /**
+   * v0.5.0: helpers are keyed by (hostId, node), because two clusters can
+   * each contain a node called `pve1`. Empty means the helper is unassigned.
+   */
+  hostId?: ID | null
+  hostName?: string | null
+  /** Proxmox node name this helper serves, within its host. */
   node: string
   address: string
   port: number
   version: string
-  status: 'online' | 'offline'
+  status: HelperStatus
   lastSeen: string
   registeredAt: string
+}
+
+/**
+ * True while a helper has no host and therefore routes nothing. Covers both
+ * the explicit status and the empty-hostId migration state.
+ */
+export function isHelperUnassigned(helper: Helper): boolean {
+  if (helper.status === 'unassigned') return true
+  const hostId = helper.hostId
+  return hostId === undefined || hostId === null || String(hostId) === ''
 }
 
 /* Settings ---------------------------------------------------------------- */
@@ -744,6 +1181,30 @@ export function getDashboard(): Promise<DashboardStats> {
 }
 
 /* ---------------------------------------------------------------------------
+ * Protection posture
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The estate's evaluated posture. Arrays are normalised so callers can always
+ * map over `reasons` and `workloads`, and an estate the server cannot judge
+ * comes back as `unknown` rather than as a green light.
+ */
+export async function getPosture(signal?: AbortSignal): Promise<Posture> {
+  const posture = await request<Posture>('/api/posture', { signal })
+  const counts = posture.counts ?? { protected: 0, atRisk: 0, unprotected: 0 }
+  return {
+    verdict: posture.verdict ?? 'unknown',
+    counts: {
+      protected: Number(counts.protected) || 0,
+      atRisk: Number(counts.atRisk) || 0,
+      unprotected: Number(counts.unprotected) || 0,
+    },
+    reasons: Array.isArray(posture.reasons) ? posture.reasons : [],
+    workloads: Array.isArray(posture.workloads) ? posture.workloads : [],
+  }
+}
+
+/* ---------------------------------------------------------------------------
  * Proxmox hosts
  * ------------------------------------------------------------------------- */
 
@@ -773,6 +1234,14 @@ export function getHostVMs(id: ID): Promise<VM[]> {
 /** Cached inventory across every host. */
 export function listVMs(): Promise<CachedVM[]> {
   return request<CachedVM[]>('/api/vms')
+}
+
+/**
+ * The next VMID free on this host, used to prefill a restore-alongside
+ * destination so the operator never has to guess one.
+ */
+export function getFreeVMID(hostId: ID, signal?: AbortSignal): Promise<FreeVMID> {
+  return request<FreeVMID>(`/api/hosts/${encodeURIComponent(String(hostId))}/free-vmid`, { signal })
 }
 
 /* ---------------------------------------------------------------------------
@@ -825,6 +1294,41 @@ export function runJob(id: ID): Promise<RunRef> {
   return request<RunRef>(`/api/jobs/${encodeURIComponent(String(id))}/run`, { method: 'POST' })
 }
 
+/**
+ * What a retention policy would keep and what it would prune, evaluated
+ * against the restore points this job actually holds.
+ *
+ * The candidate policy is sent as query parameters so the operator can see the
+ * effect of an edit *before* saving it; a server that only evaluates the
+ * stored policy simply ignores them and the answer is still correct for what
+ * is on disk today.
+ */
+export async function getRetentionPreview(
+  jobId: ID,
+  candidate?: RetentionPolicy,
+  signal?: AbortSignal,
+): Promise<RetentionPreview> {
+  const preview = await request<RetentionPreview>(
+    `/api/jobs/${encodeURIComponent(String(jobId))}/retention-preview`,
+    {
+      query: candidate
+        ? {
+            keepLast: candidate.keepLast,
+            keepDaily: candidate.keepDaily,
+            keepWeekly: candidate.keepWeekly,
+            keepMonthly: candidate.keepMonthly,
+            keepYearly: candidate.keepYearly,
+          }
+        : undefined,
+      signal,
+    },
+  )
+  return {
+    keeps: Array.isArray(preview.keeps) ? preview.keeps : [],
+    prunes: Array.isArray(preview.prunes) ? preview.prunes : [],
+  }
+}
+
 /* ---------------------------------------------------------------------------
  * Job runs
  * ------------------------------------------------------------------------- */
@@ -848,10 +1352,15 @@ export function listRuns(query: RunQuery = {}, signal?: AbortSignal): Promise<Jo
  */
 export async function getRun(id: ID, signal?: AbortSignal): Promise<RunDetail> {
   const detail = await request<RunDetail>(`/api/runs/${encodeURIComponent(String(id))}`, { signal })
+  // The restore destination has been carried under both names during the
+  // v0.5.0 rollout; accept either and expose one.
+  const raw = detail as unknown as Record<string, unknown>
+  const destination = (detail.destination ?? raw.restore ?? null) as RestoreDestination | null
   return {
     ...detail,
     sources: Array.isArray(detail.sources) ? detail.sources : [],
     throughputBps: Number.isFinite(detail.throughputBps) ? detail.throughputBps : 0,
+    destination: destination && typeof destination === 'object' ? destination : null,
   }
 }
 
@@ -912,6 +1421,11 @@ export function deleteBackup(id: ID): Promise<void> {
   return request<void>(`/api/backups/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
 }
 
+/**
+ * Starts a restore. `mode` is always explicit — the server refuses an
+ * `overwrite` whose `confirmName` does not match the destination VM's current
+ * name with a 409, and `alongside` needs a VMID that does not exist yet.
+ */
 export function createRestore(input: RestoreRequest): Promise<RunRef> {
   return request<RunRef>('/api/restores', { method: 'POST', body: { ...input } })
 }
@@ -933,6 +1447,11 @@ export function createEnrollToken(): Promise<EnrollToken> {
  * ------------------------------------------------------------------------- */
 
 export interface HelperDeployRequest {
+  /**
+   * v0.5.0: the host the node belongs to. Helpers are keyed by (hostId, node)
+   * because two clusters can each contain a `pve1`.
+   */
+  hostId: ID
   node: string
   address: string
   /** SSH port. Defaults to 22 on the server. */
@@ -973,8 +1492,28 @@ export function listHelpers(): Promise<Helper[]> {
   return request<Helper[]>('/api/helpers')
 }
 
-export function createHelperEnrollToken(): Promise<EnrollToken> {
-  return request<EnrollToken>('/api/helpers/enroll-token', { method: 'POST' })
+/**
+ * Mints a helper enrollment token for one specific host. The helper inherits
+ * the host from the token, so a Proxmox node never has to know its own
+ * cluster identity.
+ */
+export function createHelperEnrollToken(hostId: ID): Promise<EnrollToken> {
+  return request<EnrollToken>('/api/helpers/enroll-token', {
+    method: 'POST',
+    body: { hostId },
+  })
+}
+
+/**
+ * Binds an unassigned helper to a host. Until this happens the helper is not
+ * used for routing — ProxBack never guesses which cluster a bare node name
+ * belongs to.
+ */
+export function assignHelper(id: ID, hostId: ID): Promise<Helper> {
+  return request<Helper>(`/api/helpers/${encodeURIComponent(String(id))}/assign`, {
+    method: 'POST',
+    body: { hostId },
+  })
 }
 
 export function deleteHelper(id: ID): Promise<void> {

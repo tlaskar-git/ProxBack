@@ -142,7 +142,7 @@ func TestRunLogRecordsABackupRun(t *testing.T) {
 
 	job, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "nightly-vms", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: store.ManualSchedule(), Retention: 1, Enabled: true,
+		Schedule: store.ManualSchedule(), Retention: store.KeepLast(1), Enabled: true,
 		Sources: store.JobSources{{HostID: h.host.ID, VMID: 100, Name: "web-01"}},
 	})
 	if err != nil {
@@ -163,7 +163,7 @@ func TestRunLogRecordsABackupRun(t *testing.T) {
 	requireLine(t, lines, "web-01: starting 2 disks via Proxmox disk export on node pve1")
 	// web-01 has two 16 MiB disks and nothing is on the target yet.
 	done := requireLine(t, lines, "web-01: finished")
-	for _, want := range []string{"32.0 MiB processed", "32.0 MiB uploaded", "0% deduplicated", "full restore point"} {
+	for _, want := range []string{"32.0 MiB processed", "32.0 MiB uploaded", "0% avoided", "full restore point"} {
 		if !strings.Contains(done, want) {
 			t.Errorf("source completion line %q does not mention %q", done, want)
 		}
@@ -193,12 +193,12 @@ func TestRunLogRecordsABackupRun(t *testing.T) {
 	}
 	lines = h.lines(second.ID)
 	done = requireLine(t, lines, "web-01: finished")
-	for _, want := range []string{"32.0 MiB processed", "4.0 MiB uploaded", "88% deduplicated", "incremental restore point"} {
+	for _, want := range []string{"32.0 MiB processed", "4.0 MiB uploaded", "88% avoided (8.0× reduction)", "incremental restore point"} {
 		if !strings.Contains(done, want) {
 			t.Errorf("incremental completion line %q does not mention %q", done, want)
 		}
 	}
-	requireLine(t, lines, "web-01: retention pruned 1 restore point (keeping the last 1)")
+	requireLine(t, lines, "web-01: retention (keep last 1) pruned 1 restore point, 1 restore point kept")
 	requireLine(t, lines, "garbage collection freed 4.0 MiB (1 orphan chunk)")
 	requireLine(t, lines, "run succeeded")
 
@@ -237,7 +237,7 @@ func TestUnsuccessfulRunDoesNotCollectOrphanChunks(t *testing.T) {
 	// A run that fails before writing any manifest.
 	failing, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "staging-tagged", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: store.ManualSchedule(), Retention: 2, Enabled: true, TagFilter: "staging",
+		Schedule: store.ManualSchedule(), Retention: store.KeepLast(2), Enabled: true, TagFilter: "staging",
 	})
 	if err != nil {
 		t.Fatalf("create failing job: %v", err)
@@ -256,7 +256,7 @@ func TestUnsuccessfulRunDoesNotCollectOrphanChunks(t *testing.T) {
 	// does not disable it.
 	good, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "nightly-vms", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: store.ManualSchedule(), Retention: 2, Enabled: true,
+		Schedule: store.ManualSchedule(), Retention: store.KeepLast(2), Enabled: true,
 		Sources: store.JobSources{{HostID: h.host.ID, VMID: 100, Name: "web-01"}},
 	})
 	if err != nil {
@@ -278,7 +278,7 @@ func TestRunLogRecordsAFailure(t *testing.T) {
 
 	job, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "staging-tagged", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: store.ManualSchedule(), Retention: 2, Enabled: true, TagFilter: "staging",
+		Schedule: store.ManualSchedule(), Retention: store.KeepLast(2), Enabled: true, TagFilter: "staging",
 	})
 	if err != nil {
 		t.Fatalf("create job: %v", err)

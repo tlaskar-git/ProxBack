@@ -94,9 +94,14 @@ type apiRun struct {
 	BytesProcessed int64   `json:"bytesProcessed"`
 	BytesUploaded  int64   `json:"bytesUploaded"`
 	DedupRatio     float64 `json:"dedupRatio"`
-	Error          string  `json:"error"`
-	ProgressPct    float64 `json:"progressPct"`
-	CurrentStep    string  `json:"currentStep"`
+	// ReductionPct and ReductionRatio are the one definition of data reduction;
+	// the ratio is absent when nothing was uploaded, because it is unbounded.
+	ReductionPct   float64         `json:"reductionPct"`
+	ReductionRatio *float64        `json:"reductionRatio"`
+	Restore        *apiRestoreMeta `json:"restore"`
+	Error          string          `json:"error"`
+	ProgressPct    float64         `json:"progressPct"`
+	CurrentStep    string          `json:"currentStep"`
 }
 
 // apiRunLogLine mirrors one line of GET /api/runs/{id}/log. The timestamp stays
@@ -121,6 +126,50 @@ type apiSchedule struct {
 	Cron       string `json:"cron"`
 }
 
+// apiRetention mirrors the GFS retention object a job carries from v0.5.0 on.
+// A bare integer is still accepted on the way in; the way out is always this.
+type apiRetention struct {
+	KeepLast    int `json:"keepLast"`
+	KeepDaily   int `json:"keepDaily"`
+	KeepWeekly  int `json:"keepWeekly"`
+	KeepMonthly int `json:"keepMonthly"`
+	KeepYearly  int `json:"keepYearly"`
+}
+
+// apiWindow is the wall-clock window a run may start inside.
+type apiWindow struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
+
+// apiPolicy mirrors a job's protection policy.
+type apiPolicy struct {
+	Quiesce                 string     `json:"quiesce"`
+	ExcludeDisks            []string   `json:"excludeDisks"`
+	ExcludePaths            []string   `json:"excludePaths"`
+	RetryCount              int        `json:"retryCount"`
+	RetryDelayMinutes       int        `json:"retryDelayMinutes"`
+	MaxDurationMinutes      int        `json:"maxDurationMinutes"`
+	Window                  *apiWindow `json:"window"`
+	PreScript               string     `json:"preScript"`
+	PostScript              string     `json:"postScript"`
+	ScriptTimeoutSeconds    int        `json:"scriptTimeoutSeconds"`
+	UploadLimitMbpsOverride int        `json:"uploadLimitMbpsOverride"`
+}
+
+// apiRetentionEntry is one restore point in a retention preview.
+type apiRetentionEntry struct {
+	BackupID  string   `json:"backupId"`
+	CreatedAt string   `json:"createdAt"`
+	Reasons   []string `json:"reasons"`
+}
+
+// apiRetentionPreview is GET /api/jobs/{id}/retention-preview.
+type apiRetentionPreview struct {
+	Keeps  []apiRetentionEntry `json:"keeps"`
+	Prunes []apiRetentionEntry `json:"prunes"`
+}
+
 type apiJob struct {
 	ID            string         `json:"id"`
 	Name          string         `json:"name"`
@@ -129,7 +178,8 @@ type apiJob struct {
 	TargetName    string         `json:"targetName"`
 	Schedule      apiSchedule    `json:"schedule"`
 	ScheduleLabel string         `json:"scheduleLabel"`
-	Retention     int            `json:"retention"`
+	Retention     apiRetention   `json:"retention"`
+	Policy        apiPolicy      `json:"policy"`
 	Enabled       bool           `json:"enabled"`
 	Sources       []apiJobSource `json:"sources"`
 	TagFilter     *string        `json:"tagFilter"`
@@ -172,6 +222,8 @@ type apiBackup struct {
 	SourceKind    string    `json:"sourceKind"`
 	SourceID      string    `json:"sourceId"`
 	SourceName    string    `json:"sourceName"`
+	HostID        string    `json:"hostId"`
+	HostName      string    `json:"hostName"`
 	TargetID      string    `json:"targetId"`
 	CreatedAt     string    `json:"createdAt"`
 	SizeBytes     int64     `json:"sizeBytes"`
@@ -179,6 +231,56 @@ type apiBackup struct {
 	Kind          string    `json:"kind"`
 	ParentID      string    `json:"parentId"`
 	Disks         []apiDisk `json:"disks"`
+	// Verification evidence: integrity only, never a claim about restorability.
+	LastVerifiedAt   *string `json:"lastVerifiedAt"`
+	LastVerifyResult string  `json:"lastVerifyResult"`
+	VerifiedBytes    int64   `json:"verifiedBytes"`
+}
+
+// apiRestoreMeta is the persisted destination of a restore run.
+type apiRestoreMeta struct {
+	Mode     string `json:"mode"`
+	HostID   string `json:"hostId"`
+	HostName string `json:"hostName"`
+	Node     string `json:"node"`
+	VMID     int    `json:"vmid"`
+	Storage  string `json:"storage"`
+	AgentID  string `json:"agentId"`
+	DestPath string `json:"destPath"`
+}
+
+// apiPosture mirrors GET /api/posture.
+type apiPosture struct {
+	Verdict string `json:"verdict"`
+	Counts  struct {
+		Protected   int `json:"protected"`
+		AtRisk      int `json:"atRisk"`
+		Unprotected int `json:"unprotected"`
+	} `json:"counts"`
+	Reasons []struct {
+		Code      string `json:"code"`
+		Workloads int    `json:"workloads"`
+		Detail    string `json:"detail"`
+	} `json:"reasons"`
+	Workloads []apiPostureWorkload `json:"workloads"`
+}
+
+type apiPostureWorkload struct {
+	Kind           string   `json:"kind"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	HostName       string   `json:"hostName"`
+	Node           string   `json:"node"`
+	Policy         string   `json:"policy"`
+	Enabled        bool     `json:"enabled"`
+	RPOHours       *float64 `json:"rpoHours"`
+	LastSuccessAt  *string  `json:"lastSuccessAt"`
+	AgeHours       *float64 `json:"ageHours"`
+	WithinRPO      *bool    `json:"withinRpo"`
+	LastFailureAt  *string  `json:"lastFailureAt"`
+	LastVerifiedAt *string  `json:"lastVerifiedAt"`
+	RestorePoints  int      `json:"restorePoints"`
+	Status         string   `json:"status"`
 }
 
 type apiAgent struct {
@@ -194,6 +296,8 @@ type apiAgent struct {
 
 type apiHelper struct {
 	ID           string  `json:"id"`
+	HostID       string  `json:"hostId"`
+	HostName     string  `json:"hostName"`
 	Node         string  `json:"node"`
 	Address      string  `json:"address"`
 	Port         int     `json:"port"`
@@ -296,22 +400,39 @@ type nodeHelper struct {
 	content []byte
 	url     string
 	port    int
+	srv     *httptest.Server
 
 	mu       sync.Mutex
 	requests []helperRequest
 	imported map[int][]byte
+	scripts  []helperScript
+	// scriptFailures maps a phase ("pre"/"post") to the output a failing script
+	// of that phase reports.
+	scriptFailures map[string]string
+}
+
+// helperScript is one policy script the helper was asked to run.
+type helperScript struct {
+	Script         string `json:"script"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
+	Phase          string `json:"phase"`
 }
 
 func newNodeHelper(t *testing.T, node string, size int, seed uint64) *nodeHelper {
 	t.Helper()
 	nh := &nodeHelper{
-		node:     node,
-		secret:   "e2e-helper-access-secret-" + node,
-		content:  pseudoBytes(size, seed),
-		imported: map[int][]byte{},
+		node: node,
+		// The secret is per instance, not per node name: two clusters can each
+		// contain a "pve1", and the whole point of these tests is telling them
+		// apart.
+		secret:         fmt.Sprintf("e2e-helper-access-secret-%s-%x", node, seed),
+		content:        pseudoBytes(size, seed),
+		imported:       map[int][]byte{},
+		scriptFailures: map[string]string{},
 	}
 	srv := httptest.NewServer(nh.handler())
 	t.Cleanup(srv.Close)
+	nh.srv = srv
 	nh.url = srv.URL
 	host, port, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
 	if err != nil {
@@ -341,6 +462,35 @@ func (nh *nodeHelper) handler() http.Handler {
 		// Chunked, exactly like the real helper: no Content-Length is knowable.
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(nh.content)
+	})
+	// Policy scripts run where the data lives, so a vm job's pre/post scripts
+	// are executed by the helper on the node. The stand-in records what it was
+	// asked to run and can be told to report a non-zero exit.
+	mux.HandleFunc("/script", func(w http.ResponseWriter, r *http.Request) {
+		if !nh.authorized(w, r) {
+			return
+		}
+		var call helperScript
+		if err := json.NewDecoder(r.Body).Decode(&call); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		nh.record(r, len(call.Script))
+		nh.mu.Lock()
+		nh.scripts = append(nh.scripts, call)
+		failure, failing := nh.scriptFailures[call.Phase]
+		nh.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if failing {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok": false, "output": failure, "error": "exit status 1",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true, "output": "ran " + call.Script + " on " + nh.node,
+		})
 	})
 	mux.HandleFunc("/import/", func(w http.ResponseWriter, r *http.Request) {
 		if !nh.authorized(w, r) {
@@ -402,6 +552,31 @@ func (nh *nodeHelper) matching(method, path string) []helperRequest {
 	}
 	return out
 }
+
+// scriptsRun returns the policy scripts the helper was asked to execute.
+func (nh *nodeHelper) scriptsRun() []helperScript {
+	nh.mu.Lock()
+	defer nh.mu.Unlock()
+	return append([]helperScript(nil), nh.scripts...)
+}
+
+// failScript makes the given phase report a non-zero exit with output.
+func (nh *nodeHelper) failScript(phase, output string) {
+	nh.mu.Lock()
+	defer nh.mu.Unlock()
+	nh.scriptFailures[phase] = output
+}
+
+// clearScriptFailures puts the helper back to running scripts successfully.
+func (nh *nodeHelper) clearScriptFailures() {
+	nh.mu.Lock()
+	defer nh.mu.Unlock()
+	nh.scriptFailures = map[string]string{}
+}
+
+// stop takes the helper off the network, the way a node that has been shut down
+// or lost its route behaves. Calls to it then fail rather than hang.
+func (nh *nodeHelper) stop() { nh.srv.Close() }
 
 func (nh *nodeHelper) importedFor(vmid int) []byte {
 	nh.mu.Lock()
@@ -633,6 +808,22 @@ func (h *harness) helperCall(method, path, bearer string, body any) (int, []byte
 	return resp.StatusCode, raw
 }
 
+// helperEnrollToken mints a helper enrollment token for one Proxmox host. The
+// host travels with the token, which is how the registering helper learns which
+// cluster its node belongs to.
+func (h *harness) helperEnrollToken(hostID string) string {
+	h.t.Helper()
+	var out struct {
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expiresAt"`
+	}
+	h.ok(http.MethodPost, "/api/helpers/enroll-token", map[string]any{"hostId": hostID}, &out)
+	if out.Token == "" || out.ExpiresAt == "" {
+		h.t.Fatalf("helper enroll token response = %+v", out)
+	}
+	return out.Token
+}
+
 // registerHelper enrolls a fake node helper through the real registration
 // endpoint and returns the status plus the decoded response.
 func (h *harness) registerHelper(nh *nodeHelper, token string) (int, struct {
@@ -657,6 +848,21 @@ func (h *harness) registerHelper(nh *nodeHelper, token string) (int, struct {
 		}
 	}
 	return code, out
+}
+
+// backupByID re-reads one restore point through the listing endpoint, which is
+// the only way the API exposes a single point.
+func (h *harness) backupByID(sourceKind, sourceID, id string) apiBackup {
+	h.t.Helper()
+	var points []apiBackup
+	h.ok(http.MethodGet, "/api/backups?sourceKind="+sourceKind+"&sourceId="+sourceID, nil, &points)
+	for _, p := range points {
+		if p.ID == id {
+			return p
+		}
+	}
+	h.t.Fatalf("restore point %s not in %+v", id, points)
+	return apiBackup{}
 }
 
 // login re-authenticates the browser session.
@@ -982,8 +1188,19 @@ func TestEndToEnd(t *testing.T) {
 		if vmJob.ID == "" || vmJob.Kind != "vm" || len(vmJob.Sources) != 2 {
 			t.Fatalf("created job = %+v", vmJob)
 		}
-		if vmJob.TargetName != "vm-storage" || vmJob.Retention != 2 || vmJob.Schedule.Kind != "manual" {
+		// The job was created with a bare integer retention, which every older
+		// client still sends; it reads back as the GFS object that means the
+		// same thing, and the job carries the default protection policy.
+		if vmJob.TargetName != "vm-storage" || vmJob.Schedule.Kind != "manual" {
 			t.Fatalf("job fields = %+v", vmJob)
+		}
+		if (vmJob.Retention != apiRetention{KeepLast: 2}) {
+			t.Fatalf("job retention = %+v, want keepLast 2 and nothing else", vmJob.Retention)
+		}
+		if vmJob.Policy.Quiesce != "none" || vmJob.Policy.RetryDelayMinutes != 5 ||
+			vmJob.Policy.ScriptTimeoutSeconds != 30 || vmJob.Policy.Window != nil ||
+			len(vmJob.Policy.ExcludeDisks) != 0 {
+			t.Fatalf("job policy = %+v, want the defaults", vmJob.Policy)
 		}
 		if vmJob.LastRun != nil {
 			t.Fatalf("new job already has a lastRun: %+v", vmJob.LastRun)
@@ -1133,13 +1350,33 @@ func TestEndToEnd(t *testing.T) {
 		var started struct {
 			RunID string `json:"runId"`
 		}
-		h.ok(http.MethodPost, "/api/restores", map[string]any{
+		// Restoring onto the guest it came from destroys that guest, so it is an
+		// overwrite and needs the destination's current name typed back. A
+		// request that says nothing is refused rather than silently obeyed.
+		code, body := h.do(http.MethodPost, "/api/restores", map[string]any{
 			"backupId": newest.ID,
 			"vm":       map[string]any{"hostId": host.ID, "node": "pve1", "vmid": 100},
+		})
+		if code != http.StatusConflict {
+			t.Fatalf("restore onto the live guest without a mode = %d (%s), want 409", code, body)
+		}
+		if !strings.Contains(string(body), "already exists") {
+			t.Fatalf("refusal = %s", body)
+		}
+		h.ok(http.MethodPost, "/api/restores", map[string]any{
+			"backupId":    newest.ID,
+			"mode":        "overwrite",
+			"confirmName": "web-01",
+			"vm":          map[string]any{"hostId": host.ID, "node": "pve1", "vmid": 100},
 		}, &started)
 		run := h.waitRun(started.RunID, 90*time.Second)
 		if run.Status != "success" {
 			t.Fatalf("restore run %q: %s", run.Status, run.Error)
+		}
+		// The destination is history, not just a log line.
+		if run.Restore == nil || run.Restore.Mode != "overwrite" || run.Restore.VMID != 100 ||
+			run.Restore.Node != "pve1" || run.Restore.HostName != "pve-sim" {
+			t.Fatalf("restore run destination = %+v", run.Restore)
 		}
 		if !strings.HasPrefix(run.JobName, "Restore ") {
 			t.Fatalf("restore run jobName = %q", run.JobName)
@@ -1173,7 +1410,19 @@ func TestEndToEnd(t *testing.T) {
 
 		// Side-by-side restore into a free VMID must create the guest, like
 		// qmrestore does (regression: the sim used to 404 and the engine's
-		// closed-pipe error masked it).
+		// closed-pipe error masked it). No mode is given, so it is alongside —
+		// the safe default.
+		var free struct {
+			VMID int `json:"vmid"`
+		}
+		h.ok(http.MethodGet, "/api/hosts/"+host.ID+"/free-vmid", nil, &free)
+		if free.VMID != 104 {
+			t.Fatalf("free vmid = %d, want the first gap above the simulator's guests", free.VMID)
+		}
+		h.ok(http.MethodGet, "/api/hosts/"+host.ID+"/free-vmid?after=9000", nil, &free)
+		if free.VMID != 9000 {
+			t.Fatalf("free vmid after 9000 = %d", free.VMID)
+		}
 		h.ok(http.MethodPost, "/api/restores", map[string]any{
 			"backupId": newest.ID,
 			"vm":       map[string]any{"hostId": host.ID, "node": "pve1", "vmid": 9999},
@@ -1181,6 +1430,9 @@ func TestEndToEnd(t *testing.T) {
 		run = h.waitRun(started.RunID, 90*time.Second)
 		if run.Status != "success" {
 			t.Fatalf("side-by-side restore run %q: %s", run.Status, run.Error)
+		}
+		if run.Restore == nil || run.Restore.Mode != "alongside" || run.Restore.VMID != 9999 {
+			t.Fatalf("a restore without a mode recorded %+v, want alongside", run.Restore)
 		}
 		for _, disk := range []string{"scsi0", "scsi1"} {
 			want := h.fetchRaw(fmt.Sprintf("%s/sim/disk/100/%s", h.simURL, disk))
@@ -1645,6 +1897,16 @@ func TestEndToEnd(t *testing.T) {
 		if run.BytesUploaded != 0 {
 			t.Fatalf("verify uploaded %d bytes, want 0", run.BytesUploaded)
 		}
+		// The evidence lands on the restore point, not only in run history — and
+		// it is evidence of integrity, which is all a verification can prove.
+		verified := h.backupByID(point.SourceKind, point.SourceID, point.ID)
+		if verified.LastVerifyResult != "passed" || verified.LastVerifiedAt == nil {
+			t.Fatalf("verified restore point = %+v", verified)
+		}
+		if verified.VerifiedBytes != point.SizeBytes {
+			t.Fatalf("verifiedBytes = %d, want the %d bytes it re-read",
+				verified.VerifiedBytes, point.SizeBytes)
+		}
 
 		// Unknown restore points 404.
 		if code, body := h.do(http.MethodPost, "/api/backups/does-not-exist/verify", nil); code != http.StatusNotFound {
@@ -1666,6 +1928,15 @@ func TestEndToEnd(t *testing.T) {
 		}
 		if !strings.Contains(run.Error, "chunk hash verification failed") {
 			t.Fatalf("verify error = %q, want a hash verification failure", run.Error)
+		}
+		// The failure is recorded on the point too, so the UI never shows a
+		// stale "passed" beside data that no longer hashes.
+		rotten := h.backupByID(point.SourceKind, point.SourceID, point.ID)
+		if rotten.LastVerifyResult != "failed" || rotten.LastVerifiedAt == nil {
+			t.Fatalf("corrupted restore point = %+v, want a recorded failure", rotten)
+		}
+		if rotten.VerifiedBytes != 0 {
+			t.Fatalf("a failed verification claims %d verified bytes", rotten.VerifiedBytes)
 		}
 	})
 
@@ -2018,16 +2289,17 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("a fresh install already knows helpers: %+v", helpers)
 		}
 
-		var enroll struct {
-			Token     string `json:"token"`
-			ExpiresAt string `json:"expiresAt"`
+		// A helper enrollment token is minted for a host. Without one there is no
+		// token: the resulting registration could not be routed to, because a
+		// bare node name does not say which cluster's machine it is.
+		for _, bad := range []any{map[string]any{}, map[string]any{"hostId": "no-such-host"}} {
+			if code, body := h.do(http.MethodPost, "/api/helpers/enroll-token", bad); code != http.StatusBadRequest {
+				t.Fatalf("enroll-token %v = %d (%s), want 400", bad, code, body)
+			}
 		}
-		h.ok(http.MethodPost, "/api/helpers/enroll-token", nil, &enroll)
-		if enroll.Token == "" || enroll.ExpiresAt == "" {
-			t.Fatalf("helper enroll token response = %+v", enroll)
-		}
+		token := h.helperEnrollToken(host.ID)
 
-		code, res := h.registerHelper(helper, enroll.Token)
+		code, res := h.registerHelper(helper, token)
 		if code != http.StatusOK {
 			t.Fatalf("helper registration = %d", code)
 		}
@@ -2037,7 +2309,7 @@ func TestEndToEnd(t *testing.T) {
 		helperKey = res.APIKey
 
 		// Single use, and an agent token is not a helper token.
-		if code, _ := h.registerHelper(helper, enroll.Token); code != http.StatusUnauthorized {
+		if code, _ := h.registerHelper(helper, token); code != http.StatusUnauthorized {
 			t.Fatalf("reusing a helper enrollment token = %d, want 401", code)
 		}
 		var agentEnroll struct {
@@ -2066,6 +2338,11 @@ func TestEndToEnd(t *testing.T) {
 		helperInfo = helpers[0]
 		if helperInfo.Node != "pve2" || helperInfo.Port != helper.port {
 			t.Fatalf("registered helper = %+v, want node pve2 on port %d", helperInfo, helper.port)
+		}
+		// The helper inherited the cluster from the token it enrolled with.
+		if helperInfo.HostID != host.ID || helperInfo.HostName != "pve-sim" {
+			t.Fatalf("registered helper host = %q/%q, want the host the token was minted for",
+				helperInfo.HostID, helperInfo.HostName)
 		}
 		// The address is learned from the connection, never from the body.
 		if helperInfo.Address != "127.0.0.1" {
@@ -2225,10 +2502,34 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("restore without a storage passed %q", imports[0].Query)
 		}
 
-		// Restoring onto the source vmid is the overwrite case, and the optional
-		// storage override reaches qmrestore.
-		h.ok(http.MethodPost, "/api/restores", map[string]any{
+		// Restoring onto the source vmid is the overwrite case: it needs the
+		// destination guest's current name, and is refused without it.
+		code, body := h.do(http.MethodPost, "/api/restores", map[string]any{
 			"backupId": helperPoint.ID,
+			"mode":     "overwrite",
+			"vm": map[string]any{
+				"hostId": host.ID, "node": "pve2", "vmid": 103, "storage": "local-lvm",
+			},
+		})
+		if code != http.StatusConflict {
+			t.Fatalf("overwrite without a confirmName = %d (%s), want 409", code, body)
+		}
+		// The refusal names the guest, so the operator knows what to type.
+		if !strings.Contains(string(body), "mail-01") {
+			t.Fatalf("refusal %s does not say what to type", body)
+		}
+		if code, body := h.do(http.MethodPost, "/api/restores", map[string]any{
+			"backupId": helperPoint.ID, "mode": "overwrite", "confirmName": "not-mail-01",
+			"vm": map[string]any{"hostId": host.ID, "node": "pve2", "vmid": 103},
+		}); code != http.StatusConflict {
+			t.Fatalf("overwrite with the wrong confirmName = %d (%s), want 409", code, body)
+		}
+		// With the right name it goes through, and the optional storage override
+		// reaches qmrestore.
+		h.ok(http.MethodPost, "/api/restores", map[string]any{
+			"backupId":    helperPoint.ID,
+			"mode":        "overwrite",
+			"confirmName": "mail-01",
 			"vm": map[string]any{
 				"hostId": host.ID, "node": "pve2", "vmid": 103, "storage": "local-lvm",
 			},
@@ -2546,6 +2847,509 @@ func TestEndToEnd(t *testing.T) {
 				again.BytesUploaded)
 		}
 		h.ok(http.MethodPut, "/api/settings", map[string]any{"compression": "zstd"}, &settings)
+	})
+
+	// ---- Two clusters that each contain a node called "pve1" ---------------
+	//
+	// This is the defect that could route backup traffic to the wrong physical
+	// machine: helpers used to be keyed by node name alone, so the second
+	// cluster's "pve1" deleted the first one's and every job for either cluster
+	// went to whichever helper had registered last.
+	t.Run("26-two-clusters-share-a-node-name", func(t *testing.T) {
+		// A second Proxmox cluster, with the same node names and guest ids as
+		// the first — exactly the situation the old key could not express.
+		simB := pvesim.New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+		simBSrv := httptest.NewServer(simB.Handler())
+		t.Cleanup(simBSrv.Close)
+
+		var hostB apiHost
+		h.ok(http.MethodPost, "/api/hosts", map[string]any{
+			"name":        "pve-sim-b",
+			"baseUrl":     simBSrv.URL,
+			"tokenId":     "root@pam!proxback",
+			"tokenSecret": "sim-b-token-secret",
+			"insecureTLS": true,
+		}, &hostB)
+		if hostB.ID == "" || hostB.ID == host.ID {
+			t.Fatalf("second host = %+v", hostB)
+		}
+		var vmsB []apiVM
+		h.ok(http.MethodGet, "/api/hosts/"+hostB.ID+"/vms", nil, &vmsB)
+		if len(vmsB) != 4 {
+			t.Fatalf("second cluster inventory = %d guests", len(vmsB))
+		}
+		// Both clusters really do hold a pve1 with a web-01 numbered 100.
+		nodesA := map[string]bool{}
+		var cached []apiVM
+		h.ok(http.MethodGet, "/api/vms", nil, &cached)
+		for _, v := range cached {
+			if v.HostID == host.ID {
+				nodesA[v.Node] = true
+			}
+		}
+		if !nodesA["pve1"] {
+			t.Fatalf("the first cluster has no pve1: %+v", cached)
+		}
+
+		// One helper per cluster, both for a node called pve1, each with its own
+		// access secret and its own archive content.
+		helperA := newNodeHelper(t, "pve1", 5*mib, 0xA11CE)
+		helperB := newNodeHelper(t, "pve1", 7*mib, 0xB0B)
+		if code, res := h.registerHelper(helperA, h.helperEnrollToken(host.ID)); code != http.StatusOK {
+			t.Fatalf("registering cluster A's pve1 helper = %d (%+v)", code, res)
+		}
+		if code, res := h.registerHelper(helperB, h.helperEnrollToken(hostB.ID)); code != http.StatusOK {
+			t.Fatalf("registering cluster B's pve1 helper = %d (%+v)", code, res)
+		}
+
+		// Neither registration displaced the other.
+		var helpers []apiHelper
+		h.ok(http.MethodGet, "/api/helpers", nil, &helpers)
+		byHost := map[string]apiHelper{}
+		for _, hp := range helpers {
+			if hp.Node == "pve1" {
+				byHost[hp.HostID] = hp
+			}
+		}
+		if len(byHost) != 2 {
+			t.Fatalf("pve1 helpers = %+v, want one per cluster", helpers)
+		}
+		if byHost[host.ID].ID == "" || byHost[hostB.ID].ID == "" {
+			t.Fatalf("a cluster lost its pve1 helper: %+v", helpers)
+		}
+		if byHost[host.ID].ID == byHost[hostB.ID].ID {
+			t.Fatal("both clusters resolved to the same helper registration")
+		}
+		if byHost[host.ID].HostName != "pve-sim" || byHost[hostB.ID].HostName != "pve-sim-b" {
+			t.Fatalf("helper listings do not name their cluster: %+v", helpers)
+		}
+		for _, hp := range []apiHelper{byHost[host.ID], byHost[hostB.ID]} {
+			if hp.Status != "online" {
+				t.Fatalf("freshly registered helper %s is %q", hp.ID, hp.Status)
+			}
+		}
+
+		// A backup of cluster A's web-01 must reach cluster A's helper, and only
+		// that one.
+		runJobFor := func(name, hostID string, vmid int) apiRun {
+			t.Helper()
+			var job apiJob
+			h.ok(http.MethodPost, "/api/jobs", map[string]any{
+				"name": name, "kind": "vm", "targetId": vmTarget.ID,
+				"schedule": "manual", "retention": 2, "enabled": true,
+				"sources": []map[string]any{{"hostId": hostID, "vmid": vmid, "name": "web-01"}},
+			}, &job)
+			return h.runJob(job.ID)
+		}
+		runA := runJobFor("cluster-a-web", host.ID, 100)
+		if got := len(helperA.matching(http.MethodGet, "/export/100")); got != 1 {
+			t.Fatalf("cluster A's helper saw %d exports, want 1: %+v", got, helperA.seen())
+		}
+		if got := len(helperB.seen()); got != 0 {
+			t.Fatalf("cluster B's helper was called for a cluster A backup: %+v", helperB.seen())
+		}
+		if runA.BytesProcessed != int64(len(helperA.content)) {
+			t.Fatalf("cluster A backup read %d bytes, want cluster A's archive (%d)",
+				runA.BytesProcessed, len(helperA.content))
+		}
+
+		runB := runJobFor("cluster-b-web", hostB.ID, 100)
+		if got := len(helperB.matching(http.MethodGet, "/export/100")); got != 1 {
+			t.Fatalf("cluster B's helper saw %d exports, want 1: %+v", got, helperB.seen())
+		}
+		if got := len(helperA.matching(http.MethodGet, "/export/100")); got != 1 {
+			t.Fatalf("cluster A's helper was called again for a cluster B backup: %+v", helperA.seen())
+		}
+		if runB.BytesProcessed != int64(len(helperB.content)) {
+			t.Fatalf("cluster B backup read %d bytes, want cluster B's archive (%d)",
+				runB.BytesProcessed, len(helperB.content))
+		}
+
+		// The two restore points are the same guest name in different clusters,
+		// and the API says which is which.
+		for _, c := range []struct {
+			hostID, hostName string
+			size             int
+		}{
+			{host.ID, "pve-sim", len(helperA.content)},
+			{hostB.ID, "pve-sim-b", len(helperB.content)},
+		} {
+			var points []apiBackup
+			h.ok(http.MethodGet, "/api/backups?sourceKind=vm&sourceId="+c.hostID+"_100", nil, &points)
+			if len(points) == 0 {
+				t.Fatalf("%s has no restore points for web-01", c.hostName)
+			}
+			newest := points[0]
+			if newest.HostID != c.hostID || newest.HostName != c.hostName {
+				t.Fatalf("restore point identity = %q/%q, want %q/%q",
+					newest.HostID, newest.HostName, c.hostID, c.hostName)
+			}
+			if newest.SourceName != "web-01" {
+				t.Fatalf("restore point name = %q", newest.SourceName)
+			}
+			if len(newest.Disks) != 1 || newest.Disks[0].Name != "vma" ||
+				newest.SizeBytes != int64(c.size) {
+				t.Fatalf("%s restore point = %+v, want its own cluster's archive", c.hostName, newest)
+			}
+		}
+
+		// Cluster B's helper is removed; cluster A keeps its own.
+		h.ok(http.MethodDelete, "/api/helpers/"+byHost[hostB.ID].ID, nil, nil)
+		h.ok(http.MethodGet, "/api/helpers", nil, &helpers)
+		found := false
+		for _, hp := range helpers {
+			if hp.ID == byHost[host.ID].ID {
+				found = true
+			}
+			if hp.ID == byHost[hostB.ID].ID {
+				t.Fatal("cluster B's helper survived its deletion")
+			}
+		}
+		if !found {
+			t.Fatal("deleting cluster B's helper removed cluster A's")
+		}
+	})
+
+	// ---- Protection posture ------------------------------------------------
+	t.Run("27-protection-posture", func(t *testing.T) {
+		// A guest whose node has a helper that has gone off the network: its own
+		// backups fail while every other job in the estate keeps succeeding.
+		dead := newNodeHelper(t, "pve2", 3*mib, 0xDEAD)
+		if code, res := h.registerHelper(dead, h.helperEnrollToken(host.ID)); code != http.StatusOK {
+			t.Fatalf("registering the pve2 helper = %d (%+v)", code, res)
+		}
+		dead.stop()
+
+		var failing apiJob
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "mail-nightly", "kind": "vm", "targetId": vmTarget.ID,
+			"schedule":  map[string]any{"kind": "daily", "time": "02:00"},
+			"retention": 2, "enabled": true,
+			"sources": []map[string]any{{"hostId": host.ID, "vmid": 103, "name": "mail-01"}},
+		}, &failing)
+		failedRun := h.waitRun(h.startRun(failing.ID), 90*time.Second)
+		if failedRun.Status != "failed" {
+			t.Fatalf("a backup through an unreachable helper finished %q", failedRun.Status)
+		}
+
+		var posture apiPosture
+		h.ok(http.MethodGet, "/api/posture", nil, &posture)
+		if len(posture.Workloads) == 0 {
+			t.Fatal("posture reports no workloads for a populated estate")
+		}
+		byID := map[string]apiPostureWorkload{}
+		for _, w := range posture.Workloads {
+			byID[w.ID] = w
+		}
+		mail := byID[host.ID+"_103"]
+		if mail.Status != "at_risk" {
+			t.Fatalf("mail-01, whose own last run failed, is %q: %+v", mail.Status, mail)
+		}
+		if mail.LastFailureAt == nil {
+			t.Fatalf("mail-01 is at risk but reports no failure time: %+v", mail)
+		}
+		if mail.Policy == "" || mail.RestorePoints == 0 {
+			t.Fatalf("mail-01 posture = %+v", mail)
+		}
+		if mail.HostName != "pve-sim" || mail.Node != "pve2" || mail.Name != "mail-01" {
+			t.Fatalf("mail-01 is not identified as cluster/name/node: %+v", mail)
+		}
+		// A guest whose own job succeeded is not dragged down by mail-01, and a
+		// guest in no job at all is unprotected rather than merely at risk.
+		web := byID[host.ID+"_100"]
+		if web.Status != "protected" || web.Policy == "" {
+			t.Fatalf("web-01 posture = %+v, want protected (its own job succeeded)", web)
+		}
+		unprotected := 0
+		for _, w := range posture.Workloads {
+			if w.Status == "unprotected" {
+				unprotected++
+				if w.Policy != "" {
+					t.Fatalf("an unprotected workload names a policy: %+v", w)
+				}
+			}
+		}
+		if unprotected != posture.Counts.Unprotected {
+			t.Fatalf("counts.unprotected = %d, but %d workloads say so",
+				posture.Counts.Unprotected, unprotected)
+		}
+		total := posture.Counts.Protected + posture.Counts.AtRisk + posture.Counts.Unprotected
+		if total != len(posture.Workloads) {
+			t.Fatalf("counts total %d for %d workloads", total, len(posture.Workloads))
+		}
+		// The verdict is the worst state in the estate, and the reasons explain it.
+		want := "at_risk"
+		if posture.Counts.Unprotected > 0 {
+			want = "unprotected"
+		}
+		if posture.Verdict != want {
+			t.Fatalf("verdict = %q, want %q for %+v", posture.Verdict, want, posture.Counts)
+		}
+		sawFailure := false
+		for _, r := range posture.Reasons {
+			if r.Code == "last_run_failed" {
+				sawFailure = true
+			}
+			if r.Workloads < 1 || r.Detail == "" {
+				t.Fatalf("reason %+v explains nothing", r)
+			}
+		}
+		if !sawFailure {
+			t.Fatalf("reasons %+v never mention the failed backup", posture.Reasons)
+		}
+	})
+
+	// ---- Step 12: protection policy and GFS retention ----------------------
+	//
+	// The console's Advanced protection and Retention steps are built against
+	// this: a policy round-trips, its effects show up in the run log, and the
+	// retention preview says exactly what the pruning pass then does.
+	t.Run("28-protection-policy-and-gfs-retention", func(t *testing.T) {
+		// A live helper for cluster A's pve1 and a target of its own, so this
+		// job's restore points are the only history retention has to reason
+		// about and the guest's node really can run policy scripts.
+		policyHelper := newNodeHelper(t, "pve1", 4*mib, 0x9011CE)
+		if code, res := h.registerHelper(policyHelper, h.helperEnrollToken(host.ID)); code != http.StatusOK {
+			t.Fatalf("registering the policy helper = %d (%+v)", code, res)
+		}
+		var policyTarget apiTarget
+		h.ok(http.MethodPost, "/api/targets", map[string]any{
+			"name": "policy-storage", "endpoint": h.s3URL, "region": "us-east-1",
+			"bucket": "proxback-policy", "accessKey": "proxback",
+			"secretKey": "proxback-secret", "pathStyle": true,
+		}, &policyTarget)
+
+		// A per-disk exclusion cannot be expressed to vzdump on the helper
+		// path, so ProxBack refuses the run rather than storing an archive that
+		// quietly contains the excluded disk.
+		var refused apiJob
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "policy-excluded", "kind": "vm", "targetId": policyTarget.ID,
+			"schedule": map[string]any{"kind": "manual"}, "retention": 2, "enabled": true,
+			"sources": []map[string]any{{"hostId": host.ID, "vmid": 100, "name": "web-01"}},
+			"policy":  map[string]any{"excludeDisks": []string{"scsi1"}},
+		}, &refused)
+		refusedRun := h.waitRun(h.startRun(refused.ID), 90*time.Second)
+		if refusedRun.Status != "failed" {
+			t.Fatalf("a helper-backed run with excludeDisks finished %q", refusedRun.Status)
+		}
+		for _, want := range []string{"excludeDisks cannot be honoured", "backup=0"} {
+			if !strings.Contains(refusedRun.Error, want) {
+				t.Fatalf("refusal = %q, want it to mention %q", refusedRun.Error, want)
+			}
+		}
+
+		// An invalid policy never reaches a run at all: the field is named.
+		code, body := h.do(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "policy-invalid", "kind": "vm", "targetId": policyTarget.ID,
+			"schedule": map[string]any{"kind": "manual"}, "retention": 2, "enabled": true,
+			"sources": []map[string]any{{"hostId": host.ID, "vmid": 100, "name": "web-01"}},
+			"policy":  map[string]any{"retryCount": 9},
+		})
+		if code != http.StatusBadRequest || !strings.Contains(string(body), "policy.retryCount") {
+			t.Fatalf("a job with 9 retries = %d (%s), want a 400 naming policy.retryCount", code, body)
+		}
+
+		policy := map[string]any{
+			"quiesce":            "guest-agent",
+			"retryCount":         0,
+			"retryDelayMinutes":  1,
+			"maxDurationMinutes": 30,
+			// Open all day; the window is closed further down to check that a
+			// manual run is still allowed through it.
+			"window":                  map[string]any{"start": "00:00", "end": "23:59"},
+			"preScript":               "/usr/local/bin/freeze.sh",
+			"postScript":              "/usr/local/bin/thaw.sh",
+			"scriptTimeoutSeconds":    45,
+			"uploadLimitMbpsOverride": 2000,
+		}
+		var job apiJob
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "policy-web", "kind": "vm", "targetId": policyTarget.ID,
+			"schedule": map[string]any{"kind": "manual"},
+			// The GFS object, not an integer: keep the newest point and the
+			// newest point of each of the last two days.
+			"retention": map[string]any{"keepLast": 1, "keepDaily": 2},
+			"enabled":   true,
+			"sources":   []map[string]any{{"hostId": host.ID, "vmid": 100, "name": "web-01"}},
+			"policy":    policy,
+		}, &job)
+		if job.ID == "" {
+			t.Fatalf("created job = %+v", job)
+		}
+		if job.Retention.KeepLast != 1 || job.Retention.KeepDaily != 2 || job.Retention.KeepWeekly != 0 {
+			t.Fatalf("job retention = %+v", job.Retention)
+		}
+		if job.Policy.Quiesce != "guest-agent" || job.Policy.MaxDurationMinutes != 30 ||
+			job.Policy.ScriptTimeoutSeconds != 45 || job.Policy.UploadLimitMbpsOverride != 2000 ||
+			job.Policy.PreScript != "/usr/local/bin/freeze.sh" {
+			t.Fatalf("job policy = %+v", job.Policy)
+		}
+		if job.Policy.Window == nil || job.Policy.Window.Start != "00:00" {
+			t.Fatalf("job policy window = %+v", job.Policy.Window)
+		}
+
+		var log struct {
+			Lines []struct {
+				Line string `json:"line"`
+			} `json:"lines"`
+		}
+		readLog := func(runID string) string {
+			t.Helper()
+			h.ok(http.MethodGet, "/api/runs/"+runID+"/log", nil, &log)
+			var joined []string
+			for _, l := range log.Lines {
+				joined = append(joined, l.Line)
+			}
+			return strings.Join(joined, "\n")
+		}
+
+		run := h.runJob(job.ID)
+		text := readLog(run.ID)
+		for _, want := range []string{
+			"policy: upload capped at 2000 Mbps",
+			"policy: this run is limited to 30 minutes",
+			"web-01: running the pre-script on node pve1 (timeout 45s)",
+			"web-01: pre-script: ran /usr/local/bin/freeze.sh on pve1",
+			"web-01: running the post-script on node pve1",
+			// The guest has no qemu-guest-agent, and ProxBack says so rather
+			// than claiming a freeze that never happened.
+			"policy asks for guest-agent quiescing",
+			"crash-consistent",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("the run log never says %q:\n%s", want, text)
+			}
+		}
+		// The scripts really ran on the node, with the policy's timeout.
+		scripts := policyHelper.scriptsRun()
+		if len(scripts) != 2 || scripts[0].Phase != "pre" || scripts[1].Phase != "post" {
+			t.Fatalf("the helper ran %+v, want a pre-script then a post-script", scripts)
+		}
+		if scripts[0].TimeoutSeconds != 45 {
+			t.Fatalf("the pre-script carried a %ds timeout, want 45", scripts[0].TimeoutSeconds)
+		}
+
+		// Two more runs, each with a change so the restore points differ.
+		for i := 0; i < 2; i++ {
+			if _, _, err := h.sim.Mutate(100); err != nil {
+				t.Fatalf("mutate web-01: %v", err)
+			}
+			h.runJob(job.ID)
+		}
+
+		// Everything ran on one day, so keepLast 1 and keepDaily 2 both point
+		// at the newest restore point: exactly one survives.
+		var backups []apiBackup
+		h.ok(http.MethodGet, "/api/backups?jobId="+job.ID, nil, &backups)
+		if len(backups) != 1 {
+			t.Fatalf("GFS retention left %d restore points, want 1", len(backups))
+		}
+		survivor := backups[0].ID
+
+		// The preview and the pruning pass are the same decision: whatever the
+		// preview would prune has already been pruned, and what it keeps is
+		// exactly what is on the target.
+		var preview apiRetentionPreview
+		h.ok(http.MethodGet, "/api/jobs/"+job.ID+"/retention-preview", nil, &preview)
+		if len(preview.Prunes) != 0 {
+			t.Fatalf("the preview would still prune %d points that retention left in place: %+v",
+				len(preview.Prunes), preview.Prunes)
+		}
+		if len(preview.Keeps) != 1 || preview.Keeps[0].BackupID != survivor {
+			t.Fatalf("preview keeps %+v, want the one surviving restore point %s",
+				preview.Keeps, survivor)
+		}
+		if strings.Join(preview.Keeps[0].Reasons, "+") != "last+daily" {
+			t.Fatalf("preview reasons = %v, want [last daily]", preview.Keeps[0].Reasons)
+		}
+
+		// A candidate policy in the query previews an unsaved edit without
+		// touching anything: keeping nothing prunes everything, on paper.
+		var candidate apiRetentionPreview
+		h.ok(http.MethodGet,
+			"/api/jobs/"+job.ID+"/retention-preview?keepLast=0&keepDaily=0&keepWeekly=0&keepMonthly=0&keepYearly=0",
+			nil, &candidate)
+		if len(candidate.Keeps) != 0 || len(candidate.Prunes) != 1 {
+			t.Fatalf("an empty candidate policy previews %d keeps / %d prunes, want 0/1",
+				len(candidate.Keeps), len(candidate.Prunes))
+		}
+		h.ok(http.MethodGet, "/api/backups?jobId="+job.ID, nil, &backups)
+		if len(backups) != 1 || backups[0].ID != survivor {
+			t.Fatalf("the preview changed the estate: %+v", backups)
+		}
+
+		// A failing post-script fails the run but keeps the restore point it
+		// was taken from: the data is real, and the script's mistake is not
+		// the data's fault.
+		policyHelper.failScript("post", "thaw.sh: could not resume replication")
+		if _, _, err := h.sim.Mutate(100); err != nil {
+			t.Fatalf("mutate web-01: %v", err)
+		}
+		postRun := h.waitRun(h.startRun(job.ID), 90*time.Second)
+		if postRun.Status != "failed" || !strings.Contains(postRun.Error, "post-script") {
+			t.Fatalf("a failing post-script produced %q / %q", postRun.Status, postRun.Error)
+		}
+		if text := readLog(postRun.ID); !strings.Contains(text, "the restore point taken before the post-script is kept") {
+			t.Fatalf("the run log does not say the restore point survived:\n%s", text)
+		}
+		h.ok(http.MethodGet, "/api/backups?jobId="+job.ID, nil, &backups)
+		if len(backups) == 0 {
+			t.Fatal("a failing post-script destroyed the restore point it had just taken")
+		}
+
+		// A failing pre-script stops before any data moves.
+		policyHelper.clearScriptFailures()
+		policyHelper.failScript("pre", "freeze.sh: database is locked")
+		exportsBefore := len(policyHelper.matching(http.MethodGet, "/export/100"))
+		preRun := h.waitRun(h.startRun(job.ID), 90*time.Second)
+		if preRun.Status != "failed" || !strings.Contains(preRun.Error, "pre-script") {
+			t.Fatalf("a failing pre-script produced %q / %q", preRun.Status, preRun.Error)
+		}
+		if preRun.BytesProcessed != 0 || preRun.BytesUploaded != 0 {
+			t.Fatalf("a failing pre-script still moved %d/%d bytes",
+				preRun.BytesProcessed, preRun.BytesUploaded)
+		}
+		if got := len(policyHelper.matching(http.MethodGet, "/export/100")); got != exportsBefore {
+			t.Fatalf("the helper exported %d times after a failing pre-script, want %d",
+				got, exportsBefore)
+		}
+		policyHelper.clearScriptFailures()
+
+		// A scheduled run outside the job's window is skipped, while the
+		// operator's own "Run now" is not — that asymmetry is the whole point
+		// of a window, so the API must never refuse a manual start for it.
+		closed := time.Now().Add(3 * time.Hour)
+		h.ok(http.MethodPatch, "/api/jobs/"+job.ID, map[string]any{
+			"policy": map[string]any{
+				"quiesce": "none",
+				"window": map[string]any{
+					"start": closed.Format("15:04"),
+					"end":   closed.Add(time.Hour).Format("15:04"),
+				},
+			},
+		}, &job)
+		if job.Policy.Window == nil {
+			t.Fatalf("the window was not saved: %+v", job.Policy)
+		}
+		manual := h.runJob(job.ID)
+		if !strings.Contains(readLog(manual.ID), "a manual run is always allowed") {
+			t.Fatalf("a manual run outside the window did not record the override: %+v", log.Lines)
+		}
+
+		// And a retention policy that keeps nothing never gets to delete the
+		// last copy: the run applies retention and the restore point remains.
+		h.ok(http.MethodPatch, "/api/jobs/"+job.ID, map[string]any{
+			"retention": map[string]any{"keepLast": 0, "keepDaily": 0},
+		}, nil)
+		if _, _, err := h.sim.Mutate(100); err != nil {
+			t.Fatalf("mutate web-01: %v", err)
+		}
+		h.runJob(job.ID)
+		h.ok(http.MethodGet, "/api/backups?jobId="+job.ID, nil, &backups)
+		if len(backups) == 0 {
+			t.Fatal("a retention policy that keeps nothing deleted every restore point")
+		}
 	})
 }
 

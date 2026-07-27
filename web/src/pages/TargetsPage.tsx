@@ -211,13 +211,13 @@ function AddTargetModal({
         />
 
         {error ? (
-          <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+          <p className="rounded-lg border border-fail-500/30 bg-fail-500/10 px-3.5 py-2.5 text-xs text-fail-300">
             {error}
           </p>
         ) : (
           <SectionNote>
             After the target is created, ProxBack writes, reads, and deletes a small probe object to
-            prove the credentials work. Chunks are deduplicated per target, so keep one bucket per
+            prove the credentials work. Data reduction happens per target, so keep one bucket per
             target.
           </SectionNote>
         )}
@@ -336,7 +336,7 @@ export function TargetsPage() {
     <>
       <PageHeader
         title="Storage Targets"
-        description="S3-compatible buckets that hold deduplicated chunks and manifests."
+        description="S3-compatible buckets that hold your backup data."
         actions={
           <>
             <Button
@@ -365,7 +365,7 @@ export function TargetsPage() {
         <EmptyState
           icon={<Database className="size-5" aria-hidden />}
           title="No storage targets yet"
-          description="Add a Backblaze B2, MinIO, or AWS S3 bucket. ProxBack stores 4 MiB deduplicated chunks plus one manifest per restore point, so a single bucket serves every job."
+          description="Add a Backblaze B2, MinIO, or AWS S3 bucket. Backups are reduced before they are sent, so one bucket comfortably serves every job."
           action={
             <Button
               variant="primary"

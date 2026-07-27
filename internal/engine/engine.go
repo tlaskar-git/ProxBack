@@ -454,7 +454,11 @@ func (s *Session) RestoreDisk(ctx context.Context, dm DiskManifest, w io.Writer)
 
 // VerifyBackup streams every chunk of every disk of a restore point through the
 // restore path's verification — per-chunk SHA-256 plus size checks — discarding
-// the data. It proves the point is restorable without writing anywhere.
+// the data.
+//
+// This establishes the stored data's *integrity*: every chunk is present and
+// matches its content address. It is not a restore test — it says nothing about
+// whether the resulting image imports, boots, or carries a healthy application.
 func (s *Session) VerifyBackup(ctx context.Context, m *Manifest) error {
 	if len(m.Disks) == 0 {
 		return fmt.Errorf("engine: backup %s has no disks to verify", m.BackupID)

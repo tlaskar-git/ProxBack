@@ -30,15 +30,17 @@ export default function OutcomeDonut({ slices }: { slices: DonutSlice[] }) {
             <Cell key={slice.key} fill={slice.fill} />
           ))}
         </Pie>
+        {/* Theme variables, not literals: the tooltip has to be readable on a
+            white page as well as a near-black one. */}
         <Tooltip
           contentStyle={{
-            background: '#0f172a',
-            border: '1px solid #1e293b',
+            background: 'var(--color-slate-900)',
+            border: '1px solid var(--color-slate-800)',
             borderRadius: 10,
             fontSize: 12,
-            color: '#e2e8f0',
+            color: 'var(--color-slate-200)',
           }}
-          itemStyle={{ color: '#e2e8f0' }}
+          itemStyle={{ color: 'var(--color-slate-200)' }}
         />
       </PieChart>
     </ResponsiveContainer>

@@ -333,7 +333,7 @@ function WeekdayPicker({
         })}
       </div>
       {selected.length === 0 ? (
-        <p className="text-meta text-amber-400">Pick at least one day.</p>
+        <p className="text-meta text-warn-400">Pick at least one day.</p>
       ) : null}
     </div>
   )
@@ -599,7 +599,7 @@ export function ScheduleEditor({
               <span
                 className={cn(
                   'text-meta',
-                  cronInvalid ? 'text-red-400' : 'text-accent-300',
+                  cronInvalid ? 'text-fail-400' : 'text-accent-300',
                 )}
               >
                 {cronInvalid ? 'Enter five space-separated fields.' : 'In use'}

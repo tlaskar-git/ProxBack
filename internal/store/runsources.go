@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 // Run source statuses. A source is inserted pending when the run is planned,
@@ -17,8 +18,8 @@ const (
 	SourceSkipped = "skipped"
 )
 
-const runSourceCols = `seq, name, kind, node, status, size_bytes, bytes_processed,
-	bytes_uploaded, started_at, finished_at, error`
+const runSourceCols = `seq, name, kind, source_id, host_id, host_name, node, status, size_bytes,
+	bytes_processed, bytes_uploaded, started_at, finished_at, error`
 
 // ReplaceRunSources writes a run's per-source breakdown, replacing whatever was
 // there. It is called once at run start with every source the run intends to
@@ -37,8 +38,9 @@ func (s *Store) ReplaceRunSources(ctx context.Context, runID string, sources []R
 			src.Status = SourcePending
 		}
 		if _, err := s.db.ExecContext(ctx,
-			`INSERT INTO run_sources (run_id, `+runSourceCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-			runID, src.Seq, src.Name, src.Kind, src.Node, src.Status, src.SizeBytes,
+			`INSERT INTO run_sources (run_id, `+runSourceCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			runID, src.Seq, src.Name, src.Kind, src.SourceID, src.HostID, src.HostName, src.Node,
+			src.Status, src.SizeBytes,
 			src.BytesProcessed, src.BytesUploaded, fmtTimePtr(src.StartedAt), fmtTimePtr(src.FinishedAt),
 			strOrNull(src.Error)); err != nil {
 			return fmt.Errorf("insert run source %d: %w", src.Seq, err)
@@ -129,7 +131,8 @@ func (s *Store) RunSources(ctx context.Context, runID string) ([]RunSource, erro
 	for rows.Next() {
 		var src RunSource
 		var started, finished, srcErr sql.NullString
-		if err := rows.Scan(&src.Seq, &src.Name, &src.Kind, &src.Node, &src.Status, &src.SizeBytes,
+		if err := rows.Scan(&src.Seq, &src.Name, &src.Kind, &src.SourceID, &src.HostID, &src.HostName,
+			&src.Node, &src.Status, &src.SizeBytes,
 			&src.BytesProcessed, &src.BytesUploaded, &started, &finished, &srcErr); err != nil {
 			return nil, fmt.Errorf("scan run source: %w", err)
 		}
@@ -148,4 +151,41 @@ func (s *Store) DeleteRunSources(ctx context.Context, runID string) error {
 		return fmt.Errorf("delete run sources: %w", err)
 	}
 	return nil
+}
+
+// SourceOutcome is how one workload's most recent finished attempt ended. It is
+// per workload, not per run: a job of eight guests can succeed for seven of them
+// and fail for the eighth, and the eighth is the one whose protection is at
+// risk.
+type SourceOutcome struct {
+	SourceID   string
+	Status     string
+	FinishedAt time.Time
+}
+
+// LatestSourceOutcomes returns, for every workload that has ever been walked by
+// a run, how its most recent finished attempt ended. Rows written before run
+// sources carried a workload id are skipped rather than guessed at.
+func (s *Store) LatestSourceOutcomes(ctx context.Context) (map[string]SourceOutcome, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT source_id, status, COALESCE(finished_at, '') FROM run_sources
+		 WHERE source_id <> '' AND status IN (?,?)
+		 ORDER BY COALESCE(finished_at, '') ASC`, SourceSuccess, SourceFailed)
+	if err != nil {
+		return nil, fmt.Errorf("latest source outcomes: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]SourceOutcome{}
+	for rows.Next() {
+		var sourceID, status, finished string
+		if err := rows.Scan(&sourceID, &status, &finished); err != nil {
+			return nil, fmt.Errorf("scan source outcome: %w", err)
+		}
+		// Ascending order means the last row written for a workload is its most
+		// recent one.
+		out[sourceID] = SourceOutcome{
+			SourceID: sourceID, Status: status, FinishedAt: parseTime(finished),
+		}
+	}
+	return out, rows.Err()
 }

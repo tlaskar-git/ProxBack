@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Activity, Ban, ChevronRight, Eraser, RefreshCw, RotateCcw } from 'lucide-react'
-import { cancelRun, clearRuns, errorMessage, getRun, listJobs, listRuns, retryRun } from '../api'
+import {
+  cancelRun,
+  clearRuns,
+  errorMessage,
+  getRun,
+  listJobs,
+  listRuns,
+  reductionOf,
+  retryRun,
+} from '../api'
 import type { ClearRunsScope, ID, Job, JobRun, RunDetail } from '../api'
 import { useConfirm } from '../components/Confirm'
 import { RunDetailModal } from '../components/RunDetailModal'
@@ -27,6 +36,7 @@ import {
   formatDateTime,
   formatDuration,
   formatRatio,
+  formatReduction,
   formatRelative,
 } from '../lib/format'
 
@@ -57,14 +67,15 @@ function HistoryRow({
   const [busy, setBusy] = useState<'cancel' | 'retry' | null>(null)
   const running = run.status === 'running'
   const failed = run.status === 'failed'
+  const reduction = reductionOf(run)
 
   const onCancel = async () => {
     const ok = await confirm({
       title: 'Cancel this run?',
       message: (
         <>
-          Stop the run of <span className="font-medium text-slate-100">{run.jobName}</span>? Chunks
-          already uploaded stay on the target, but no restore point is created for this run.
+          Stop the run of <span className="font-medium text-slate-100">{run.jobName}</span>? Data already
+          transferred stays on the target, but no restore point is created for this run.
         </>
       ),
       confirmLabel: 'Cancel run',
@@ -75,7 +86,7 @@ function HistoryRow({
     setBusy('cancel')
     try {
       await cancelRun(run.id)
-      toast.success('Cancellation requested.', 'The engine stops at the next chunk boundary.')
+      toast.success('Cancellation requested.', 'The run stops at the next safe boundary.')
       onChanged()
     } catch (err) {
       toast.error('Could not cancel run', errorMessage(err))
@@ -112,14 +123,14 @@ function HistoryRow({
     >
       <td className="max-w-[22rem] py-2.5 pr-4 pl-5">
         <div className="flex items-center gap-2">
-          {running ? <LiveDot tone="blue" /> : null}
+          {running ? <LiveDot tone="brand" /> : null}
           <p className="truncate text-[13px] font-medium text-slate-100">{run.jobName}</p>
         </div>
         {/* Fixed-height second line: the row must not resize when polling
             swaps the step text for an error and back. */}
         <div className="mt-0.5 flex h-4 items-center">
           {failed && run.error ? (
-            <span className="truncate text-micro text-red-400/90" title={run.error}>
+            <span className="truncate text-micro text-fail-400/90" title={run.error}>
               {run.error}
             </span>
           ) : run.currentStep ? (
@@ -145,7 +156,12 @@ function HistoryRow({
         <Num className="text-meta text-slate-300">{formatBytes(run.bytesUploaded)}</Num>
       </td>
       <td className="px-4 py-2.5 text-right whitespace-nowrap">
-        <Num className="text-meta text-emerald-400">{formatRatio(run.dedupRatio)}</Num>
+        <span className="inline-flex items-baseline gap-1.5">
+          <Num className="text-meta text-slate-200">{formatReduction(reduction.pct)}</Num>
+          {reduction.ratio === null ? null : (
+            <Num className="text-micro text-slate-500">{formatRatio(reduction.ratio)}</Num>
+          )}
+        </span>
       </td>
       <td className="w-20 px-4 py-2.5" onClick={(event) => event.stopPropagation()}>
         <div className="flex items-center justify-end gap-1">
@@ -204,13 +220,13 @@ function HistoryTable({
               Duration
             </th>
             <th scope="col" className="px-4 py-2 text-right font-semibold">
-              Read
+              Source data processed
             </th>
             <th scope="col" className="px-4 py-2 text-right font-semibold">
-              Uploaded
+              Transferred to target
             </th>
             <th scope="col" className="px-4 py-2 text-right font-semibold">
-              Dedup
+              Data reduction
             </th>
             {/* `relative` keeps the visually-hidden label's containing block
                 inside the scroll container, so it cannot widen the page. */}
@@ -322,7 +338,7 @@ export function MonitorPage() {
       message: (
         <>
           Stop the run of <span className="font-medium text-slate-100">{detail.jobName}</span>?
-          Chunks already uploaded stay on the target, but no restore point is created for this run.
+          Data already transferred stays on the target, but no restore point is created for this run.
         </>
       ),
       confirmLabel: 'Cancel run',
@@ -331,7 +347,7 @@ export function MonitorPage() {
     if (!ok) return
     try {
       await cancelRun(detail.id)
-      toast.success('Cancellation requested.', 'The engine stops at the next chunk boundary.')
+      toast.success('Cancellation requested.', 'The run stops at the next safe boundary.')
       await refresh()
     } catch (err) {
       toast.error('Could not cancel run', errorMessage(err))
@@ -352,7 +368,7 @@ export function MonitorPage() {
     <>
       <PageHeader
         title="Monitor"
-        description="Runs in flight, object by object. Finished runs drop into the history below."
+        description="Runs in flight, workload by workload. Finished runs drop into the history below."
         actions={
           <>
             <Select

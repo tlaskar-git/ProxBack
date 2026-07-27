@@ -31,9 +31,22 @@ func IsVMAManifest(disks []engine.DiskManifest) bool {
 	return len(disks) == 1 && disks[0].Name == VMAStreamName
 }
 
+// UnassignedHelperHint is shown when the only helper carrying a node's name is
+// not bound to a Proxmox host. Two clusters can each contain a "pve1", so using
+// it would be a guess about which physical machine is meant — and the wrong
+// guess sends a backup, or a restore, to someone else's hardware.
+const UnassignedHelperHint = "a ProxBack node helper is registered for this node name but is not " +
+	"assigned to a Proxmox host, so it cannot be used — open Hosts → Node helpers and assign it " +
+	"to the right host, or re-deploy it"
+
 // noHelperError renders NoHelperHint for a node.
 func noHelperError(node string) error {
 	return fmt.Errorf("node %q: %s", node, NoHelperHint)
+}
+
+// unassignedHelperError renders UnassignedHelperHint for a node.
+func unassignedHelperError(node string) error {
+	return fmt.Errorf("node %q: %s", node, UnassignedHelperHint)
 }
 
 // mapExportError turns the Proxmox extension's "there is no such endpoint"
@@ -51,13 +64,25 @@ func mapExportError(err error, node string) error {
 	return fmt.Errorf("node %q: %s: %w", node, NoHelperHint, err)
 }
 
-// helperForNode resolves the helper that owns a node. A registered but offline
-// helper is an error rather than a silent fall back to the extension path: the
-// operator installed it, so backing up behind its back would be a lie.
-func (m *Manager) helperForNode(ctx context.Context, node string) (*store.NodeHelper, error) {
-	h, err := m.st.HelperByNode(ctx, node)
+// helperForNode resolves the helper that owns a node of one Proxmox host. The
+// host is half of the lookup key: resolving by node name alone would route a
+// backup or a restore to the identically named node of another cluster.
+//
+// A registered but offline helper is an error rather than a silent fall back to
+// the extension path: the operator installed it, so backing up behind its back
+// would be a lie. So is a helper that carries the node's name but no host —
+// that one needs an operator decision, not a guess.
+func (m *Manager) helperForNode(ctx context.Context, hostID, node string) (*store.NodeHelper, error) {
+	h, err := m.st.HelperFor(ctx, hostID, node)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
+		// Nothing serves this (host, node). If something is registered for the
+		// node name without a host, say so instead of quietly falling back.
+		if _, uerr := m.st.UnassignedHelperForNode(ctx, node); uerr == nil {
+			return nil, unassignedHelperError(node)
+		} else if !errors.Is(uerr, store.ErrNotFound) {
+			return nil, fmt.Errorf("look up node helper for %q: %w", node, uerr)
+		}
 		return nil, nil
 	case err != nil:
 		return nil, fmt.Errorf("look up node helper for %q: %w", node, err)
@@ -70,8 +95,8 @@ func (m *Manager) helperForNode(ctx context.Context, node string) (*store.NodeHe
 
 // requireHelperForNode resolves the helper that must handle a node, failing with
 // the actionable message when none is registered.
-func (m *Manager) requireHelperForNode(ctx context.Context, node string) (*store.NodeHelper, error) {
-	h, err := m.helperForNode(ctx, node)
+func (m *Manager) requireHelperForNode(ctx context.Context, hostID, node string) (*store.NodeHelper, error) {
+	h, err := m.helperForNode(ctx, hostID, node)
 	if err != nil {
 		return nil, err
 	}

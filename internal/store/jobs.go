@@ -10,20 +10,23 @@ import (
 	"time"
 )
 
-const jobCols = `id, name, kind, target_id, schedule, retention, enabled, sources, tag_filter, created_at`
+const jobCols = `id, name, kind, target_id, schedule, retention, retention_policy, policy,
+	enabled, sources, tag_filter, created_at`
 
 func scanJob(sc interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
-	var enabled int
-	var schedule, sources, created string
-	if err := sc.Scan(&j.ID, &j.Name, &j.Kind, &j.TargetID, &schedule, &j.Retention, &enabled,
-		&sources, &j.TagFilter, &created); err != nil {
+	var enabled, legacyRetention int
+	var schedule, retention, policy, sources, created string
+	if err := sc.Scan(&j.ID, &j.Name, &j.Kind, &j.TargetID, &schedule, &legacyRetention,
+		&retention, &policy, &enabled, &sources, &j.TagFilter, &created); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("scan job: %w", err)
 	}
 	j.Schedule = decodeSchedule(schedule)
+	j.Retention = decodeRetention(retention, legacyRetention)
+	j.Policy = decodePolicy(policy)
 	j.Enabled = enabled != 0
 	j.CreatedAt = parseTime(created)
 	if err := json.Unmarshal([]byte(sources), &j.Sources); err != nil {
@@ -53,14 +56,33 @@ func (s *Store) CreateJob(ctx context.Context, j *Job) (*Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	j.Policy = j.Policy.Normalized()
+	retention, policy, err := encodeJobPolicies(j)
+	if err != nil {
+		return nil, err
+	}
+	// The integer column is written alongside the object as the keep-last
+	// mirror, so a row stays meaningful to a binary that predates GFS.
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO jobs (`+jobCols+`) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		j.ID, j.Name, j.Kind, j.TargetID, schedule, j.Retention, boolInt(j.Enabled), string(raw),
-		j.TagFilter, fmtTime(j.CreatedAt))
+		`INSERT INTO jobs (`+jobCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		j.ID, j.Name, j.Kind, j.TargetID, schedule, j.Retention.KeepLast, retention, policy,
+		boolInt(j.Enabled), string(raw), j.TagFilter, fmtTime(j.CreatedAt))
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
 	}
 	return j, nil
+}
+
+// encodeJobPolicies renders a job's retention and protection policy for their
+// columns.
+func encodeJobPolicies(j *Job) (retention, policy string, err error) {
+	if retention, err = encodeRetention(j.Retention); err != nil {
+		return "", "", err
+	}
+	if policy, err = encodePolicy(j.Policy); err != nil {
+		return "", "", err
+	}
+	return retention, policy, nil
 }
 
 // UpdateJob writes all mutable fields of a job.
@@ -74,9 +96,16 @@ func (s *Store) UpdateJob(ctx context.Context, j *Job) error {
 	if err != nil {
 		return err
 	}
+	j.Policy = j.Policy.Normalized()
+	retention, policy, err := encodeJobPolicies(j)
+	if err != nil {
+		return err
+	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET name=?, kind=?, target_id=?, schedule=?, retention=?, enabled=?, sources=?, tag_filter=? WHERE id=?`,
-		j.Name, j.Kind, j.TargetID, schedule, j.Retention, boolInt(j.Enabled), string(raw), j.TagFilter, j.ID)
+		`UPDATE jobs SET name=?, kind=?, target_id=?, schedule=?, retention=?, retention_policy=?,
+			policy=?, enabled=?, sources=?, tag_filter=? WHERE id=?`,
+		j.Name, j.Kind, j.TargetID, schedule, j.Retention.KeepLast, retention, policy,
+		boolInt(j.Enabled), string(raw), j.TagFilter, j.ID)
 	if err != nil {
 		return fmt.Errorf("update job: %w", err)
 	}
@@ -127,14 +156,15 @@ func (s *Store) CountJobs(ctx context.Context) (int, error) { return s.count(ctx
 // ---------------------------------------------------------------- job runs
 
 const runCols = `id, job_id, job_name, kind, status, started_at, finished_at,
-	bytes_processed, bytes_uploaded, dedup_ratio, error, progress_pct, current_step`
+	bytes_processed, bytes_uploaded, dedup_ratio, error, progress_pct, current_step, restore_meta`
 
 func scanRun(sc interface{ Scan(...any) error }) (*JobRun, error) {
 	var r JobRun
 	var started string
-	var finished, errStr sql.NullString
+	var finished, errStr, restoreMeta sql.NullString
 	if err := sc.Scan(&r.ID, &r.JobID, &r.JobName, &r.Kind, &r.Status, &started, &finished,
-		&r.BytesProcessed, &r.BytesUploaded, &r.DedupRatio, &errStr, &r.ProgressPct, &r.CurrentStep); err != nil {
+		&r.BytesProcessed, &r.BytesUploaded, &r.DedupRatio, &errStr, &r.ProgressPct, &r.CurrentStep,
+		&restoreMeta); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -143,7 +173,29 @@ func scanRun(sc interface{ Scan(...any) error }) (*JobRun, error) {
 	r.StartedAt = parseTime(started)
 	r.FinishedAt = nullTime(finished)
 	r.Error = nullStr(errStr)
+	if raw := nullStr(restoreMeta); raw != "" {
+		var meta RestoreMeta
+		if err := json.Unmarshal([]byte(raw), &meta); err == nil {
+			r.Restore = &meta
+		}
+	}
+	// The reduction figures are always derived from the byte counters, never
+	// read back from a column that some other code path may have computed
+	// differently.
+	r.applyReductionMetrics()
 	return &r, nil
+}
+
+// encodeRestoreMeta renders a restore destination for the job_runs column.
+func encodeRestoreMeta(m *RestoreMeta) (string, error) {
+	if m == nil {
+		return "", nil
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return "", fmt.Errorf("encode restore metadata: %w", err)
+	}
+	return string(raw), nil
 }
 
 // CreateRun inserts a running job run row.
@@ -160,13 +212,19 @@ func (s *Store) CreateRun(ctx context.Context, r *JobRun) (*JobRun, error) {
 	if r.StartedAt.IsZero() {
 		r.StartedAt = Now()
 	}
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO job_runs (`+runCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	meta, err := encodeRestoreMeta(r.Restore)
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO job_runs (`+runCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.JobID, r.JobName, r.Kind, r.Status, fmtTime(r.StartedAt), fmtTimePtr(r.FinishedAt),
-		r.BytesProcessed, r.BytesUploaded, r.DedupRatio, strOrNull(r.Error), r.ProgressPct, r.CurrentStep)
+		r.BytesProcessed, r.BytesUploaded, r.DedupRatio, strOrNull(r.Error), r.ProgressPct, r.CurrentStep,
+		meta)
 	if err != nil {
 		return nil, fmt.Errorf("create job run: %w", err)
 	}
+	r.applyReductionMetrics()
 	return r, nil
 }
 
@@ -369,15 +427,18 @@ func (s *Store) MarkOrphanRunsFailed(ctx context.Context) error {
 
 // ---------------------------------------------------------------- backups
 
-const backupCols = `id, job_id, run_id, source_kind, source_id, source_name, target_id,
-	created_at, size_bytes, uploaded_bytes, kind, parent_id, disks`
+const backupCols = `id, job_id, run_id, source_kind, source_id, source_name, host_id, host_name,
+	target_id, created_at, size_bytes, uploaded_bytes, kind, parent_id, disks,
+	last_verified_at, last_verify_result, verified_bytes`
 
 func scanBackup(sc interface{ Scan(...any) error }) (*Backup, error) {
 	var b Backup
 	var created, disks string
-	var parent sql.NullString
-	if err := sc.Scan(&b.ID, &b.JobID, &b.RunID, &b.SourceKind, &b.SourceID, &b.SourceName, &b.TargetID,
-		&created, &b.SizeBytes, &b.UploadedBytes, &b.Kind, &parent, &disks); err != nil {
+	var parent, verifiedAt, verifyResult sql.NullString
+	if err := sc.Scan(&b.ID, &b.JobID, &b.RunID, &b.SourceKind, &b.SourceID, &b.SourceName,
+		&b.HostID, &b.HostName, &b.TargetID,
+		&created, &b.SizeBytes, &b.UploadedBytes, &b.Kind, &parent, &disks,
+		&verifiedAt, &verifyResult, &b.VerifiedBytes); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -385,6 +446,8 @@ func scanBackup(sc interface{ Scan(...any) error }) (*Backup, error) {
 	}
 	b.CreatedAt = parseTime(created)
 	b.ParentID = nullStr(parent)
+	b.LastVerifiedAt = nullTime(verifiedAt)
+	b.LastVerifyResult = nullStr(verifyResult)
 	if err := json.Unmarshal([]byte(disks), &b.Disks); err != nil {
 		return nil, fmt.Errorf("backup %s disks: %w", b.ID, err)
 	}
@@ -412,14 +475,43 @@ func (s *Store) CreateBackup(ctx context.Context, b *Backup) (*Backup, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encode backup disks: %w", err)
 	}
+	// A VM restore point always knows its cluster: the source id encodes it, so
+	// a caller that forgot to set it still produces an unambiguous row.
+	if b.HostID == "" && b.SourceKind == SourceVM {
+		if hostID, ok := HostIDFromSourceID(b.SourceID); ok {
+			b.HostID = hostID
+		}
+	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO backups (`+backupCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		b.ID, b.JobID, b.RunID, b.SourceKind, b.SourceID, b.SourceName, b.TargetID,
-		fmtTime(b.CreatedAt), b.SizeBytes, b.UploadedBytes, b.Kind, strOrNull(b.ParentID), string(raw))
+		`INSERT INTO backups (`+backupCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		b.ID, b.JobID, b.RunID, b.SourceKind, b.SourceID, b.SourceName, b.HostID, b.HostName,
+		b.TargetID, fmtTime(b.CreatedAt), b.SizeBytes, b.UploadedBytes, b.Kind,
+		strOrNull(b.ParentID), string(raw),
+		fmtTimePtr(b.LastVerifiedAt), b.LastVerifyResult, b.VerifiedBytes)
 	if err != nil {
 		return nil, fmt.Errorf("create backup: %w", err)
 	}
 	return b, nil
+}
+
+// RecordBackupVerification attaches the outcome of a verification run to the
+// restore point. result is VerifyPassed or VerifyFailed and describes integrity
+// — the stored chunks were re-read and re-hashed — not whether restoring the
+// point would produce a working guest.
+func (s *Store) RecordBackupVerification(ctx context.Context, backupID string, at time.Time, result string, verifiedBytes int64) error {
+	if result != VerifyPassed && result != VerifyFailed {
+		return fmt.Errorf("record verification: unknown result %q", result)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE backups SET last_verified_at = ?, last_verify_result = ?, verified_bytes = ? WHERE id = ?`,
+		fmtTime(at), result, verifiedBytes, backupID)
+	if err != nil {
+		return fmt.Errorf("record verification: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // BackupFilter narrows a backup listing.

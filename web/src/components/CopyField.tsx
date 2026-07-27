@@ -61,7 +61,7 @@ export function CopyButton({
       className={className}
     >
       {copied ? (
-        <Check className="size-4 text-emerald-400" aria-hidden />
+        <Check className="size-4 text-ok-400" aria-hidden />
       ) : (
         <Copy className="size-4" aria-hidden />
       )}

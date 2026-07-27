@@ -28,6 +28,9 @@ type testServer struct {
 	st      *store.Store
 	dataDir string
 	cookie  *http.Cookie
+	// hostID is a configured Proxmox host, because a node helper is identified
+	// by the host it belongs to as much as by its node name.
+	hostID string
 }
 
 func newTestServer(t *testing.T) *testServer {
@@ -66,9 +69,17 @@ func newTestServer(t *testing.T) *testServer {
 	if err != nil {
 		t.Fatalf("build api server: %v", err)
 	}
+	host, err := st.CreatePVEHost(ctx, &store.PVEHost{
+		Name: "cluster-a", BaseURL: "https://pve-a.example:8006",
+		TokenID: "root@pam!proxback", TokenSecret: "secret", Status: "online",
+	})
+	if err != nil {
+		t.Fatalf("create host: %v", err)
+	}
 	return &testServer{
 		Server: srv, st: st, dataDir: dataDir,
 		cookie: &http.Cookie{Name: auth.SessionCookieName, Value: token},
+		hostID: host.ID,
 	}
 }
 
@@ -105,6 +116,12 @@ func (ts *testServer) post(t *testing.T, path string, body any) (int, map[string
 	return rec.Code, out
 }
 
+func (ts *testServer) deployBody() map[string]any {
+	body := deployBody()
+	body["hostId"] = ts.hostID
+	return body
+}
+
 func deployBody() map[string]any {
 	return map[string]any{
 		"node":               "pve1",
@@ -130,7 +147,7 @@ func TestDeployHelperEndpointHappyPath(t *testing.T) {
 		}}, nil
 	}
 
-	code, body := ts.post(t, "/api/helpers/deploy", deployBody())
+	code, body := ts.post(t, "/api/helpers/deploy", ts.deployBody())
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, body = %+v", code, body)
 	}
@@ -186,13 +203,13 @@ func TestDeployHelperEndpointReportsHelperOnline(t *testing.T) {
 	}
 	now := store.Now()
 	if _, err := ts.st.CreateHelper(context.Background(), &store.NodeHelper{
-		Node: "pve1", Address: "10.20.1.5", Port: store.DefaultHelperPort,
+		HostID: ts.hostID, Node: "pve1", Address: "10.20.1.5", Port: store.DefaultHelperPort,
 		Version: "0.3.1", AccessSecret: "secret", APIKeyHash: "hash", LastSeen: &now,
 	}); err != nil {
 		t.Fatalf("create helper: %v", err)
 	}
 
-	code, body := ts.post(t, "/api/helpers/deploy", deployBody())
+	code, body := ts.post(t, "/api/helpers/deploy", ts.deployBody())
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, body = %+v", code, body)
 	}
@@ -208,7 +225,7 @@ func TestDeployHelperEndpointFingerprintConflict(t *testing.T) {
 		return nodedeploy.Result{}, &nodedeploy.FingerprintError{Fingerprint: "SHA256:realkey"}
 	}
 
-	body := deployBody()
+	body := ts.deployBody()
 	delete(body, "hostKeyFingerprint")
 	code, got := ts.post(t, "/api/helpers/deploy", body)
 	if code != http.StatusConflict {
@@ -230,7 +247,7 @@ func TestDeployHelperEndpointDeploymentFailure(t *testing.T) {
 			&testError{"nodedeploy: ssh to root@10.20.1.5:22: ssh: unable to authenticate"}
 	}
 
-	code, got := ts.post(t, "/api/helpers/deploy", deployBody())
+	code, got := ts.post(t, "/api/helpers/deploy", ts.deployBody())
 	if code != http.StatusBadGateway {
 		t.Fatalf("status = %d, body = %+v", code, got)
 	}
@@ -251,7 +268,7 @@ func TestDeployHelperEndpointRequiresTheStagedBinary(t *testing.T) {
 		return nodedeploy.Result{}, nil
 	}
 
-	code, got := ts.post(t, "/api/helpers/deploy", deployBody())
+	code, got := ts.post(t, "/api/helpers/deploy", ts.deployBody())
 	if code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %+v", code, got)
 	}
@@ -269,6 +286,7 @@ func TestDeployHelperEndpointValidation(t *testing.T) {
 		mutate func(map[string]any)
 		want   string
 	}{
+		{"no hostId", func(b map[string]any) { delete(b, "hostId") }, "hostId is required"},
 		{"no node", func(b map[string]any) { delete(b, "node") }, "node is required"},
 		{"blank address", func(b map[string]any) { b["address"] = "  " }, "address is required"},
 		{"no username", func(b map[string]any) { delete(b, "username") }, "username is required"},
@@ -285,7 +303,7 @@ func TestDeployHelperEndpointValidation(t *testing.T) {
 				called = true
 				return nodedeploy.Result{}, nil
 			}
-			body := deployBody()
+			body := ts.deployBody()
 			tc.mutate(body)
 
 			code, got := ts.post(t, "/api/helpers/deploy", body)
@@ -309,7 +327,7 @@ func TestDeployHelperEndpointRequiresASession(t *testing.T) {
 		t.Error("deployment ran for an unauthenticated request")
 		return nodedeploy.Result{}, nil
 	}
-	raw, err := json.Marshal(deployBody())
+	raw, err := json.Marshal(ts.deployBody())
 	if err != nil {
 		t.Fatalf("marshal body: %v", err)
 	}

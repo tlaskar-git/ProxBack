@@ -192,7 +192,9 @@ function JobRow({
             </span>
             <span className="inline-flex items-center gap-1.5">
               <CalendarClock className="size-3.5 text-slate-600" aria-hidden />
-              {describeSchedule(job.schedule)}
+              {/* The server renders this sentence; describeSchedule only
+                  covers servers that predate `scheduleLabel`. */}
+              {job.scheduleLabel || describeSchedule(job.schedule)}
             </span>
             <span className="inline-flex items-center gap-1.5">
               <Clock className="size-3.5 text-slate-600" aria-hidden />

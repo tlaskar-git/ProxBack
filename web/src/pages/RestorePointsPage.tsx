@@ -243,13 +243,13 @@ function RestoreWizard({
         <div className="space-y-4">
           <dl className="grid grid-cols-2 gap-4 rounded-lg border border-slate-800 bg-slate-950/40 px-4 py-3">
             <div>
-              <dt className="text-[11px] tracking-wide text-slate-500 uppercase">Size</dt>
+              <dt className="eyebrow">Size</dt>
               <dd className="mt-0.5 font-mono text-sm tabular-nums text-slate-200">
                 {formatBytes(backup.sizeBytes)}
               </dd>
             </div>
             <div>
-              <dt className="text-[11px] tracking-wide text-slate-500 uppercase">Created</dt>
+              <dt className="eyebrow">Created</dt>
               <dd className="mt-0.5 font-mono text-sm tabular-nums text-slate-200">
                 {formatRelative(backup.createdAt)}
               </dd>

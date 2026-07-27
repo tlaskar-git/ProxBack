@@ -32,6 +32,7 @@ import {
   StatusPill,
   toneForStatus,
 } from '../components/ui'
+import { cn } from '../lib/cn'
 import { useAsync } from '../lib/useAsync'
 import { formatBytes, formatCount, formatUptime } from '../lib/format'
 
@@ -43,15 +44,19 @@ interface VMsData {
   agents: Agent[]
 }
 
-/** The first enabled job that already protects this VM, else any job that does. */
+/**
+ * The first enabled job that already protects this VM, else any job that does.
+ * Tag-filtered jobs resolve their members at run time, so a guest carrying the
+ * job's tag counts as protected even though it is in no explicit source list.
+ */
 function jobForVM(jobs: Job[], vm: CachedVM): Job | null {
-  const matches = jobs.filter(
-    (job) =>
-      job.kind === 'vm' &&
-      vmSourcesOf(job).some(
-        (source) => String(source.hostId) === String(vm.hostId) && source.vmid === vm.vmid,
-      ),
-  )
+  const matches = jobs.filter((job) => {
+    if (job.kind !== 'vm') return false
+    if (job.tagFilter) return tagsOf(vm).includes(job.tagFilter)
+    return vmSourcesOf(job).some(
+      (source) => String(source.hostId) === String(vm.hostId) && source.vmid === vm.vmid,
+    )
+  })
   return matches.find((job) => job.enabled) ?? matches[0] ?? null
 }
 
@@ -68,7 +73,12 @@ function VMCard({
 }) {
   const tags = tagsOf(vm)
   return (
-    <Card className="flex flex-col p-5">
+    // A guest no *enabled* job covers carries an amber edge, so the gap the
+    // dashboard counts is findable by scanning rather than by reading every
+    // card. A disabled job protects nothing until it is switched back on.
+    <Card
+      className={cn('flex flex-col p-5', job?.enabled ? '' : 'border-l-2 border-l-amber-500/50')}
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-start gap-3">
           <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-slate-800 bg-slate-950/60 text-accent-400">
@@ -85,15 +95,15 @@ function VMCard({
       </div>
 
       <div className="mt-5 grid grid-cols-2 gap-3">
-        <div className="rounded-lg border border-slate-800/80 bg-slate-950/40 px-3 py-2.5">
-          <p className="flex items-center gap-1.5 text-[11px] tracking-wide text-slate-500 uppercase">
+        <div className="well px-3 py-2.5">
+          <p className="eyebrow flex items-center gap-1.5">
             <HardDrive className="size-3" aria-hidden />
             Disk
           </p>
           <Num className="mt-1 block text-sm text-slate-200">{formatBytes(vm.maxdisk)}</Num>
         </div>
-        <div className="rounded-lg border border-slate-800/80 bg-slate-950/40 px-3 py-2.5">
-          <p className="flex items-center gap-1.5 text-[11px] tracking-wide text-slate-500 uppercase">
+        <div className="well px-3 py-2.5">
+          <p className="eyebrow flex items-center gap-1.5">
             <Cpu className="size-3" aria-hidden />
             Memory
           </p>
@@ -113,10 +123,15 @@ function VMCard({
 
       <p className="mt-3 text-xs text-slate-500">
         {vm.status === 'running' ? <>Up <Num>{formatUptime(vm.uptime)}</Num></> : 'Not running'}
-        {job ? (
+        {job?.enabled ? (
           <>
             {' · '}
             <span className="text-slate-400">Protected by “{job.name}”</span>
+          </>
+        ) : job ? (
+          <>
+            {' · '}
+            <span className="text-amber-400/80">Only “{job.name}”, which is disabled</span>
           </>
         ) : (
           <>
@@ -352,7 +367,7 @@ export function VirtualMachinesPage() {
 
           {tagCounts.length > 0 ? (
             <div className="mb-4 flex flex-wrap items-center gap-1.5">
-              <span className="mr-1 inline-flex items-center gap-1.5 text-[11px] font-medium tracking-wide text-slate-500 uppercase">
+              <span className="eyebrow mr-1 inline-flex items-center gap-1.5">
                 <Tags className="size-3.5" aria-hidden />
                 Tags
               </span>
@@ -370,7 +385,7 @@ export function VirtualMachinesPage() {
                 <button
                   type="button"
                   onClick={() => setTagFilters([])}
-                  className="ml-1 text-[11px] text-slate-500 transition-colors duration-150 hover:text-slate-300"
+                  className="ml-1 text-meta text-slate-500 transition-colors duration-150 hover:text-slate-300"
                 >
                   {tagFilters.length > 1
                     ? `Clear ${tagFilters.length} tags — showing VMs with all of them`

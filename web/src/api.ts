@@ -165,6 +165,127 @@ export interface TargetTestResult {
   error?: string
 }
 
+/* Schedules (v0.4.0) -------------------------------------------------------
+ *
+ * Operators pick a schedule the way they think about it; the server derives the
+ * cron expression internally. `advanced` is the escape hatch and is never the
+ * default. Times are `HH:MM` in the server's local timezone (`Settings.timezone`).
+ * ------------------------------------------------------------------------- */
+
+export type ScheduleKind = 'manual' | 'hourly' | 'daily' | 'weekly' | 'monthly' | 'advanced'
+
+/** 0 = Sunday … 6 = Saturday, matching the contract. */
+export type Weekday = 0 | 1 | 2 | 3 | 4 | 5 | 6
+
+export interface ManualSchedule {
+  kind: 'manual'
+}
+
+export interface HourlySchedule {
+  kind: 'hourly'
+  /** Minute past each hour, 0–59. */
+  minute: number
+}
+
+export interface DailySchedule {
+  kind: 'daily'
+  /** `HH:MM`, 24-hour, server local time. */
+  time: string
+}
+
+export interface WeeklySchedule {
+  kind: 'weekly'
+  time: string
+  /** 0 = Sunday … 6 = Saturday. At least one. */
+  weekdays: number[]
+}
+
+export interface MonthlySchedule {
+  kind: 'monthly'
+  time: string
+  /** 1–31; 31 means "the last day of the month". */
+  dayOfMonth: number
+}
+
+export interface AdvancedSchedule {
+  kind: 'advanced'
+  /** Five-field cron expression. */
+  cron: string
+}
+
+export type Schedule =
+  | ManualSchedule
+  | HourlySchedule
+  | DailySchedule
+  | WeeklySchedule
+  | MonthlySchedule
+  | AdvancedSchedule
+
+/**
+ * What a job's `schedule` field can hold on the wire. The contract says
+ * `GET /api/jobs` always returns the object, but a bare string is still
+ * accepted on write and may come back from an older server — always read it
+ * through `parseSchedule`.
+ */
+export type ScheduleValue = Schedule | string
+
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/
+
+function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(min, Math.min(max, Math.round(n)))
+}
+
+function timeOf(value: unknown, fallback: string): string {
+  return typeof value === 'string' && HHMM.test(value) ? value : fallback
+}
+
+/**
+ * Normalises anything the server (or an older job record) may hold in
+ * `schedule` into the v0.4.0 object form. A bare string is treated as
+ * `manual` or `advanced`, exactly as the server does on write.
+ */
+export function parseSchedule(value: ScheduleValue | null | undefined): Schedule {
+  if (value === null || value === undefined || value === '') return { kind: 'manual' }
+
+  if (typeof value === 'string') {
+    const text = value.trim()
+    if (!text || text === 'manual') return { kind: 'manual' }
+    return { kind: 'advanced', cron: text }
+  }
+
+  const raw = value as unknown as Record<string, unknown>
+  switch (raw.kind) {
+    case 'hourly':
+      return { kind: 'hourly', minute: clampInt(raw.minute, 0, 59, 0) }
+    case 'daily':
+      return { kind: 'daily', time: timeOf(raw.time, '02:00') }
+    case 'weekly': {
+      const list = Array.isArray(raw.weekdays) ? raw.weekdays : []
+      const weekdays = [...new Set(list.map((day) => clampInt(day, 0, 6, 0)))].sort((a, b) => a - b)
+      return { kind: 'weekly', time: timeOf(raw.time, '03:00'), weekdays: weekdays.length ? weekdays : [0] }
+    }
+    case 'monthly':
+      return {
+        kind: 'monthly',
+        time: timeOf(raw.time, '01:00'),
+        dayOfMonth: clampInt(raw.dayOfMonth, 1, 31, 1),
+      }
+    case 'advanced':
+      return { kind: 'advanced', cron: typeof raw.cron === 'string' ? raw.cron.trim() : '' }
+    case 'manual':
+      return { kind: 'manual' }
+    default:
+      return { kind: 'manual' }
+  }
+}
+
+/** True when the schedule never fires on its own. */
+export function isManualSchedule(schedule: Schedule): boolean {
+  return schedule.kind === 'manual'
+}
+
 /* Jobs -------------------------------------------------------------------- */
 
 export type JobKind = 'vm' | 'agent'
@@ -196,8 +317,16 @@ export interface Job {
   kind: JobKind
   targetId: ID
   targetName: string
-  /** `"manual"` or a 5-field cron expression. */
-  schedule: string
+  /**
+   * v0.4.0 schedule object. Older servers may still send a bare string —
+   * read it through `parseSchedule`.
+   */
+  schedule: ScheduleValue
+  /**
+   * Server-rendered English summary ("Daily at 02:00", "Weekly on Sun, Sat at
+   * 03:00"). Display verbatim when present; `describeSchedule` is the fallback.
+   */
+  scheduleLabel?: string
   /** Keep-last-N restore points. */
   retention: number
   enabled: boolean
@@ -220,7 +349,8 @@ export interface JobCreate {
   name: string
   kind: JobKind
   targetId: ID
-  schedule: string
+  /** Send the v0.4.0 object; a bare string is still accepted by the server. */
+  schedule: ScheduleValue
   retention: number
   sources: JobSources
   enabled: boolean
@@ -247,6 +377,37 @@ export interface JobRun {
   error?: string | null
   progressPct: number
   currentStep: string
+}
+
+/** Per-object state inside a run — the "objects in this session" breakdown. */
+export type RunSourceStatus = 'pending' | 'running' | 'success' | 'failed' | 'skipped'
+
+export interface RunSource {
+  /** Position in the run's source list; also the row's stable key. */
+  seq: number
+  name: string
+  kind: SourceKind
+  /** Proxmox node for VM sources. */
+  node?: string
+  status: RunSourceStatus
+  bytesProcessed: number
+  bytesUploaded: number
+  /** Expected total size, used for this row's progress denominator. */
+  sizeBytes: number
+  progressPct: number
+  startedAt?: string | null
+  finishedAt?: string | null
+  error?: string | null
+}
+
+/**
+ * `GET /api/runs/{id}` — a run plus the v0.4.0 monitor payload. `sources` is
+ * always an array; `throughputBps` is 0 unless the run is in flight.
+ */
+export interface RunDetail extends JobRun {
+  sources: RunSource[]
+  /** Bytes per second over the server's last sample window. */
+  throughputBps: number
 }
 
 export interface RunRef {
@@ -383,6 +544,11 @@ export interface Settings {
   compression: Compression
   /** Upload ceiling in Mbps shared by all runs. 0 = unlimited. */
   uploadLimitMbps: number
+  /**
+   * Read-only IANA name of the server's local timezone (v0.4.0). Every job
+   * schedule fires in this zone, so the scheduling UI says so out loud.
+   */
+  timezone?: string
 }
 
 export interface WebhookTestResult {
@@ -675,12 +841,31 @@ export function listRuns(query: RunQuery = {}, signal?: AbortSignal): Promise<Jo
   })
 }
 
-export function getRun(id: ID, signal?: AbortSignal): Promise<JobRun> {
-  return request<JobRun>(`/api/runs/${encodeURIComponent(String(id))}`, { signal })
+/**
+ * One run with its per-source breakdown and live throughput. Servers that
+ * predate v0.4.0 omit both fields, so they are normalised here — callers can
+ * always read `sources.length` and `throughputBps`.
+ */
+export async function getRun(id: ID, signal?: AbortSignal): Promise<RunDetail> {
+  const detail = await request<RunDetail>(`/api/runs/${encodeURIComponent(String(id))}`, { signal })
+  return {
+    ...detail,
+    sources: Array.isArray(detail.sources) ? detail.sources : [],
+    throughputBps: Number.isFinite(detail.throughputBps) ? detail.throughputBps : 0,
+  }
 }
 
 export function cancelRun(id: ID): Promise<void> {
   return request<void>(`/api/runs/${encodeURIComponent(String(id))}/cancel`, { method: 'POST' })
+}
+
+/**
+ * Re-runs the job behind a finished run. Rejects with 409 when that job
+ * already has a run in flight, and 404 for restore/verify runs — those have no
+ * job to re-run.
+ */
+export function retryRun(id: ID): Promise<RunRef> {
+  return request<RunRef>(`/api/runs/${encodeURIComponent(String(id))}/retry`, { method: 'POST' })
 }
 
 export function getRunLog(id: ID, signal?: AbortSignal): Promise<RunLogResponse> {
@@ -809,7 +994,9 @@ export function getSettings(): Promise<Settings> {
 }
 
 export function putSettings(input: Settings): Promise<Settings> {
-  return request<Settings>('/api/settings', { method: 'PUT', body: { ...input } })
+  // `timezone` is read-only — never echo it back on the write.
+  const { timezone: _timezone, ...writable } = input
+  return request<Settings>('/api/settings', { method: 'PUT', body: { ...writable } })
 }
 
 /** Sends a sample payload to the saved webhook URL. Never throws on a 200. */

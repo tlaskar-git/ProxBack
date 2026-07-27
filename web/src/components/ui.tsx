@@ -6,7 +6,7 @@ import type {
   SelectHTMLAttributes,
 } from 'react'
 import { useId } from 'react'
-import { Loader2 } from 'lucide-react'
+import { Loader2, TriangleAlert } from 'lucide-react'
 import { cn } from '../lib/cn'
 
 /* ---------------------------------------------------------------------------
@@ -107,19 +107,35 @@ export function IconButton({
  * Surfaces
  * ------------------------------------------------------------------------- */
 
+/**
+ * Cards carry weight by importance, not uniformly.
+ *
+ * - `flat`  — reference material, tables, secondary panels.
+ * - `raised` — the default surface a page is built from.
+ * - `feature` — the one card on a page that answers the page's question
+ *   (the live run, the status strip). Lighter border, deeper shadow, a hairline
+ *   accent along the top edge.
+ */
+export type CardElevation = 'flat' | 'raised' | 'feature'
+
+const CARD_ELEVATION: Record<CardElevation, string> = {
+  flat: 'border-slate-800/80 bg-slate-900/35',
+  raised: 'border-slate-800 bg-slate-900/60 elev-1',
+  feature: 'border-slate-700/70 bg-slate-900/80 elev-2',
+}
+
 export function Card({
   className,
   children,
+  elevation = 'raised',
   ...rest
-}: { className?: string; children: ReactNode } & HTMLAttributes<HTMLDivElement>) {
+}: {
+  className?: string
+  children: ReactNode
+  elevation?: CardElevation
+} & HTMLAttributes<HTMLDivElement>) {
   return (
-    <div
-      className={cn(
-        'rounded-xl border border-slate-800 bg-slate-900/60 shadow-sm shadow-black/20',
-        className,
-      )}
-      {...rest}
-    >
+    <div className={cn('rounded-xl border', CARD_ELEVATION[elevation], className)} {...rest}>
       {children}
     </div>
   )
@@ -139,13 +155,15 @@ export function CardHeader({
   return (
     <div
       className={cn(
-        'flex flex-wrap items-start justify-between gap-3 border-b border-slate-800 px-5 py-4',
+        'flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-slate-800/80 px-5 py-3',
         className,
       )}
     >
       <div className="min-w-0">
-        <h2 className="text-sm font-semibold tracking-wide text-slate-100">{title}</h2>
-        {subtitle ? <p className="mt-0.5 text-xs text-slate-500">{subtitle}</p> : null}
+        <h2 className="text-[13px] leading-5 font-semibold tracking-tight text-slate-100">
+          {title}
+        </h2>
+        {subtitle ? <p className="text-meta text-slate-500">{subtitle}</p> : null}
       </div>
       {actions ? <div className="flex items-center gap-2">{actions}</div> : null}
     </div>
@@ -166,13 +184,49 @@ export function PageHeader({
   actions?: ReactNode
 }) {
   return (
-    <header className="mb-6 flex flex-wrap items-end justify-between gap-4">
-      <div>
-        <h1 className="text-2xl font-semibold text-white">{title}</h1>
-        {description ? <p className="mt-1 max-w-2xl text-sm text-slate-400">{description}</p> : null}
+    <header className="mb-5 flex flex-wrap items-end justify-between gap-x-6 gap-y-3 border-b border-slate-800/70 pb-4">
+      <div className="min-w-0">
+        <h1 className="text-xl leading-7 font-semibold tracking-tight text-white">{title}</h1>
+        {description ? (
+          <p className="mt-1 max-w-2xl text-[13px] leading-5 text-slate-400">{description}</p>
+        ) : null}
       </div>
       {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
     </header>
+  )
+}
+
+/**
+ * Groups content within a page. The rule that runs to the right edge is what
+ * turns a stack of cards into sections — it costs one line and does the whole
+ * job of saying "this block is separate from the last one".
+ */
+export function SectionHeading({
+  title,
+  count,
+  hint,
+  actions,
+  className,
+}: {
+  title: string
+  /** Rendered as a quiet tabular counter beside the title. */
+  count?: ReactNode
+  hint?: ReactNode
+  actions?: ReactNode
+  className?: string
+}) {
+  return (
+    <div className={cn('mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5', className)}>
+      <h2 className="eyebrow text-slate-400">{title}</h2>
+      {count !== undefined ? (
+        <span className="rounded-md border border-slate-800 bg-slate-900/70 px-1.5 py-px font-mono text-micro tabular-nums text-slate-500">
+          {count}
+        </span>
+      ) : null}
+      <span className="hidden h-px min-w-8 flex-1 bg-slate-800/80 sm:block" aria-hidden />
+      {hint ? <span className="text-meta text-slate-500">{hint}</span> : null}
+      {actions ? <div className="flex items-center gap-2">{actions}</div> : null}
+    </div>
   )
 }
 
@@ -455,6 +509,200 @@ export function ProgressBar({
 }
 
 /* ---------------------------------------------------------------------------
+ * Arc gauge
+ *
+ * A 270° gauge rather than a full donut: the open bottom leaves room for a
+ * caption under the figure and reads as an instrument, not a pie chart. The
+ * sweep animates through stroke-dashoffset so a 2 s poll interval does not
+ * make the needle jump.
+ * ------------------------------------------------------------------------- */
+
+const ARC_STROKE: Record<PillTone, string> = {
+  green: 'stroke-emerald-400',
+  amber: 'stroke-amber-400',
+  red: 'stroke-red-400',
+  blue: 'stroke-accent-400',
+  slate: 'stroke-slate-600',
+}
+
+export function ArcProgress({
+  value,
+  tone = 'blue',
+  size = 148,
+  thickness = 9,
+  label,
+  caption,
+  ariaLabel,
+  className,
+}: {
+  value: number
+  tone?: PillTone
+  size?: number
+  thickness?: number
+  /** Centre figure. */
+  label: ReactNode
+  /** One line under the figure. */
+  caption?: ReactNode
+  ariaLabel: string
+  className?: string
+}) {
+  const pct = Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0))
+  const radius = (size - thickness) / 2
+  const circumference = 2 * Math.PI * radius
+  // The gauge occupies three quarters of the circle; the group is rotated so
+  // the gap sits symmetrically at the bottom.
+  const sweep = circumference * 0.75
+  const center = size / 2
+
+  return (
+    <div
+      className={cn('relative shrink-0', className)}
+      style={{ width: size, height: size }}
+      role="img"
+      aria-label={ariaLabel}
+    >
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden>
+        <g transform={`rotate(135 ${center} ${center})`}>
+          <circle
+            cx={center}
+            cy={center}
+            r={radius}
+            fill="none"
+            strokeWidth={thickness}
+            strokeLinecap="round"
+            strokeDasharray={`${sweep} ${circumference}`}
+            className="stroke-slate-800"
+          />
+          <circle
+            cx={center}
+            cy={center}
+            r={radius}
+            fill="none"
+            strokeWidth={thickness}
+            strokeLinecap="round"
+            strokeDasharray={`${sweep} ${circumference}`}
+            strokeDashoffset={sweep * (1 - pct / 100)}
+            className={cn('pb-arc', ARC_STROKE[tone])}
+          />
+        </g>
+      </svg>
+      <div className="absolute inset-0 flex flex-col items-center justify-center gap-0.5 px-4 text-center">
+        {label}
+        {caption ? <span className="text-meta text-slate-500">{caption}</span> : null}
+      </div>
+    </div>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Sparkline
+ *
+ * Inline SVG over samples the page collects while polling. No charting
+ * library — a polyline and a filled area under it are the whole requirement,
+ * and keeping it dependency-free keeps it fast enough to redraw every 2 s.
+ * ------------------------------------------------------------------------- */
+
+export function Sparkline({
+  values,
+  width = 220,
+  height = 44,
+  tone = 'blue',
+  ariaLabel,
+  className,
+}: {
+  values: number[]
+  width?: number
+  height?: number
+  tone?: 'blue' | 'green'
+  ariaLabel: string
+  className?: string
+}) {
+  const stroke = tone === 'green' ? 'var(--color-emerald-400)' : 'var(--color-accent-400)'
+  const clean = values.filter((value) => Number.isFinite(value) && value >= 0)
+  const padding = 3
+  const usableH = height - padding * 2
+
+  // Scale against the tallest sample so a slow link still fills the box, but
+  // never against zero — an all-idle window draws a flat line on the floor.
+  const peak = Math.max(...clean, 1)
+  const points = clean.map((value, index) => {
+    const x = clean.length === 1 ? width : (index / (clean.length - 1)) * width
+    const y = padding + usableH - (value / peak) * usableH
+    return [x, y] as const
+  })
+
+  const line = points.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ')
+  const area =
+    points.length > 1
+      ? `${points[0]?.[0].toFixed(1)},${height} ${line} ${points[points.length - 1]?.[0].toFixed(1)},${height}`
+      : ''
+  // Unique per instance: two live runs on screen must not share a gradient id.
+  const gradientId = `pb-spark-${useId().replace(/:/g, '')}`
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      className={cn('h-11 w-full', className)}
+      role="img"
+      aria-label={ariaLabel}
+    >
+      <defs>
+        <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={stroke} stopOpacity="0.28" />
+          <stop offset="100%" stopColor={stroke} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {points.length < 2 ? (
+        <line
+          x1="0"
+          y1={height - padding}
+          x2={width}
+          y2={height - padding}
+          stroke="var(--color-slate-800)"
+          strokeWidth="1.5"
+          strokeDasharray="3 4"
+        />
+      ) : (
+        <>
+          <polygon points={area} fill={`url(#${gradientId})`} />
+          <polyline
+            points={line}
+            fill="none"
+            stroke={stroke}
+            strokeWidth="1.75"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            vectorEffect="non-scaling-stroke"
+          />
+        </>
+      )}
+    </svg>
+  )
+}
+
+/* The halo is painted from `currentColor`, so it needs the text-* twin of the
+   dot's background class — written out rather than derived, because Tailwind
+   only ships classes it can see in the source. */
+const DOT_HALOS: Record<PillTone, string> = {
+  green: 'text-emerald-400',
+  amber: 'text-amber-400',
+  red: 'text-red-400',
+  blue: 'text-accent-400',
+  slate: 'text-slate-500',
+}
+
+/** Pulsing dot for anything genuinely live. Motion is muted by the reduced-motion block. */
+export function LiveDot({ tone = 'blue', className }: { tone?: PillTone; className?: string }) {
+  return (
+    <span className={cn('relative flex size-2 shrink-0', className)} aria-hidden>
+      <span className={cn('pb-ping absolute inset-0 rounded-full', DOT_HALOS[tone])} />
+      <span className={cn('relative size-2 rounded-full', DOTS[tone])} />
+    </span>
+  )
+}
+
+/* ---------------------------------------------------------------------------
  * Loading & empty states
  * ------------------------------------------------------------------------- */
 
@@ -501,48 +749,79 @@ export function SkeletonRows({ count = 5 }: { count?: number }) {
   )
 }
 
+/**
+ * Empty states are a designed surface, not a fallback: a faint dot grid so the
+ * area still reads as a panel, a bordered glyph, one line of explanation, one
+ * action. `hint` carries the secondary route out when there is one.
+ */
 export function EmptyState({
   icon,
   title,
   description,
   action,
+  hint,
   className,
 }: {
   icon: ReactNode
   title: string
   description: string
   action?: ReactNode
+  hint?: ReactNode
   className?: string
 }) {
   return (
     <div
       className={cn(
-        'flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-800 bg-slate-900/40 px-6 py-16 text-center',
+        'relative isolate overflow-hidden rounded-xl border border-slate-800/90 bg-slate-900/40 px-6 py-14 text-center',
         className,
       )}
     >
-      <div className="mb-4 flex size-12 items-center justify-center rounded-xl border border-slate-800 bg-slate-900 text-accent-400">
+      <span
+        className="pointer-events-none absolute inset-0 -z-10 opacity-60"
+        aria-hidden
+        style={{
+          backgroundImage: 'radial-gradient(var(--color-slate-800) 1px, transparent 1px)',
+          backgroundSize: '18px 18px',
+          maskImage: 'radial-gradient(ellipse 70% 60% at 50% 45%, #000 20%, transparent 75%)',
+          WebkitMaskImage: 'radial-gradient(ellipse 70% 60% at 50% 45%, #000 20%, transparent 75%)',
+        }}
+      />
+      <div className="mx-auto mb-4 flex size-11 items-center justify-center rounded-xl border border-slate-700/70 bg-slate-900 text-accent-400 elev-1">
         {icon}
       </div>
-      <h3 className="text-base font-semibold text-slate-100">{title}</h3>
-      <p className="mt-1.5 max-w-md text-sm leading-relaxed text-slate-400">{description}</p>
-      {action ? <div className="mt-6">{action}</div> : null}
+      <h3 className="text-[15px] leading-6 font-semibold tracking-tight text-slate-100">{title}</h3>
+      <p className="mx-auto mt-1.5 max-w-md text-[13px] leading-relaxed text-slate-400">
+        {description}
+      </p>
+      {action ? <div className="mt-5 flex justify-center">{action}</div> : null}
+      {hint ? <p className="mt-3 text-meta text-slate-600">{hint}</p> : null}
     </div>
   )
 }
 
-export function ErrorBlock({ message, onRetry }: { message: string; onRetry?: () => void }) {
+export function ErrorBlock({
+  message,
+  onRetry,
+  title = 'Could not load this page',
+}: {
+  message: string
+  onRetry?: () => void
+  title?: string
+}) {
   return (
-    <div className="flex flex-col items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/5 px-5 py-4">
-      <div>
-        <p className="text-sm font-medium text-red-300">Could not load this page</p>
-        <p className="mt-1 text-sm text-slate-400">{message}</p>
+    <div className="flex items-start gap-3.5 rounded-xl border border-red-500/25 bg-red-500/[0.06] px-5 py-4 elev-1">
+      <span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg border border-red-500/30 bg-red-500/10 text-red-300">
+        <TriangleAlert className="size-4" aria-hidden />
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-medium text-red-200">{title}</p>
+        <p className="mt-1 text-[13px] leading-relaxed break-words text-slate-400">{message}</p>
+        {onRetry ? (
+          <Button size="sm" className="mt-3" onClick={onRetry}>
+            Try again
+          </Button>
+        ) : null}
       </div>
-      {onRetry ? (
-        <Button size="sm" onClick={onRetry}>
-          Try again
-        </Button>
-      ) : null}
     </div>
   )
 }
@@ -690,7 +969,7 @@ export function Metric({
 }) {
   return (
     <div className={cn('min-w-0', className)}>
-      <dt className="text-[11px] tracking-wide text-slate-500 uppercase">{label}</dt>
+      <dt className="eyebrow">{label}</dt>
       <dd className="mt-0.5 truncate text-sm text-slate-200">{value}</dd>
     </div>
   )

@@ -81,19 +81,6 @@ func TestGateSetLimitReleasesWaiters(t *testing.T) {
 	}
 }
 
-func TestValidateSchedule(t *testing.T) {
-	for _, ok := range []string{"", ManualSchedule, "0 2 * * *", "*/15 * * * *", "@daily"} {
-		if err := ValidateSchedule(ok); err != nil {
-			t.Errorf("ValidateSchedule(%q) = %v, want nil", ok, err)
-		}
-	}
-	for _, bad := range []string{"not a cron", "* * *", "99 * * * *"} {
-		if err := ValidateSchedule(bad); err == nil {
-			t.Errorf("ValidateSchedule(%q) accepted an invalid spec", bad)
-		}
-	}
-}
-
 func TestVMSourceIDRoundTrip(t *testing.T) {
 	id := VMSourceID("abc123", 100)
 	if id != "abc123_100" {

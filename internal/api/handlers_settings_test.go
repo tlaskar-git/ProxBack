@@ -62,6 +62,31 @@ func TestSettingsDefaultsAndThroughputRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSettingsReportsTheServerTimezone covers the read-only field the UI needs
+// to say which zone a schedule's "02:00" means. It is derived from the server,
+// never stored, so a PUT can neither change it nor lose it.
+func TestSettingsReportsTheServerTimezone(t *testing.T) {
+	ts := newTestServer(t)
+
+	_, body := ts.request(t, http.MethodGet, "/api/settings", nil)
+	zone, _ := body["timezone"].(string)
+	if zone == "" {
+		t.Fatalf(`GET /api/settings has no timezone: %v`, body)
+	}
+
+	code, put := ts.request(t, http.MethodPut, "/api/settings",
+		map[string]any{"serverName": "lab", "timezone": "Mars/Olympus"})
+	if code != http.StatusOK {
+		t.Fatalf("PUT /api/settings = %d (%v)", code, put)
+	}
+	if put["timezone"] != zone {
+		t.Errorf("PUT changed the reported timezone to %v, want the server's %q", put["timezone"], zone)
+	}
+	if put["serverName"] != "lab" {
+		t.Errorf("the settings PUT itself did not take: %v", put)
+	}
+}
+
 // TestSettingsValidationRejectsBadThroughputValues keeps a mistyped setting from
 // reaching the engine, with a 400 the UI can show.
 func TestSettingsValidationRejectsBadThroughputValues(t *testing.T) {

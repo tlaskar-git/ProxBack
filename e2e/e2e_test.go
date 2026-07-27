@@ -110,19 +110,55 @@ type apiRunLog struct {
 	Lines []apiRunLogLine `json:"lines"`
 }
 
+// apiSchedule mirrors the structured schedule object. Every field is decoded so
+// the test can prove the server emits exactly the shape the UI is built against.
+type apiSchedule struct {
+	Kind       string `json:"kind"`
+	Minute     *int   `json:"minute"`
+	Time       string `json:"time"`
+	Weekdays   []int  `json:"weekdays"`
+	DayOfMonth *int   `json:"dayOfMonth"`
+	Cron       string `json:"cron"`
+}
+
 type apiJob struct {
-	ID         string         `json:"id"`
-	Name       string         `json:"name"`
-	Kind       string         `json:"kind"`
-	TargetID   string         `json:"targetId"`
-	TargetName string         `json:"targetName"`
-	Schedule   string         `json:"schedule"`
-	Retention  int            `json:"retention"`
-	Enabled    bool           `json:"enabled"`
-	Sources    []apiJobSource `json:"sources"`
-	TagFilter  *string        `json:"tagFilter"`
-	NextRun    *string        `json:"nextRun"`
-	LastRun    *apiRun        `json:"lastRun"`
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	Kind          string         `json:"kind"`
+	TargetID      string         `json:"targetId"`
+	TargetName    string         `json:"targetName"`
+	Schedule      apiSchedule    `json:"schedule"`
+	ScheduleLabel string         `json:"scheduleLabel"`
+	Retention     int            `json:"retention"`
+	Enabled       bool           `json:"enabled"`
+	Sources       []apiJobSource `json:"sources"`
+	TagFilter     *string        `json:"tagFilter"`
+	NextRun       *string        `json:"nextRun"`
+	LastRun       *apiRun        `json:"lastRun"`
+}
+
+// apiRunSource mirrors one entry of GET /api/runs/{id}'s sources array.
+type apiRunSource struct {
+	Seq            int     `json:"seq"`
+	Name           string  `json:"name"`
+	Kind           string  `json:"kind"`
+	Node           string  `json:"node"`
+	Status         string  `json:"status"`
+	BytesProcessed int64   `json:"bytesProcessed"`
+	BytesUploaded  int64   `json:"bytesUploaded"`
+	SizeBytes      int64   `json:"sizeBytes"`
+	ProgressPct    float64 `json:"progressPct"`
+	StartedAt      *string `json:"startedAt"`
+	FinishedAt     *string `json:"finishedAt"`
+	Error          string  `json:"error"`
+}
+
+// apiRunDetail is GET /api/runs/{id}: a run plus the per-source breakdown that
+// drives the visual monitor.
+type apiRunDetail struct {
+	apiRun
+	Sources       []apiRunSource `json:"sources"`
+	ThroughputBps float64        `json:"throughputBps"`
 }
 
 type apiDisk struct {
@@ -191,6 +227,8 @@ type apiSettings struct {
 	UploadConcurrency int    `json:"uploadConcurrency"`
 	Compression       string `json:"compression"`
 	UploadLimitMbps   int    `json:"uploadLimitMbps"`
+	// Timezone is read-only: the zone the server's schedules are expressed in.
+	Timezone string `json:"timezone"`
 }
 
 // webhookPayload mirrors the notification body in the contract.
@@ -944,7 +982,7 @@ func TestEndToEnd(t *testing.T) {
 		if vmJob.ID == "" || vmJob.Kind != "vm" || len(vmJob.Sources) != 2 {
 			t.Fatalf("created job = %+v", vmJob)
 		}
-		if vmJob.TargetName != "vm-storage" || vmJob.Retention != 2 || vmJob.Schedule != "manual" {
+		if vmJob.TargetName != "vm-storage" || vmJob.Retention != 2 || vmJob.Schedule.Kind != "manual" {
 			t.Fatalf("job fields = %+v", vmJob)
 		}
 		if vmJob.LastRun != nil {
@@ -1488,6 +1526,61 @@ func TestEndToEnd(t *testing.T) {
 			}
 		}
 
+		// The run detail carries the per-object breakdown the visual monitor
+		// draws: one entry per guest the tag resolved to, each finished.
+		var detail apiRunDetail
+		h.ok(http.MethodGet, "/api/runs/"+run.ID, nil, &detail)
+		if detail.ID != run.ID || detail.Status != "success" {
+			t.Fatalf("run detail = %+v", detail.apiRun)
+		}
+		if len(detail.Sources) != 2 {
+			t.Fatalf("run detail exposes %d sources, want 2: %+v", len(detail.Sources), detail.Sources)
+		}
+		if detail.ThroughputBps != 0 {
+			t.Errorf("a finished run reports throughputBps %v, want 0", detail.ThroughputBps)
+		}
+		bySource := map[string]apiRunSource{}
+		for i, src := range detail.Sources {
+			if src.Seq != i {
+				t.Errorf("source %d carries seq %d", i, src.Seq)
+			}
+			bySource[src.Name] = src
+		}
+		for name, size := range map[string]int64{
+			"web-01": 32 * mib, // two disks
+			"db-01":  16 * mib, // one
+		} {
+			src, ok := bySource[name]
+			if !ok {
+				t.Fatalf("run detail has no source for %s: %+v", name, detail.Sources)
+			}
+			if src.Status != "success" {
+				t.Errorf("%s finished %q (%s), want success", name, src.Status, src.Error)
+			}
+			if src.Kind != "vm" || src.Node == "" {
+				t.Errorf("%s = kind %q on node %q", name, src.Kind, src.Node)
+			}
+			if src.SizeBytes != size || src.BytesProcessed != size {
+				t.Errorf("%s = %d of %d bytes, want %d of %d",
+					name, src.BytesProcessed, src.SizeBytes, size, size)
+			}
+			// Everything this run read was already on the target.
+			if src.BytesUploaded != 0 {
+				t.Errorf("%s uploaded %d bytes, want 0 (all chunks known)", name, src.BytesUploaded)
+			}
+			if src.ProgressPct != 100 {
+				t.Errorf("%s progressPct = %v, want 100", name, src.ProgressPct)
+			}
+			if src.StartedAt == nil || src.FinishedAt == nil || src.Error != "" {
+				t.Errorf("%s timing/error = %v … %v (%q)", name, src.StartedAt, src.FinishedAt, src.Error)
+			}
+		}
+		// The list stays cheap: the breakdown is only on the detail endpoint.
+		_, rawList := h.do(http.MethodGet, "/api/runs?limit=5", nil)
+		if strings.Contains(string(rawList), `"sources"`) {
+			t.Errorf("GET /api/runs carries the per-source breakdown: %s", rawList)
+		}
+
 		// A filter that matches nothing fails the run with a clear message
 		// rather than silently succeeding with an empty backup.
 		var orphan apiJob
@@ -1675,7 +1768,7 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatal("no jobs to inspect")
 		}
 		for _, j := range jobs {
-			if j.Schedule == "manual" && j.NextRun != nil {
+			if j.Schedule.Kind == "manual" && j.NextRun != nil {
 				t.Fatalf("manual job %q reports nextRun %q, want null", j.Name, *j.NextRun)
 			}
 		}
@@ -1709,12 +1802,149 @@ func TestEndToEnd(t *testing.T) {
 		if job.NextRun != nil {
 			t.Fatalf("manual job reports nextRun %q, want null", *job.NextRun)
 		}
-		if job.Schedule != "manual" || !job.Enabled {
+		if job.Schedule.Kind != "manual" || !job.Enabled {
 			t.Fatalf("job not restored to manual/enabled: %+v", job)
 		}
 		// An unparsable cron spec is rejected outright.
 		if code, body := h.do(http.MethodPatch, "/api/jobs/"+vmJob.ID, map[string]any{"schedule": "not a cron"}); code != http.StatusBadRequest {
 			t.Fatalf("PATCH with an invalid schedule = %d (%s), want 400", code, body)
+		}
+	})
+
+	// ---- structured schedules ---------------------------------------------
+	t.Run("17b-structured-schedule", func(t *testing.T) {
+		// The shape the schedule picker sends: no cron anywhere in sight.
+		var daily apiJob
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "daily-vms", "kind": "vm", "targetId": vmTarget.ID,
+			"schedule":  map[string]any{"kind": "daily", "time": "02:00"},
+			"retention": 2, "enabled": true,
+			"sources": []map[string]any{{"hostId": host.ID, "vmid": 100, "name": "web-01"}},
+		}, &daily)
+		if daily.Schedule.Kind != "daily" || daily.Schedule.Time != "02:00" {
+			t.Fatalf("schedule round trip = %+v", daily.Schedule)
+		}
+		if daily.Schedule.Cron != "" || daily.Schedule.Minute != nil || daily.Schedule.DayOfMonth != nil {
+			t.Fatalf("a daily schedule carries fields of other kinds: %+v", daily.Schedule)
+		}
+		if daily.ScheduleLabel != "Daily at 02:00" {
+			t.Fatalf("scheduleLabel = %q, want %q", daily.ScheduleLabel, "Daily at 02:00")
+		}
+		if daily.NextRun == nil {
+			t.Fatal("a daily schedule reports no nextRun")
+		}
+		next, err := time.Parse(time.RFC3339, *daily.NextRun)
+		if err != nil {
+			t.Fatalf("nextRun %q is not RFC3339: %v", *daily.NextRun, err)
+		}
+		if !next.After(time.Now()) {
+			t.Fatalf("nextRun %s is not in the future", next)
+		}
+		if next.Sub(time.Now()) > 25*time.Hour {
+			t.Fatalf("nextRun %s is more than a day out for a daily schedule", next)
+		}
+		if local := next.Local(); local.Hour() != 2 || local.Minute() != 0 {
+			t.Fatalf("nextRun %s is not 02:00 in the server's zone", local)
+		}
+
+		// It survives a reload, and the other kinds render their labels too.
+		var jobs []apiJob
+		h.ok(http.MethodGet, "/api/jobs", nil, &jobs)
+		var found bool
+		for _, j := range jobs {
+			if j.ID != daily.ID {
+				continue
+			}
+			found = true
+			if j.Schedule.Kind != "daily" || j.Schedule.Time != "02:00" || j.ScheduleLabel != "Daily at 02:00" {
+				t.Fatalf("listed job = %+v / %q", j.Schedule, j.ScheduleLabel)
+			}
+		}
+		if !found {
+			t.Fatalf("the scheduled job is missing from the listing")
+		}
+
+		var weekly apiJob
+		h.ok(http.MethodPatch, "/api/jobs/"+daily.ID, map[string]any{
+			"schedule": map[string]any{"kind": "weekly", "time": "03:00", "weekdays": []int{0, 6}},
+		}, &weekly)
+		if weekly.ScheduleLabel != "Weekly on Sun, Sat at 03:00" {
+			t.Fatalf("weekly label = %q", weekly.ScheduleLabel)
+		}
+		if len(weekly.Schedule.Weekdays) != 2 || weekly.Schedule.Weekdays[0] != 0 || weekly.Schedule.Weekdays[1] != 6 {
+			t.Fatalf("weekdays = %v", weekly.Schedule.Weekdays)
+		}
+
+		// The server's timezone is reported so the UI can say what "02:00" means.
+		var settings apiSettings
+		h.ok(http.MethodGet, "/api/settings", nil, &settings)
+		if settings.Timezone == "" {
+			t.Fatal("GET /api/settings reports no timezone")
+		}
+
+		// A schedule the scheduler could not honour never reaches the database.
+		for _, bad := range []any{
+			map[string]any{"kind": "daily", "time": "25:00"},
+			map[string]any{"kind": "weekly", "time": "03:00", "weekdays": []int{}},
+			map[string]any{"kind": "monthly", "time": "01:00", "dayOfMonth": 32},
+			map[string]any{"kind": "advanced", "cron": "not a cron"},
+			map[string]any{"kind": "yearly"},
+		} {
+			code, body := h.do(http.MethodPatch, "/api/jobs/"+daily.ID, map[string]any{"schedule": bad})
+			if code != http.StatusBadRequest {
+				t.Fatalf("PATCH with schedule %v = %d (%s), want 400", bad, code, body)
+			}
+		}
+		h.ok(http.MethodDelete, "/api/jobs/"+daily.ID, nil, nil)
+	})
+
+	// ---- retry -------------------------------------------------------------
+	t.Run("17c-retry-a-run", func(t *testing.T) {
+		var runs []apiRun
+		h.ok(http.MethodGet, "/api/runs?jobId="+vmJob.ID+"&limit=1", nil, &runs)
+		if len(runs) == 0 {
+			t.Fatal("the vm job has no runs to retry")
+		}
+		var started struct {
+			RunID string `json:"runId"`
+		}
+		h.ok(http.MethodPost, "/api/runs/"+runs[0].ID+"/retry", nil, &started)
+		if started.RunID == "" || started.RunID == runs[0].ID {
+			t.Fatalf("retry returned runId %q", started.RunID)
+		}
+		// While that run is in flight the job refuses another. The retry may
+		// already have finished on a fast machine, in which case a second one is
+		// legitimately accepted — and then has to be waited for as well, so it
+		// cannot collide with the subtests that follow.
+		code, body := h.do(http.MethodPost, "/api/runs/"+runs[0].ID+"/retry", nil)
+		switch code {
+		case http.StatusConflict:
+		case http.StatusOK:
+			var second struct {
+				RunID string `json:"runId"`
+			}
+			if err := json.Unmarshal(body, &second); err != nil {
+				t.Fatalf("decode second retry %s: %v", body, err)
+			}
+			h.waitRun(second.RunID, 60*time.Second)
+		default:
+			t.Fatalf("second retry = %d (%s), want 409 or 200", code, body)
+		}
+		retried := h.waitRun(started.RunID, 60*time.Second)
+		if retried.JobID != vmJob.ID || retried.Status != "success" {
+			t.Fatalf("retry run = %+v", retried)
+		}
+		// A restore run has no job behind it, so there is nothing to re-run.
+		var restores []apiRun
+		h.ok(http.MethodGet, "/api/runs?limit=100", nil, &restores)
+		for _, r := range restores {
+			if r.JobID != "" {
+				continue
+			}
+			if code, body := h.do(http.MethodPost, "/api/runs/"+r.ID+"/retry", nil); code != http.StatusNotFound {
+				t.Fatalf("retry of the jobless run %q = %d (%s), want 404", r.JobName, code, body)
+			}
+			break
 		}
 	})
 

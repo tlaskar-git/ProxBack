@@ -185,6 +185,7 @@ func (s *Server) apiRoutes() chi.Router {
 		r.Get("/runs/{id}/log", s.handleRunLog)
 		r.Delete("/runs/{id}", s.handleDeleteRun)
 		r.Post("/runs/{id}/cancel", s.handleCancelRun)
+		r.Post("/runs/{id}/retry", s.handleRetryRun)
 
 		r.Get("/backups", s.handleListBackups)
 		r.Post("/backups/{id}/verify", s.handleVerifyBackup)

@@ -15,14 +15,15 @@ const jobCols = `id, name, kind, target_id, schedule, retention, enabled, source
 func scanJob(sc interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var enabled int
-	var sources, created string
-	if err := sc.Scan(&j.ID, &j.Name, &j.Kind, &j.TargetID, &j.Schedule, &j.Retention, &enabled,
+	var schedule, sources, created string
+	if err := sc.Scan(&j.ID, &j.Name, &j.Kind, &j.TargetID, &schedule, &j.Retention, &enabled,
 		&sources, &j.TagFilter, &created); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("scan job: %w", err)
 	}
+	j.Schedule = decodeSchedule(schedule)
 	j.Enabled = enabled != 0
 	j.CreatedAt = parseTime(created)
 	if err := json.Unmarshal([]byte(sources), &j.Sources); err != nil {
@@ -39,9 +40,7 @@ func (s *Store) CreateJob(ctx context.Context, j *Job) (*Job, error) {
 	if j.ID == "" {
 		j.ID = NewID()
 	}
-	if j.Schedule == "" {
-		j.Schedule = "manual"
-	}
+	j.Schedule = j.Schedule.Normalized()
 	if j.Sources == nil {
 		j.Sources = JobSources{}
 	}
@@ -50,9 +49,13 @@ func (s *Store) CreateJob(ctx context.Context, j *Job) (*Job, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encode job sources: %w", err)
 	}
+	schedule, err := encodeSchedule(j.Schedule)
+	if err != nil {
+		return nil, err
+	}
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO jobs (`+jobCols+`) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		j.ID, j.Name, j.Kind, j.TargetID, j.Schedule, j.Retention, boolInt(j.Enabled), string(raw),
+		j.ID, j.Name, j.Kind, j.TargetID, schedule, j.Retention, boolInt(j.Enabled), string(raw),
 		j.TagFilter, fmtTime(j.CreatedAt))
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
@@ -66,9 +69,14 @@ func (s *Store) UpdateJob(ctx context.Context, j *Job) error {
 	if err != nil {
 		return fmt.Errorf("encode job sources: %w", err)
 	}
+	j.Schedule = j.Schedule.Normalized()
+	schedule, err := encodeSchedule(j.Schedule)
+	if err != nil {
+		return err
+	}
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE jobs SET name=?, kind=?, target_id=?, schedule=?, retention=?, enabled=?, sources=?, tag_filter=? WHERE id=?`,
-		j.Name, j.Kind, j.TargetID, j.Schedule, j.Retention, boolInt(j.Enabled), string(raw), j.TagFilter, j.ID)
+		j.Name, j.Kind, j.TargetID, schedule, j.Retention, boolInt(j.Enabled), string(raw), j.TagFilter, j.ID)
 	if err != nil {
 		return fmt.Errorf("update job: %w", err)
 	}
@@ -281,8 +289,9 @@ func (s *Store) RunCountsSince(ctx context.Context, since time.Time) (map[string
 	return out, rows.Err()
 }
 
-// DeleteJobRun removes one run from the history together with its activity log.
-// Restore points and chunk data are untouched: a run row is history, not data.
+// DeleteJobRun removes one run from the history together with its activity log
+// and per-source breakdown. Restore points and chunk data are untouched: a run
+// row is history, not data.
 func (s *Store) DeleteJobRun(ctx context.Context, id string) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM job_runs WHERE id = ?`, id)
 	if err != nil {
@@ -290,6 +299,9 @@ func (s *Store) DeleteJobRun(ctx context.Context, id string) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
+	}
+	if err := s.DeleteRunSources(ctx, id); err != nil {
+		return err
 	}
 	return s.DeleteRunLog(ctx, id)
 }
@@ -315,10 +327,15 @@ func (s *Store) DeleteJobRunsByStatus(ctx context.Context, statuses []string, jo
 		where += ` AND job_id = ?`
 		args = append(args, jobID)
 	}
-	// The log rows go first: once the runs are gone their ids are unrecoverable.
+	// The dependent rows go first: once the runs are gone their ids are
+	// unrecoverable.
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM run_log WHERE run_id IN (SELECT id FROM job_runs`+where+`)`, args...); err != nil {
 		return 0, fmt.Errorf("delete run logs by status: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM run_sources WHERE run_id IN (SELECT id FROM job_runs`+where+`)`, args...); err != nil {
+		return 0, fmt.Errorf("delete run sources by status: %w", err)
 	}
 	res, err := s.db.ExecContext(ctx, `DELETE FROM job_runs`+where, args...)
 	if err != nil {

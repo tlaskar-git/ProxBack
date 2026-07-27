@@ -26,6 +26,32 @@
   --color-accent-800: #065f46;
   --color-accent-900: #064e3b;
   --color-accent-950: #022c22;
+
+  /* ---------------------------------------------------------------------
+     Type scale. Denser and more deliberate than Tailwind's defaults: the
+     console is read at a glance, so headings step down in small, confident
+     increments and labels are genuinely small rather than "sm".
+     --------------------------------------------------------------------- */
+  --text-micro: 0.625rem; /* 10px — eyebrows, unit suffixes */
+  --text-micro--line-height: 0.875rem;
+  --text-meta: 0.6875rem; /* 11px — chips, table meta, captions */
+  --text-meta--line-height: 1rem;
+
+  /* ---------------------------------------------------------------------
+     Elevation. Three levels, used to say what matters — not for decoration.
+     Each carries a 1px inner highlight along the top edge, which is what
+     stops a dark card from reading as a flat rectangle.
+     --------------------------------------------------------------------- */
+  --shadow-level-1:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.03), 0 1px 2px 0 rgb(0 0 0 / 0.4);
+  --shadow-level-2:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.045), 0 1px 3px 0 rgb(0 0 0 / 0.45),
+    0 8px 24px -12px rgb(0 0 0 / 0.7);
+  --shadow-level-3:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.06), 0 2px 4px 0 rgb(0 0 0 / 0.5),
+    0 24px 48px -16px rgb(0 0 0 / 0.8);
+  /* Recessed wells — log panes, source lists, anything "inside" a card. */
+  --shadow-well: inset 0 1px 2px 0 rgb(0 0 0 / 0.45);
 }
 
 @layer base {
@@ -124,6 +150,46 @@
   background-color: color-mix(in oklab, var(--color-slate-900) 70%, transparent);
 }
 
+/* A recessed panel inside a card: source lists, log tails, metric strips. */
+@utility well {
+  border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in oklab, var(--color-slate-800) 80%, transparent);
+  background-color: color-mix(in oklab, var(--color-slate-950) 60%, transparent);
+  box-shadow: var(--shadow-well);
+}
+
+/* Elevation levels — see the token block above. */
+@utility elev-1 {
+  box-shadow: var(--shadow-level-1);
+}
+
+@utility elev-2 {
+  box-shadow: var(--shadow-level-2);
+}
+
+@utility elev-3 {
+  box-shadow: var(--shadow-level-3);
+}
+
+/* Small uppercase label above a group of content. */
+@utility eyebrow {
+  font-size: var(--text-micro);
+  line-height: var(--text-micro--line-height);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--color-slate-500);
+}
+
+/* Large figures: tabular, tightened, so a wall of numbers reads as a table
+   rather than as prose. */
+@utility figure-lg {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  font-weight: 600;
+}
+
 @keyframes pb-toast-in {
   from {
     opacity: 0;
@@ -199,6 +265,34 @@
   animation: pb-shimmer 1.6s infinite;
 }
 
+/* Arc/ring progress. Animating the dash offset (not a width) keeps the sweep
+   smooth while the run's percentage is repolled every 2 s. */
+.pb-arc {
+  transition: stroke-dashoffset 600ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Expanding halo behind the "live" dot on an in-flight run. */
+@keyframes pb-ping {
+  0% {
+    opacity: 0.5;
+    transform: scale(1);
+  }
+  70%,
+  100% {
+    opacity: 0;
+    transform: scale(2.4);
+  }
+}
+
+.pb-ping::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background-color: currentColor;
+  animation: pb-ping 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
 .pb-bar-active {
   background-image: linear-gradient(
     115deg,
@@ -219,14 +313,16 @@
   .pb-modal-in,
   .pb-skeleton::after,
   .pb-bar-active,
+  .pb-ping::after,
   /* Decorative "live" dots; the loading spinner keeps turning because it is
      the only signal that work is still in flight. */
   .animate-pulse {
     animation: none;
   }
 
-  /* Progress fills jump straight to their new width instead of sliding. */
-  .transition-\[width\] {
+  /* Progress fills jump straight to their new value instead of sliding. */
+  .transition-\[width\],
+  .pb-arc {
     transition-duration: 1ms;
   }
 }

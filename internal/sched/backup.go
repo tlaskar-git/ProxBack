@@ -19,9 +19,15 @@ const SnapshotTaskTimeout = 10 * time.Minute
 
 func (m *Manager) progressFn(runID string) engine.ProgressFunc {
 	return func(s engine.Stats) {
-		if err := m.st.UpdateRunProgress(m.detached(), runID,
+		ctx := m.detached()
+		if err := m.st.UpdateRunProgress(ctx, runID,
 			s.BytesProcessed, s.BytesUploaded, s.Pct, s.CurrentStep); err != nil {
 			m.log.Warn("could not persist run progress", "run", runID, "error", err)
+		}
+		// The same callback advances the source in flight and takes the
+		// throughput sample; both are throttled inside the monitor.
+		if mon := m.monitorFor(runID); mon != nil {
+			mon.progress(ctx, s)
 		}
 	}
 }
@@ -216,91 +222,34 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 	sess := eng.NewSession(total, m.progressFn(run.ID))
 	snapname := "proxback-" + run.ID[:8]
 
-	for _, p := range plans {
+	// Every guest is recorded up front, pending and with its known size, so the
+	// monitor can draw the whole run — one row per VM, advancing independently —
+	// from the moment it starts.
+	mon := m.monitorFor(run.ID)
+	if mon != nil {
+		planned := make([]store.RunSource, 0, len(plans))
+		for i, p := range plans {
+			planned = append(planned, store.RunSource{
+				Seq: i, Name: p.name, Kind: store.SourceVM, Node: p.node,
+				Status: store.SourcePending, SizeBytes: p.totalBytes,
+			})
+		}
+		mon.plan(ctx, planned)
+	}
+
+	for i, p := range plans {
 		if err := ctx.Err(); err != nil {
 			return statsPtr(sess), err
 		}
 		before := sess.Stats()
-
-		var disks []engine.DiskManifest
-		if p.helper != nil {
-			// vzdump owns snapshot consistency, so ProxBack must not create one.
-			m.logRun(ctx, run.ID, "%s: starting vzdump stream via helper on node %s", p.name, p.node)
-			var err error
-			if disks, err = m.backupViaHelper(ctx, run.ID, sess, p); err != nil {
-				return statsPtr(sess), err
-			}
-		} else {
-			m.logRun(ctx, run.ID, "%s: starting %s via Proxmox disk export on node %s",
-				p.name, countNoun(len(p.disks), "disk"), p.node)
-			sess.SetStep("Snapshotting " + p.name)
-			upid, err := p.client.CreateSnapshot(ctx, p.node, p.vmid, snapname)
-			if err != nil {
-				return statsPtr(sess), fmt.Errorf("snapshot %s: %w", p.name, err)
-			}
-			if err := p.client.WaitTask(ctx, p.node, upid, SnapshotTaskTimeout); err != nil {
-				return statsPtr(sess), fmt.Errorf("snapshot %s: %w", p.name, err)
-			}
-			if disks, err = m.exportDisks(ctx, run.ID, sess, p, snapname); err != nil {
-				return statsPtr(sess), err
-			}
+		if mon != nil {
+			mon.begin(ctx, i, before)
 		}
-		after := sess.Stats()
-
-		parentID, err := m.parentFor(ctx, store.SourceVM, p.sourceID, eng.TargetID())
+		err := m.backupOneVM(ctx, run, job, eng, sess, p, snapname, before)
+		if mon != nil {
+			mon.finish(ctx, sourceOutcome(err), sess.Stats(), errText(err))
+		}
 		if err != nil {
-			return statsPtr(sess), err
-		}
-
-		var size int64
-		storeDisks := make([]store.Disk, 0, len(disks))
-		for _, d := range disks {
-			size += d.SizeBytes
-			storeDisks = append(storeDisks, store.Disk{Name: d.Name, SizeBytes: d.SizeBytes})
-		}
-		uploaded := after.BytesUploaded - before.BytesUploaded
-
-		backupID := store.NewID()
-		man := &engine.Manifest{
-			BackupID:      backupID,
-			JobID:         job.ID,
-			JobName:       job.Name,
-			RunID:         run.ID,
-			SourceKind:    store.SourceVM,
-			SourceID:      p.sourceID,
-			SourceName:    p.name,
-			TargetID:      eng.TargetID(),
-			CreatedAt:     store.Now(),
-			Kind:          engine.Kind(parentID),
-			ParentID:      parentID,
-			SizeBytes:     size,
-			UploadedBytes: uploaded,
-			ChunkSize:     engine.ChunkSize,
-			Disks:         disks,
-		}
-		sess.SetStep("Writing manifest for " + p.name)
-		if err := eng.WriteManifest(ctx, man); err != nil {
-			return statsPtr(sess), err
-		}
-		if _, err := m.st.CreateBackup(ctx, &store.Backup{
-			ID:            backupID,
-			JobID:         job.ID,
-			RunID:         run.ID,
-			SourceKind:    store.SourceVM,
-			SourceID:      p.sourceID,
-			SourceName:    p.name,
-			TargetID:      eng.TargetID(),
-			CreatedAt:     man.CreatedAt,
-			SizeBytes:     size,
-			UploadedBytes: uploaded,
-			Kind:          man.Kind,
-			ParentID:      parentID,
-			Disks:         storeDisks,
-		}); err != nil {
-			return statsPtr(sess), err
-		}
-		m.logSourceDone(ctx, run.ID, p.name, after.BytesProcessed-before.BytesProcessed, uploaded, man.Kind)
-		if err := m.applyRetention(ctx, run.ID, eng, job, store.SourceVM, p.sourceID); err != nil {
 			return statsPtr(sess), err
 		}
 	}
@@ -308,6 +257,114 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 	sess.SetStep("Completed")
 	sess.Flush()
 	return statsPtr(sess), nil
+}
+
+// backupOneVM backs up a single guest: export (helper or Proxmox extension),
+// manifest, restore point, retention. before is the run's byte count when the
+// guest started, which is what makes the per-source figures deltas of the
+// session's shared counters.
+func (m *Manager) backupOneVM(ctx context.Context, run *store.JobRun, job *store.Job, eng *engine.Engine,
+	sess *engine.Session, p vmPlan, snapname string, before engine.Stats) error {
+	var disks []engine.DiskManifest
+	if p.helper != nil {
+		// vzdump owns snapshot consistency, so ProxBack must not create one.
+		m.logRun(ctx, run.ID, "%s: starting vzdump stream via helper on node %s", p.name, p.node)
+		var err error
+		if disks, err = m.backupViaHelper(ctx, run.ID, sess, p); err != nil {
+			return err
+		}
+	} else {
+		m.logRun(ctx, run.ID, "%s: starting %s via Proxmox disk export on node %s",
+			p.name, countNoun(len(p.disks), "disk"), p.node)
+		sess.SetStep("Snapshotting " + p.name)
+		upid, err := p.client.CreateSnapshot(ctx, p.node, p.vmid, snapname)
+		if err != nil {
+			return fmt.Errorf("snapshot %s: %w", p.name, err)
+		}
+		if err := p.client.WaitTask(ctx, p.node, upid, SnapshotTaskTimeout); err != nil {
+			return fmt.Errorf("snapshot %s: %w", p.name, err)
+		}
+		if disks, err = m.exportDisks(ctx, run.ID, sess, p, snapname); err != nil {
+			return err
+		}
+	}
+	after := sess.Stats()
+
+	parentID, err := m.parentFor(ctx, store.SourceVM, p.sourceID, eng.TargetID())
+	if err != nil {
+		return err
+	}
+
+	var size int64
+	storeDisks := make([]store.Disk, 0, len(disks))
+	for _, d := range disks {
+		size += d.SizeBytes
+		storeDisks = append(storeDisks, store.Disk{Name: d.Name, SizeBytes: d.SizeBytes})
+	}
+	uploaded := after.BytesUploaded - before.BytesUploaded
+
+	backupID := store.NewID()
+	man := &engine.Manifest{
+		BackupID:      backupID,
+		JobID:         job.ID,
+		JobName:       job.Name,
+		RunID:         run.ID,
+		SourceKind:    store.SourceVM,
+		SourceID:      p.sourceID,
+		SourceName:    p.name,
+		TargetID:      eng.TargetID(),
+		CreatedAt:     store.Now(),
+		Kind:          engine.Kind(parentID),
+		ParentID:      parentID,
+		SizeBytes:     size,
+		UploadedBytes: uploaded,
+		ChunkSize:     engine.ChunkSize,
+		Disks:         disks,
+	}
+	sess.SetStep("Writing manifest for " + p.name)
+	if err := eng.WriteManifest(ctx, man); err != nil {
+		return err
+	}
+	if _, err := m.st.CreateBackup(ctx, &store.Backup{
+		ID:            backupID,
+		JobID:         job.ID,
+		RunID:         run.ID,
+		SourceKind:    store.SourceVM,
+		SourceID:      p.sourceID,
+		SourceName:    p.name,
+		TargetID:      eng.TargetID(),
+		CreatedAt:     man.CreatedAt,
+		SizeBytes:     size,
+		UploadedBytes: uploaded,
+		Kind:          man.Kind,
+		ParentID:      parentID,
+		Disks:         storeDisks,
+	}); err != nil {
+		return err
+	}
+	m.logSourceDone(ctx, run.ID, p.name, after.BytesProcessed-before.BytesProcessed, uploaded, man.Kind)
+	return m.applyRetention(ctx, run.ID, eng, job, store.SourceVM, p.sourceID)
+}
+
+// sourceOutcome maps a source's outcome to its recorded status. A cancellation
+// is not the source's fault, so it is recorded as skipped rather than failed.
+func sourceOutcome(err error) string {
+	switch {
+	case err == nil:
+		return store.SourceSuccess
+	case errors.Is(err, context.Canceled):
+		return store.SourceSkipped
+	default:
+		return store.SourceFailed
+	}
+}
+
+// errText renders an error for a run source row.
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // exportDisks streams every disk of the snapshot through the engine, always
@@ -349,7 +406,8 @@ func (m *Manager) exportDisks(ctx context.Context, runID string, sess *engine.Se
 
 // ---------------------------------------------------------------- agent backups
 
-func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *store.Job, eng *engine.Engine) (*engine.Stats, error) {
+func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *store.Job,
+	eng *engine.Engine) (stats *engine.Stats, runErr error) {
 	if len(job.Sources) == 0 || job.Sources[0].AgentID == "" {
 		return nil, errors.New("sched: agent job needs an agentId source")
 	}
@@ -371,6 +429,18 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 	}
 
 	sess := eng.NewSession(0, m.progressFn(run.ID))
+	// An agent job walks exactly one source; its size is only known once the
+	// agent has streamed it, so the row starts at zero bytes.
+	mon := m.monitorFor(run.ID)
+	if mon != nil {
+		mon.plan(ctx, []store.RunSource{{
+			Seq: 0, Name: agent.Hostname, Kind: store.SourceAgent, Status: store.SourcePending,
+		}})
+		mon.begin(ctx, 0, sess.Stats())
+		defer func() {
+			mon.finish(m.detached(), sourceOutcome(runErr), sess.Stats(), errText(runErr))
+		}()
+	}
 	m.logRun(ctx, run.ID, "%s: starting file backup via agent (%s: %s)",
 		agent.Hostname, countNoun(len(src.Paths), "path"), strings.Join(src.Paths, ", "))
 	sess.SetStep("Dispatching to agent " + agent.Hostname)
@@ -401,7 +471,12 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 		size += d.SizeBytes
 		storeDisks = append(storeDisks, store.Disk{Name: d.Name, SizeBytes: d.SizeBytes})
 	}
-	stats := sess.Stats()
+	// The agent's stream size only becomes known here, so the source row learns
+	// its total after the fact rather than at plan time.
+	if mon != nil {
+		mon.setSize(ctx, 0, size)
+	}
+	snapshot := sess.Stats()
 
 	backupID := store.NewID()
 	man := &engine.Manifest{
@@ -417,7 +492,7 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 		Kind:          engine.Kind(parentID),
 		ParentID:      parentID,
 		SizeBytes:     size,
-		UploadedBytes: stats.BytesUploaded,
+		UploadedBytes: snapshot.BytesUploaded,
 		ChunkSize:     engine.ChunkSize,
 		Disks:         res.Disks,
 	}
@@ -435,14 +510,14 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 		TargetID:      eng.TargetID(),
 		CreatedAt:     man.CreatedAt,
 		SizeBytes:     size,
-		UploadedBytes: stats.BytesUploaded,
+		UploadedBytes: snapshot.BytesUploaded,
 		Kind:          man.Kind,
 		ParentID:      parentID,
 		Disks:         storeDisks,
 	}); err != nil {
 		return statsPtr(sess), err
 	}
-	m.logSourceDone(ctx, run.ID, agent.Hostname, stats.BytesProcessed, stats.BytesUploaded, man.Kind)
+	m.logSourceDone(ctx, run.ID, agent.Hostname, snapshot.BytesProcessed, snapshot.BytesUploaded, man.Kind)
 	if err := m.applyRetention(ctx, run.ID, eng, job, store.SourceAgent, agent.ID); err != nil {
 		return statsPtr(sess), err
 	}

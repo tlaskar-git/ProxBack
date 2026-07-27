@@ -222,10 +222,33 @@ S3 targets
 - `POST /api/targets/{id}/test` → `{"ok":bool,"error"?}` (put+get+delete probe object)
 - `DELETE /api/targets/{id}`
 
+### Schedules (v0.4.0) — no cron in the product surface
+
+Operators pick a schedule the way they think about it, not in cron syntax. A job's
+`schedule` is an object; the server derives the cron expression internally.
+
+```
+{"kind":"manual"}
+{"kind":"hourly","minute":30}                         // every hour at :30
+{"kind":"daily","time":"02:00"}
+{"kind":"weekly","time":"03:00","weekdays":[0,6]}     // 0=Sunday … 6=Saturday
+{"kind":"monthly","time":"01:00","dayOfMonth":1}      // 1–31; 31 runs on the last day
+{"kind":"advanced","cron":"*/15 * * * *"}             // escape hatch, never the default
+```
+
+- `POST/PATCH /api/jobs` accept this object. A bare string is still accepted and treated
+  as `advanced` (or `manual`), so existing automation keeps working.
+- `GET /api/jobs` always returns the object plus `"scheduleLabel"` — a rendered English
+  summary ("Daily at 02:00", "Weekly on Sun, Sat at 03:00") the UI displays verbatim.
+- Existing jobs migrate on upgrade: a stored cron that matches a preset becomes that
+  preset; anything else becomes `advanced` with the cron preserved.
+- All times are the server's local timezone; `GET /api/settings` gains read-only
+  `"timezone"` so the UI can say so.
+
 Jobs
 - `GET  /api/jobs` → `[{"id","name","kind":"vm"|"agent","targetId","targetName","schedule",
-  "retention","enabled","sources":[...],"tagFilter":string|null,"nextRun":RFC3339|null,
-  "lastRun":JobRun|null}]`
+  "scheduleLabel","retention","enabled","sources":[...],"tagFilter":string|null,
+  "nextRun":RFC3339|null,"lastRun":JobRun|null}]`
   - vm job sources: `[{"hostId","vmid","name"}]`; agent job: `{"agentId","paths":[...]}`
   - `tagFilter` (vm jobs only): when set, membership is dynamic — at run start the job
     resolves to every cached VM carrying that tag (sources array may be empty); VMs added
@@ -242,8 +265,18 @@ Jobs
   JobRun = `{"id","jobId","jobName","status":"running"|"success"|"failed"|"canceled",
   "startedAt","finishedAt"?,"bytesProcessed","bytesUploaded","dedupRatio","error"?,
   "progressPct","currentStep"}`
-- `GET  /api/runs/{id}` → JobRun
+- `GET  /api/runs/{id}` → JobRun **plus `"sources"`** (v0.4.0): the per-object breakdown
+  that drives the visual monitor —
+  `[{"seq","name","kind":"vm"|"agent","node"?,"status":"pending"|"running"|"success"|
+  "failed"|"skipped","bytesProcessed","bytesUploaded","sizeBytes","progressPct",
+  "startedAt"?,"finishedAt"?,"error"?}]`.
+  Written as the run walks its sources, so a run of 8 VMs shows 8 rows advancing
+  independently — one finished, one at 40%, six pending. Always an array.
+- `GET /api/runs/{id}` also returns `"throughputBps"` (bytes/second over the last sample
+  window, 0 when not running) so the monitor can plot live speed.
 - `POST /api/runs/{id}/cancel`
+- `POST /api/runs/{id}/retry` (v0.4.0) → `{"runId"}` — re-runs the same job; 409 when the
+  job already has a run in flight, 404 for restore/verify runs (no job to re-run).
 - Run history detail & cleanup (v0.3.1):
   - `GET /api/runs/{id}/log` → `{"lines":[{"ts":RFC3339,"line":string}]}` — persisted
     per-run activity log (run started, each step transition, per-source completions with

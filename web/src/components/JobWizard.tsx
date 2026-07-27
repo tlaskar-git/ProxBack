@@ -17,15 +17,34 @@ import {
   allTagsOf,
   createJob,
   errorMessage,
+  parseSchedule,
   patchJob,
   tagsOf,
   vmSourcesOf,
   vmsWithTag,
 } from '../api'
-import type { Agent, CachedVM, ID, Job, JobCreate, JobKind, JobSources, Target } from '../api'
+import type {
+  Agent,
+  CachedVM,
+  ID,
+  Job,
+  JobCreate,
+  JobKind,
+  JobSources,
+  Schedule,
+  Target,
+} from '../api'
 import { cn } from '../lib/cn'
-import { describeSchedule, formatBytes, formatCount, isValidCron } from '../lib/format'
+import {
+  describeSchedule,
+  formatBytes,
+  formatCount,
+  formatWallClock,
+  nextRunOf,
+} from '../lib/format'
+import { useServerTimezone } from '../lib/useServerTimezone'
 import { Modal } from './Modal'
+import { isScheduleComplete, ScheduleEditor } from './ScheduleEditor'
 import { useToast } from './Toast'
 import {
   Button,
@@ -42,15 +61,10 @@ import {
   toneForStatus,
 } from './ui'
 
-type ScheduleMode = 'manual' | 'hourly' | 'daily' | 'weekly' | 'custom'
-
-const CRON_PRESETS: Record<Exclude<ScheduleMode, 'manual' | 'custom'>, string> = {
-  hourly: '0 * * * *',
-  daily: '0 2 * * *',
-  weekly: '0 3 * * 0',
-}
-
 const STEPS = ['Sources', 'Target', 'Schedule', 'Retention', 'Review'] as const
+
+/** New jobs land on a nightly window rather than on nothing or on cron. */
+const DEFAULT_SCHEDULE: Schedule = { kind: 'daily', time: '02:00' }
 
 /** How a VM job picks its members: a fixed list, or every VM carrying a tag. */
 type VMSourceMode = 'manual' | 'tag'
@@ -69,21 +83,13 @@ interface WizardState {
   agentId: ID | ''
   paths: string[]
   targetId: ID | ''
-  scheduleMode: ScheduleMode
-  cron: string
+  schedule: Schedule
   retention: number
   enabled: boolean
 }
 
 function vmKey(hostId: ID, vmid: number): string {
   return `${String(hostId)}:${vmid}`
-}
-
-function scheduleModeOf(schedule: string): ScheduleMode {
-  if (!schedule || schedule === 'manual') return 'manual'
-  const entry = Object.entries(CRON_PRESETS).find(([, cron]) => cron === schedule.trim())
-  if (entry) return entry[0] as ScheduleMode
-  return 'custom'
 }
 
 function initialState(
@@ -104,8 +110,7 @@ function initialState(
       agentId: agentSource?.agentId ?? '',
       paths: agentSource?.paths ?? [],
       targetId: editJob.targetId,
-      scheduleMode: scheduleModeOf(editJob.schedule),
-      cron: scheduleModeOf(editJob.schedule) === 'custom' ? editJob.schedule : '',
+      schedule: parseSchedule(editJob.schedule),
       retention: editJob.retention,
       enabled: editJob.enabled,
     }
@@ -120,8 +125,7 @@ function initialState(
     agentId: '',
     paths: [],
     targetId: '',
-    scheduleMode: 'daily',
-    cron: '',
+    schedule: DEFAULT_SCHEDULE,
     retention: 7,
     enabled: true,
   }
@@ -229,6 +233,7 @@ export function JobWizard({
   editJob?: Job | null
 }) {
   const toast = useToast()
+  const timezone = useServerTimezone(open)
   const [step, setStep] = useState(0)
   const [state, setState] = useState<WizardState>(() => initialState(editJob, initialVM, vms))
   const [pathDraft, setPathDraft] = useState('')
@@ -249,12 +254,7 @@ export function JobWizard({
 
   const patch = (next: Partial<WizardState>) => setState((current) => ({ ...current, ...next }))
 
-  const schedule =
-    state.scheduleMode === 'manual'
-      ? 'manual'
-      : state.scheduleMode === 'custom'
-        ? state.cron.trim()
-        : CRON_PRESETS[state.scheduleMode]
+  const schedule = state.schedule
 
   const selectedKeys = useMemo(
     () => new Set(state.selectedVMs.map((vm) => vmKey(vm.hostId, vm.vmid))),
@@ -276,6 +276,8 @@ export function JobWizard({
   const selectedTarget = targets.find((target) => String(target.id) === String(state.targetId))
   const selectedAgent = agents.find((agent) => String(agent.id) === String(state.agentId))
 
+  const nextRunPreview = useMemo(() => nextRunOf(schedule, timezone), [schedule, timezone])
+
   const availableTags = useMemo(() => allTagsOf(vms), [vms])
   const tagMatches = useMemo(
     () => (state.tagFilter ? vmsWithTag(vms, state.tagFilter) : []),
@@ -292,8 +294,7 @@ export function JobWizard({
       case 1:
         return state.targetId !== ''
       case 2:
-        if (state.scheduleMode === 'custom') return isValidCron(state.cron)
-        return true
+        return isScheduleComplete(state.schedule)
       case 3:
         return Number.isFinite(state.retention) && state.retention >= 1
       default:
@@ -356,7 +357,9 @@ export function JobWizard({
         await createJob(payload)
         toast.success(
           `Job “${payload.name}” created.`,
-          schedule === 'manual' ? 'Run it from the Backup Jobs page.' : describeSchedule(schedule),
+          schedule.kind === 'manual'
+            ? 'Run it from the Backup Jobs page.'
+            : describeSchedule(schedule),
         )
       }
       onSaved()
@@ -734,69 +737,11 @@ export function JobWizard({
 
       {/* Step 3 — schedule */}
       {step === 2 ? (
-        <div className="space-y-3">
-          <p className="text-xs font-medium text-slate-400">When should this job run?</p>
-          <div className="grid gap-2 sm:grid-cols-2">
-            <SelectTile
-              selected={state.scheduleMode === 'manual'}
-              onClick={() => patch({ scheduleMode: 'manual' })}
-              icon={<Check className="size-4" aria-hidden />}
-              title="Manual only"
-              description="Never runs on its own — you press Run Now."
-            />
-            <SelectTile
-              selected={state.scheduleMode === 'hourly'}
-              onClick={() => patch({ scheduleMode: 'hourly' })}
-              icon={<Check className="size-4" aria-hidden />}
-              title="Hourly"
-              description="Every hour, on the hour — cron 0 * * * *"
-            />
-            <SelectTile
-              selected={state.scheduleMode === 'daily'}
-              onClick={() => patch({ scheduleMode: 'daily' })}
-              icon={<Check className="size-4" aria-hidden />}
-              title="Daily at 02:00"
-              description="Overnight window — cron 0 2 * * *"
-            />
-            <SelectTile
-              selected={state.scheduleMode === 'weekly'}
-              onClick={() => patch({ scheduleMode: 'weekly' })}
-              icon={<Check className="size-4" aria-hidden />}
-              title="Weekly, Sunday 03:00"
-              description="Once a week — cron 0 3 * * 0"
-            />
-          </div>
-
-          <SelectTile
-            selected={state.scheduleMode === 'custom'}
-            onClick={() => patch({ scheduleMode: 'custom' })}
-            icon={<Check className="size-4" aria-hidden />}
-            title="Custom cron expression"
-            description="Five fields: minute, hour, day of month, month, day of week."
-          />
-
-          {state.scheduleMode === 'custom' ? (
-            <Field
-              label="Cron expression"
-              error={
-                state.cron.trim() && !isValidCron(state.cron)
-                  ? 'Enter five space-separated cron fields.'
-                  : undefined
-              }
-              hint="Example: 30 1 * * 1-5 — 01:30, Monday through Friday."
-            >
-              {({ id }) => (
-                <Input
-                  id={id}
-                  value={state.cron}
-                  placeholder="0 2 * * *"
-                  className="font-mono"
-                  onChange={(event) => patch({ cron: event.target.value })}
-                />
-              )}
-            </Field>
-          ) : null}
-        </div>
+        <ScheduleEditor
+          value={state.schedule}
+          onChange={(next) => patch({ schedule: next })}
+          timezone={timezone}
+        />
       ) : null}
 
       {/* Step 4 — retention */}
@@ -871,7 +816,20 @@ export function JobWizard({
                 ),
               },
               { label: 'Target', value: selectedTarget?.name ?? '—' },
-              { label: 'Schedule', value: describeSchedule(schedule) },
+              {
+                label: 'Schedule',
+                value: (
+                  <span className="inline-flex flex-wrap items-baseline gap-x-2">
+                    {describeSchedule(schedule)}
+                    {nextRunPreview ? (
+                      <span className="text-xs text-slate-500">
+                        next run <Num>{formatWallClock(nextRunPreview)}</Num>
+                        {timezone ? ` (${timezone})` : ''}
+                      </span>
+                    ) : null}
+                  </span>
+                ),
+              },
               { label: 'Retention', value: `Keep last ${state.retention}` },
             ].map((row) => (
               <div key={row.label} className="flex gap-4 px-4 py-2.5">

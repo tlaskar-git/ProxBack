@@ -237,7 +237,7 @@ export function DeployHelperModal({
 
         {log.length > 0 ? (
           <div className="space-y-1 rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3">
-            <p className="flex items-center gap-2 text-[11px] tracking-wide text-slate-500 uppercase">
+            <p className="eyebrow flex items-center gap-2">
               <Terminal className="size-3.5" aria-hidden />
               Deployment log
             </p>

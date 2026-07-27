@@ -194,6 +194,23 @@ CREATE TABLE IF NOT EXISTS job_runs (
 CREATE INDEX IF NOT EXISTS idx_runs_job ON job_runs(job_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON job_runs(started_at DESC);
 
+CREATE TABLE IF NOT EXISTS run_sources (
+	run_id          TEXT NOT NULL,
+	seq             INTEGER NOT NULL,
+	name            TEXT NOT NULL,
+	kind            TEXT NOT NULL,
+	node            TEXT NOT NULL DEFAULT '',
+	status          TEXT NOT NULL DEFAULT 'pending',
+	size_bytes      INTEGER NOT NULL DEFAULT 0,
+	bytes_processed INTEGER NOT NULL DEFAULT 0,
+	bytes_uploaded  INTEGER NOT NULL DEFAULT 0,
+	started_at      TEXT,
+	finished_at     TEXT,
+	error           TEXT,
+	PRIMARY KEY (run_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_run_sources_run ON run_sources(run_id);
+
 CREATE TABLE IF NOT EXISTS run_log (
 	id     INTEGER PRIMARY KEY AUTOINCREMENT,
 	run_id TEXT NOT NULL,
@@ -261,7 +278,55 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.backfillChunkAddedAt(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateJobSchedules(ctx); err != nil {
+		return err
+	}
 	return s.normalizeTimestamps(ctx)
+}
+
+// migrateJobSchedules converts jobs written before v0.4.0, whose schedule column
+// held "manual" or a bare cron expression, into the structured schedule object.
+// A cron a preset can express becomes that preset; anything else becomes an
+// advanced schedule with the expression preserved, so no job's timing changes.
+// Rows already holding the JSON object are left alone, which makes the pass
+// idempotent — it runs on every open.
+func (s *Store) migrateJobSchedules(ctx context.Context) error {
+	type conversion struct{ id, schedule string }
+	// The whole set is collected before anything is written: the pool is limited
+	// to a single connection, so updating while a query is still open deadlocks.
+	var pending []conversion
+	rows, err := s.db.QueryContext(ctx, `SELECT id, schedule FROM jobs`)
+	if err != nil {
+		return fmt.Errorf("migrate job schedules: %w", err)
+	}
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return fmt.Errorf("migrate job schedules: %w", err)
+		}
+		if strings.HasPrefix(strings.TrimSpace(raw), "{") {
+			continue
+		}
+		encoded, err := encodeSchedule(ParseLegacySchedule(raw))
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, conversion{id: id, schedule: encoded})
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return fmt.Errorf("migrate job schedules: %w", err)
+	}
+	for _, c := range pending {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE jobs SET schedule = ? WHERE id = ?`, c.schedule, c.id); err != nil {
+			return fmt.Errorf("migrate job schedules: %w", err)
+		}
+	}
+	return nil
 }
 
 // sortedTimeColumns are the TEXT timestamp columns SQLite orders or compares as

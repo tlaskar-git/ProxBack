@@ -218,11 +218,13 @@ func trimSpace(b []byte) []byte {
 
 // Job is a backup job definition.
 type Job struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	Kind      string     `json:"kind"` // vm | agent
-	TargetID  string     `json:"targetId"`
-	Schedule  string     `json:"schedule"` // "manual" or a 5 field cron spec
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"` // vm | agent
+	TargetID string `json:"targetId"`
+	// Schedule is the structured schedule; the cron expression the scheduler
+	// runs on is derived from it by Schedule.Cron().
+	Schedule  Schedule   `json:"schedule"`
 	Retention int        `json:"retention"`
 	Enabled   bool       `json:"enabled"`
 	Sources   JobSources `json:"sources"`
@@ -263,6 +265,51 @@ type JobRun struct {
 	Error          string     `json:"error,omitempty"`
 	ProgressPct    float64    `json:"progressPct"`
 	CurrentStep    string     `json:"currentStep"`
+}
+
+// RunSource is one object a run walks — a VM for an agentless job, an agent for
+// a file-level one. The rows are written as the run progresses, so a run of 8
+// VMs shows 8 rows advancing independently and the monitor can draw them.
+type RunSource struct {
+	// RunID is the owning run; it is not part of the API shape, which always
+	// appears nested inside its run.
+	RunID string `json:"-"`
+	// Seq is the source's position in the run, starting at 0.
+	Seq            int        `json:"seq"`
+	Name           string     `json:"name"`
+	Kind           string     `json:"kind"` // vm | agent
+	Node           string     `json:"node,omitempty"`
+	Status         string     `json:"status"`
+	BytesProcessed int64      `json:"bytesProcessed"`
+	BytesUploaded  int64      `json:"bytesUploaded"`
+	SizeBytes      int64      `json:"sizeBytes"`
+	ProgressPct    float64    `json:"progressPct"`
+	StartedAt      *time.Time `json:"startedAt,omitempty"`
+	FinishedAt     *time.Time `json:"finishedAt,omitempty"`
+	Error          string     `json:"error,omitempty"`
+}
+
+// progress derives the source's completion percentage. It is computed rather
+// than stored: the inputs are already in the row, and a finished source is 100%
+// whatever its size estimate turned out to be.
+func (s RunSource) progress() float64 {
+	switch s.Status {
+	case SourceSuccess:
+		return 100
+	case SourcePending:
+		return 0
+	}
+	if s.SizeBytes <= 0 {
+		return 0
+	}
+	pct := float64(s.BytesProcessed) / float64(s.SizeBytes) * 100
+	if pct > 100 {
+		return 100
+	}
+	if pct < 0 {
+		return 0
+	}
+	return pct
 }
 
 // RunLogLine is one line of a run's persisted activity log.

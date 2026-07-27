@@ -14,15 +14,18 @@ import (
 )
 
 type jobDTO struct {
-	ID         string           `json:"id"`
-	Name       string           `json:"name"`
-	Kind       string           `json:"kind"`
-	TargetID   string           `json:"targetId"`
-	TargetName string           `json:"targetName"`
-	Schedule   string           `json:"schedule"`
-	Retention  int              `json:"retention"`
-	Enabled    bool             `json:"enabled"`
-	Sources    store.JobSources `json:"sources"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	TargetID   string `json:"targetId"`
+	TargetName string `json:"targetName"`
+	// Schedule is always the structured object, whatever form it was sent in.
+	Schedule store.Schedule `json:"schedule"`
+	// ScheduleLabel is the rendered English summary the UI shows verbatim.
+	ScheduleLabel string           `json:"scheduleLabel"`
+	Retention     int              `json:"retention"`
+	Enabled       bool             `json:"enabled"`
+	Sources       store.JobSources `json:"sources"`
 	// TagFilter is null when the job uses its static source list.
 	TagFilter *string `json:"tagFilter"`
 	// NextRun is null for manual schedules and disabled jobs.
@@ -44,8 +47,9 @@ func (s *Server) jobDTOs(r *http.Request, jobs []*store.Job) ([]jobDTO, error) {
 	for _, j := range jobs {
 		d := jobDTO{
 			ID: j.ID, Name: j.Name, Kind: j.Kind, TargetID: j.TargetID,
-			TargetName: names[j.TargetID], Schedule: j.Schedule,
-			Retention: j.Retention, Enabled: j.Enabled, Sources: j.Sources,
+			TargetName: names[j.TargetID], Schedule: j.Schedule.Normalized(),
+			ScheduleLabel: j.Schedule.Label(),
+			Retention:     j.Retention, Enabled: j.Enabled, Sources: j.Sources,
 			NextRun: sched.NextRun(j.Schedule, j.Enabled, now),
 		}
 		if j.TagFilter != "" {
@@ -83,10 +87,12 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 type jobRequest struct {
-	Name      *string           `json:"name"`
-	Kind      *string           `json:"kind"`
-	TargetID  *string           `json:"targetId"`
-	Schedule  *string           `json:"schedule"`
+	Name     *string `json:"name"`
+	Kind     *string `json:"kind"`
+	TargetID *string `json:"targetId"`
+	// Schedule accepts the structured object and, for existing automation, the
+	// bare string earlier releases took ("manual" or a cron expression).
+	Schedule  *store.Schedule   `json:"schedule"`
 	Retention *int              `json:"retention"`
 	Enabled   *bool             `json:"enabled"`
 	Sources   *store.JobSources `json:"sources"`
@@ -141,7 +147,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	job := &store.Job{Schedule: sched.ManualSchedule, Retention: 7, Enabled: true}
+	job := &store.Job{Schedule: store.ManualSchedule(), Retention: 7, Enabled: true}
 	if body.Name != nil {
 		job.Name = strings.TrimSpace(*body.Name)
 	}
@@ -151,7 +157,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if body.TargetID != nil {
 		job.TargetID = *body.TargetID
 	}
-	if body.Schedule != nil && *body.Schedule != "" {
+	if body.Schedule != nil {
 		job.Schedule = *body.Schedule
 	}
 	if body.Retention != nil {
@@ -182,7 +188,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := sched.ValidateSchedule(job.Schedule); err != nil {
+	if err := job.Schedule.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -222,10 +228,7 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 		job.TargetID = *body.TargetID
 	}
 	if body.Schedule != nil {
-		job.Schedule = *body.Schedule
-		if job.Schedule == "" {
-			job.Schedule = sched.ManualSchedule
-		}
+		job.Schedule = body.Schedule.Normalized()
 	}
 	if body.Retention != nil {
 		job.Retention = *body.Retention
@@ -253,7 +256,7 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := sched.ValidateSchedule(job.Schedule); err != nil {
+	if err := job.Schedule.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -320,13 +323,56 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, runs)
 }
 
+// runDetailDTO is one run plus the per-object breakdown that drives the visual
+// monitor. The list endpoint deliberately does not carry it: a run of 8 VMs
+// costs 8 extra rows, and the list is polled every two seconds.
+type runDetailDTO struct {
+	*store.JobRun
+	// Sources is always an array, empty for restores and verifications.
+	Sources []store.RunSource `json:"sources"`
+	// ThroughputBps is the run's current speed over the last sample window, 0
+	// when the run is not in flight.
+	ThroughputBps float64 `json:"throughputBps"`
+}
+
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
-	run, err := s.st.RunByID(r.Context(), chi.URLParam(r, "id"))
+	id := chi.URLParam(r, "id")
+	run, err := s.st.RunByID(r.Context(), id)
 	if err != nil {
 		s.notFoundOr(w, err, "run")
 		return
 	}
-	writeJSON(w, http.StatusOK, run)
+	sources, err := s.st.RunSources(r.Context(), id)
+	if err != nil {
+		s.serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, runDetailDTO{
+		JobRun:        run,
+		Sources:       sources,
+		ThroughputBps: s.sched.ThroughputBps(id),
+	})
+}
+
+// handleRetryRun re-runs the job a run belongs to. It goes through the normal
+// trigger path, so the retry uses the job as it stands now and obeys the same
+// "one run per job" rule as a manual start.
+func (s *Server) handleRetryRun(w http.ResponseWriter, r *http.Request) {
+	runID, err := s.sched.RetryRun(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		switch {
+		case errors.Is(err, sched.ErrAlreadyRunning):
+			writeError(w, http.StatusConflict, "job is already running")
+		case errors.Is(err, sched.ErrNoJob):
+			writeError(w, http.StatusNotFound, "this run has no job to re-run")
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "run not found")
+		default:
+			s.serverError(w, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"runId": runID})
 }
 
 // handleRunLog serves a run's persisted activity log. The lines array is always

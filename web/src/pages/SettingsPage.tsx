@@ -139,11 +139,11 @@ function SoftwareUpdateCard() {
           <>
             <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
               <div>
-                <div className="text-[11px] tracking-wide text-slate-500 uppercase">Installed</div>
+                <div className="eyebrow">Installed</div>
                 <div className="font-mono text-slate-200">v{status.currentVersion}</div>
               </div>
               <div>
-                <div className="text-[11px] tracking-wide text-slate-500 uppercase">Latest</div>
+                <div className="eyebrow">Latest</div>
                 <div className="font-mono text-slate-200">
                   {status.latestVersion ? `v${status.latestVersion}` : '— none published'}
                 </div>
@@ -795,6 +795,18 @@ export function SettingsPage() {
                 />
               )}
             </Field>
+
+            <div className="flex items-baseline justify-between gap-4 rounded-lg border border-slate-800 bg-slate-950/40 px-4 py-2.5">
+              <div className="min-w-0">
+                <p className="eyebrow">Time zone</p>
+                <p className="mt-0.5 text-meta text-slate-500">
+                  Every job schedule fires in this zone. Set on the server, read-only here.
+                </p>
+              </div>
+              <span className="shrink-0 font-mono text-[13px] text-slate-300">
+                {data?.timezone || 'server local'}
+              </span>
+            </div>
 
             <SectionNote>
               Higher concurrency finishes large jobs sooner but puts more read pressure on your

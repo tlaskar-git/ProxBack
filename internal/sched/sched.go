@@ -31,10 +31,10 @@ var (
 	ErrAlreadyRunning = errors.New("sched: job already running")
 	// ErrNotRunning is returned when cancelling a run that is not in progress.
 	ErrNotRunning = errors.New("sched: run is not in progress")
+	// ErrNoJob is returned when retrying a run that belongs to no job — a
+	// restore or a verification, which has nothing to re-run.
+	ErrNoJob = errors.New("sched: run has no job to re-run")
 )
-
-// ManualSchedule marks a job that is never scheduled automatically.
-const ManualSchedule = "manual"
 
 // AgentDispatchTimeout bounds how long a run waits for an agent to pick up work.
 const AgentDispatchTimeout = 5 * time.Minute
@@ -67,6 +67,9 @@ type Manager struct {
 	// verifying maps a backup id to the id of the verify run in flight for it,
 	// so a second verify of the same restore point is rejected.
 	verifying map[string]string
+	// monitors holds the live per-source and throughput state of the runs in
+	// flight, keyed by run id. A run has an entry exactly while it is running.
+	monitors map[string]*runMonitor
 }
 
 // New builds a scheduler manager.
@@ -85,6 +88,7 @@ func New(st *store.Store, agents *agentmgr.Manager, log *slog.Logger) *Manager {
 		entries:      map[string]cron.EntryID{},
 		targetActive: map[string]int{},
 		verifying:    map[string]string{},
+		monitors:     map[string]*runMonitor{},
 	}
 	m.cron = cron.New(cron.WithLogger(cron.DiscardLogger))
 	return m
@@ -94,6 +98,11 @@ func New(st *store.Store, agents *agentmgr.Manager, log *slog.Logger) *Manager {
 func (m *Manager) Start(ctx context.Context) error {
 	m.baseCtx, m.stopBase = context.WithCancel(context.WithoutCancel(ctx))
 	if err := m.st.MarkOrphanRunsFailed(ctx); err != nil {
+		return err
+	}
+	// Their per-source rows go with them: nothing may still look like it is
+	// backing up after the process that was doing it has gone.
+	if err := m.st.SkipOrphanRunSources(ctx); err != nil {
 		return err
 	}
 	settings, err := m.st.Settings(ctx)
@@ -152,13 +161,19 @@ func (m *Manager) ReloadSchedules(ctx context.Context) error {
 	m.mu.Unlock()
 
 	for _, j := range jobs {
-		if !j.Enabled || j.Schedule == "" || j.Schedule == ManualSchedule {
+		spec := j.Schedule.Cron()
+		if !j.Enabled || spec == "" {
 			continue
 		}
 		jobID := j.ID
 		name := j.Name
-		spec := j.Schedule
+		schedule := j.Schedule
 		id, err := m.cron.AddFunc(spec, func() {
+			// A monthly "last day" schedule fires on every day that could be the
+			// last one; ShouldRun discards the ones that are not.
+			if !schedule.ShouldRun(time.Now()) {
+				return
+			}
 			if _, err := m.TriggerJob(m.baseContext(), jobID); err != nil {
 				if errors.Is(err, ErrAlreadyRunning) {
 					m.log.Warn("scheduled run skipped, already running", "job", name)
@@ -178,34 +193,38 @@ func (m *Manager) ReloadSchedules(ctx context.Context) error {
 	return nil
 }
 
-// ValidateSchedule checks a cron spec (or "manual").
-func ValidateSchedule(spec string) error {
-	if spec == "" || spec == ManualSchedule {
-		return nil
-	}
-	if _, err := cron.ParseStandard(spec); err != nil {
-		return fmt.Errorf("invalid schedule %q: %w", spec, err)
-	}
-	return nil
-}
+// nextRunProbes bounds the search for the next real firing. Only the monthly
+// last-day schedule ever skips a candidate, and it can skip at most the three
+// days between the 28th and the month's last day.
+const nextRunProbes = 8
 
 // NextRun returns the next time a schedule fires, in UTC. It is nil for manual
-// schedules, disabled jobs and specs the cron parser rejects — exactly the cases
-// where the API contract asks for a null nextRun.
-func NextRun(schedule string, enabled bool, now time.Time) *time.Time {
-	if !enabled || schedule == "" || schedule == ManualSchedule {
+// schedules, disabled jobs and schedules whose expression the cron parser
+// rejects — exactly the cases where the API contract asks for a null nextRun.
+//
+// Times are computed in the server's local zone, which is what the structured
+// schedule means by "02:00"; the answer is converted to UTC for the wire.
+func NextRun(schedule store.Schedule, enabled bool, now time.Time) *time.Time {
+	spec := schedule.Cron()
+	if !enabled || spec == "" {
 		return nil
 	}
-	spec, err := cron.ParseStandard(schedule)
+	parsed, err := cron.ParseStandard(spec)
 	if err != nil {
 		return nil
 	}
-	next := spec.Next(now)
-	if next.IsZero() {
-		return nil
+	next := now.Local()
+	for i := 0; i < nextRunProbes; i++ {
+		next = parsed.Next(next)
+		if next.IsZero() {
+			return nil
+		}
+		if schedule.ShouldRun(next) {
+			utc := next.UTC()
+			return &utc
+		}
 	}
-	utc := next.UTC()
-	return &utc
+	return nil
 }
 
 func (m *Manager) baseContext() context.Context {
@@ -244,6 +263,21 @@ func (m *Manager) TriggerJob(ctx context.Context, jobID string) (string, error) 
 		return m.executeBackup(runCtx, run, job)
 	}, nil)
 	return run.ID, nil
+}
+
+// RetryRun re-runs the job a finished (or failed) run belongs to, through the
+// normal trigger path — so it honours the concurrency limit, the run queue and
+// the job's current definition rather than replaying the old run. Restore and
+// verification runs have no job behind them and answer ErrNoJob.
+func (m *Manager) RetryRun(ctx context.Context, runID string) (string, error) {
+	run, err := m.st.RunByID(ctx, runID)
+	if err != nil {
+		return "", err
+	}
+	if run.JobID == "" {
+		return "", ErrNoJob
+	}
+	return m.TriggerJob(ctx, run.JobID)
 }
 
 // VMRestoreTarget is where a VM restore should be written.
@@ -362,6 +396,7 @@ func (m *Manager) launch(run *store.JobRun, notifyKind string, fn func(context.C
 	runCtx, cancel := context.WithCancel(m.baseContext())
 	m.mu.Lock()
 	m.cancels[run.ID] = cancel
+	m.monitors[run.ID] = newRunMonitor(m.st, m.log, run.ID)
 	m.mu.Unlock()
 
 	m.logRun(runCtx, run.ID, "%s run queued for %q", notifyKind, run.JobName)
@@ -408,6 +443,15 @@ func (m *Manager) detached() context.Context {
 
 func (m *Manager) finish(runID, notifyKind string, stats *engine.Stats, runErr error) {
 	ctx := m.detached()
+	// The run is over: nothing it never reached may stay pending, and the live
+	// throughput sample goes with the monitor (0 once the run is not running).
+	m.mu.Lock()
+	mon := m.monitors[runID]
+	delete(m.monitors, runID)
+	m.mu.Unlock()
+	if mon != nil {
+		mon.closeOut(ctx)
+	}
 	cur, err := m.st.RunByID(ctx, runID)
 	if err != nil {
 		m.log.Error("could not load run to finish it", "run", runID, "error", err)

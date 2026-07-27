@@ -100,13 +100,67 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- settings
 
+// settingsDTO is the stored settings plus the read-only facts about the server
+// the UI needs to explain them. Schedules are expressed in the server's local
+// zone, so the UI has to be able to say which one that is.
+type settingsDTO struct {
+	store.Settings
+	// Timezone is the server's local zone name, e.g. "Europe/London". It is
+	// read-only: PUT ignores it.
+	Timezone string `json:"timezone"`
+}
+
+func (s *Server) settingsDTO(settings store.Settings) settingsDTO {
+	return settingsDTO{Settings: settings, Timezone: localTimezone()}
+}
+
+// localTimezone names the zone the server schedules jobs in. Go's time.Local is
+// called "Local" when the zone came from /etc/localtime rather than from $TZ, so
+// the IANA name is recovered from the usual system files; the zone abbreviation
+// is the last resort (which is what a Windows host reports).
+func localTimezone() string {
+	if name := time.Local.String(); name != "" && name != "Local" && name != "UTC" {
+		return name
+	}
+	if link, err := os.Readlink("/etc/localtime"); err == nil {
+		if name := zoneNameFromPath(link); name != "" {
+			return name
+		}
+	}
+	if raw, err := os.ReadFile("/etc/timezone"); err == nil {
+		if name := strings.TrimSpace(string(raw)); name != "" {
+			return name
+		}
+	}
+	if name := time.Local.String(); name != "" {
+		return name
+	}
+	zone, _ := time.Now().Zone()
+	if zone == "" {
+		return "UTC"
+	}
+	return zone
+}
+
+// zoneNameFromPath extracts "Europe/London" from a zoneinfo path such as
+// /usr/share/zoneinfo/Europe/London.
+func zoneNameFromPath(p string) string {
+	p = filepath.ToSlash(p)
+	const marker = "zoneinfo/"
+	i := strings.LastIndex(p, marker)
+	if i < 0 {
+		return ""
+	}
+	return strings.Trim(p[i+len(marker):], "/")
+}
+
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	settings, err := s.st.Settings(r.Context())
 	if err != nil {
 		s.serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, s.settingsDTO(settings))
 }
 
 func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
@@ -185,7 +239,7 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.sched.SetConcurrency(saved.Concurrency)
-	writeJSON(w, http.StatusOK, saved)
+	writeJSON(w, http.StatusOK, s.settingsDTO(saved))
 }
 
 // validateWebhookURL keeps the stored value to something the notifier can

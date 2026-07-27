@@ -142,7 +142,7 @@ func TestRunLogRecordsABackupRun(t *testing.T) {
 
 	job, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "nightly-vms", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: ManualSchedule, Retention: 1, Enabled: true,
+		Schedule: store.ManualSchedule(), Retention: 1, Enabled: true,
 		Sources: store.JobSources{{HostID: h.host.ID, VMID: 100, Name: "web-01"}},
 	})
 	if err != nil {
@@ -237,7 +237,7 @@ func TestUnsuccessfulRunDoesNotCollectOrphanChunks(t *testing.T) {
 	// A run that fails before writing any manifest.
 	failing, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "staging-tagged", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: ManualSchedule, Retention: 2, Enabled: true, TagFilter: "staging",
+		Schedule: store.ManualSchedule(), Retention: 2, Enabled: true, TagFilter: "staging",
 	})
 	if err != nil {
 		t.Fatalf("create failing job: %v", err)
@@ -256,7 +256,7 @@ func TestUnsuccessfulRunDoesNotCollectOrphanChunks(t *testing.T) {
 	// does not disable it.
 	good, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "nightly-vms", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: ManualSchedule, Retention: 2, Enabled: true,
+		Schedule: store.ManualSchedule(), Retention: 2, Enabled: true,
 		Sources: store.JobSources{{HostID: h.host.ID, VMID: 100, Name: "web-01"}},
 	})
 	if err != nil {
@@ -278,7 +278,7 @@ func TestRunLogRecordsAFailure(t *testing.T) {
 
 	job, err := h.st.CreateJob(ctx, &store.Job{
 		Name: "staging-tagged", Kind: store.SourceVM, TargetID: h.target.ID,
-		Schedule: ManualSchedule, Retention: 2, Enabled: true, TagFilter: "staging",
+		Schedule: store.ManualSchedule(), Retention: 2, Enabled: true, TagFilter: "staging",
 	})
 	if err != nil {
 		t.Fatalf("create job: %v", err)

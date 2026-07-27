@@ -57,27 +57,35 @@ const NAV_GROUPS: { heading: string; items: NavItem[] }[] = [
 
 function Brand() {
   return (
-    <div className="flex items-center gap-2.5 px-5 py-5">
-      <div className="flex size-8 items-center justify-center rounded-lg bg-accent-500/15 text-accent-400 ring-1 ring-accent-500/30">
-        <ShieldCheck className="size-[18px]" aria-hidden />
+    <div className="flex h-14 items-center gap-2.5 border-b border-slate-800/80 px-4">
+      <div className="flex size-7 items-center justify-center rounded-md bg-accent-500/15 text-accent-400 ring-1 ring-accent-500/30">
+        <ShieldCheck className="size-4" aria-hidden />
       </div>
-      <div className="leading-tight">
-        <p className="text-sm font-semibold tracking-tight text-white">ProxBack</p>
-        <p className="text-[11px] text-slate-500">Proxmox VE backup</p>
+      <div className="leading-none">
+        <p className="text-[13px] font-semibold tracking-tight text-white">ProxBack</p>
+        <p className="mt-1 text-micro text-slate-500">Proxmox VE backup</p>
       </div>
     </div>
   )
 }
 
+/**
+ * Dense nav: 32px rows, a section rule instead of a floating caption, and an
+ * active state that is a filled slab with a hard accent edge — visible from
+ * the far side of the screen, unlike a tint alone.
+ */
 function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
   return (
-    <nav className="flex-1 space-y-6 overflow-y-auto px-3 pb-6">
-      {NAV_GROUPS.map((group) => (
-        <div key={group.heading}>
-          <p className="px-2 pb-2 text-[10px] font-semibold tracking-[0.12em] text-slate-600 uppercase">
-            {group.heading}
-          </p>
-          <ul className="space-y-0.5">
+    <nav className="flex-1 overflow-y-auto px-2.5 py-3">
+      {NAV_GROUPS.map((group, index) => (
+        <div key={group.heading} className={cn(index > 0 && 'mt-5')}>
+          <div className="mb-1.5 flex items-center gap-2 px-2">
+            <span className="text-micro font-semibold tracking-[0.14em] text-slate-600 uppercase">
+              {group.heading}
+            </span>
+            <span className="h-px flex-1 bg-slate-800/70" aria-hidden />
+          </div>
+          <ul>
             {group.items.map((item) => (
               <li key={item.to}>
                 <NavLink
@@ -86,10 +94,10 @@ function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
                   onClick={onNavigate}
                   className={({ isActive }) =>
                     cn(
-                      'group relative flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors duration-150',
+                      'group relative flex h-8 items-center gap-2.5 rounded-md px-2.5 text-[13px] transition-colors duration-150',
                       isActive
-                        ? 'bg-accent-500/10 font-medium text-accent-200 before:absolute before:top-1/2 before:left-0 before:h-4 before:w-0.5 before:-translate-y-1/2 before:rounded-full before:bg-accent-400'
-                        : 'text-slate-400 hover:bg-slate-800/60 hover:text-slate-100',
+                        ? 'bg-slate-800/80 font-medium text-white before:absolute before:top-1.5 before:bottom-1.5 before:-left-2.5 before:w-[3px] before:rounded-r-full before:bg-accent-400'
+                        : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-100',
                     )
                   }
                 >
@@ -127,13 +135,13 @@ export function Layout() {
   return (
     <div className="flex min-h-full bg-slate-950">
       {/* Desktop sidebar */}
-      <aside className="fixed inset-y-0 left-0 hidden w-64 flex-col border-r border-slate-800 bg-slate-900/50 lg:flex">
+      <aside className="fixed inset-y-0 left-0 hidden w-56 flex-col border-r border-slate-800/90 bg-slate-900/45 lg:flex">
         <Brand />
         <SidebarNav />
-        <div className="flex items-center justify-between gap-2 border-t border-slate-800 px-5 py-3">
-          <p className="truncate text-[11px] text-slate-600">Signed in as {user.username}</p>
+        <div className="flex items-center justify-between gap-2 border-t border-slate-800/80 px-4 py-2.5">
+          <p className="truncate text-micro text-slate-600">Signed in as {user.username}</p>
           {serverVersion ? (
-            <span className="shrink-0 font-mono text-[10px] text-slate-600" title="Server version">
+            <span className="shrink-0 font-mono text-micro text-slate-600" title="Server version">
               v{serverVersion}
             </span>
           ) : null}
@@ -149,15 +157,15 @@ export function Layout() {
             onClick={() => setDrawerOpen(false)}
             className="pb-overlay-in absolute inset-0 cursor-default bg-slate-950/80 backdrop-blur-sm"
           />
-          <aside className="pb-modal-in relative flex h-full w-64 flex-col border-r border-slate-800 bg-slate-900">
+          <aside className="pb-modal-in relative flex h-full w-56 flex-col border-r border-slate-800 bg-slate-900">
             <Brand />
             <SidebarNav onNavigate={() => setDrawerOpen(false)} />
           </aside>
         </div>
       ) : null}
 
-      <div className="flex min-w-0 flex-1 flex-col lg:pl-64">
-        <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-slate-800 bg-slate-950/85 px-4 backdrop-blur-md sm:px-6">
+      <div className="flex min-w-0 flex-1 flex-col lg:pl-56">
+        <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-slate-800/90 bg-slate-950/85 px-4 backdrop-blur-md sm:px-6">
           <button
             type="button"
             onClick={() => setDrawerOpen(true)}
@@ -167,15 +175,15 @@ export function Layout() {
             {drawerOpen ? <X className="size-[18px]" aria-hidden /> : <Menu className="size-[18px]" aria-hidden />}
           </button>
 
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="truncate text-sm font-medium text-slate-200">{serverName}</span>
-            <span className="hidden rounded-full border border-slate-800 bg-slate-900 px-2 py-0.5 text-[10px] tracking-wide text-slate-500 uppercase sm:inline">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <span className="truncate text-[13px] font-medium text-slate-200">{serverName}</span>
+            <span className="hidden rounded border border-slate-800 bg-slate-900 px-1.5 py-0.5 text-micro tracking-[0.1em] text-slate-500 uppercase sm:inline">
               Backup server
             </span>
           </div>
 
           <div className="ml-auto flex items-center gap-2">
-            <span className="hidden text-xs text-slate-500 sm:inline">{user.username}</span>
+            <span className="hidden text-meta text-slate-500 sm:inline">{user.username}</span>
             <Button size="sm" icon={<LogOut className="size-3.5" aria-hidden />} onClick={signOut}>
               Sign out
             </Button>

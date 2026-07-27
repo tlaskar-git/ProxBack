@@ -1,200 +1,219 @@
+<div align="center">
+
 # ProxBack
 
-ProxBack is a self-hosted, Veeam-style backup platform for [Proxmox VE](https://www.proxmox.com/):
+**Backup and recovery for Proxmox VE.**
 
-- **Agentless VM backup** of Windows and Linux VMs via the Proxmox API (snapshot → disk
-  export), plus **optional in-guest agents** for file-level backup of individual machines.
-- **Incremental forever** — 4 MiB content chunks with SHA-256 deduplication. Unchanged data
-  is never uploaded twice, and every restore point is self-contained via its manifest.
-- **Fast uploads** — chunks upload in parallel (object stores charge a fixed per-object
-  latency that serial uploads pay in full) and are zstd-compressed individually, after
-  chunking, so compression never disturbs deduplication. Both are tunable, with an
-  optional bandwidth cap, under Settings → Performance.
-- **S3-compatible storage targets** — Backblaze B2, MinIO, AWS S3, or anything
-  S3-compatible (custom endpoint and path-style addressing supported).
-- **Web control panel** — a dark, button-first dashboard for hosts, VMs, backup jobs, live
-  job monitoring, restore points, storage targets, and one-click agent deployment.
-- **Tag-based grouping** — back up by Proxmox tag instead of a fixed VM list; guests
-  tagged later are picked up automatically at the next run.
-- **Restore-point verification** — one click re-downloads and SHA-256-checks every chunk
-  of a restore point, proving it is restorable without writing anywhere.
-- **Webhook notifications** — POST a JSON summary of every finished (or only failed) run
-  to ntfy, Gotify, or any automation endpoint.
-- **Single static binary** with the web UI embedded, SQLite state, systemd deployment,
-  in-app updates from GitHub releases, no Docker required.
+Image-level backup of your virtual machines, deduplicated and compressed to
+object storage, managed from one web console.
 
-## Try it in five minutes (no Proxmox needed)
+[![Release](https://img.shields.io/github/v/release/tlaskar-git/ProxBack?color=10b981)](https://github.com/tlaskar-git/ProxBack/releases)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Go](https://img.shields.io/badge/go-1.26-00ADD8)](https://go.dev)
 
-The repo ships simulators for both Proxmox and S3, so you can try the whole product on any
-machine with Go 1.26+ installed:
+</div>
+
+---
+
+## Overview
+
+ProxBack protects Proxmox VE estates without agents in every guest. It snapshots
+virtual machines through Proxmox's own tooling, splits the stream into content-addressed
+chunks, and stores only the chunks your target does not already hold. The result is a
+first backup that costs one full copy and subsequent backups that cost only what changed.
+
+It runs as a single binary with the web console built in. There is no database server to
+install, no message queue, and no agent requirement for image-level protection.
+
+## Capabilities
+
+| | |
+|---|---|
+| **Agentless VM backup** | Snapshot-consistent image backup of Windows and Linux guests through a lightweight node service. No software inside the guest. |
+| **File-level agents** | Optional in-guest agents for protecting individual directories on Windows and Linux. |
+| **Incremental forever** | 4 MiB content-addressed chunks with SHA-256 deduplication. Unchanged data is never uploaded twice; every restore point remains independently restorable. |
+| **Object storage targets** | Backblaze B2, Amazon S3, MinIO, or any S3-compatible endpoint. Credentials are encrypted at rest. |
+| **Parallel, compressed transfer** | Chunks upload concurrently and are compressed individually, after chunking, so compression never degrades deduplication. Optional bandwidth ceiling. |
+| **Policy-based grouping** | Target virtual machines by Proxmox tag. Guests tagged later join the job automatically at the next run. |
+| **Verification** | On-demand integrity checks re-read every chunk of a restore point and validate its hash, proving recoverability before you need it. |
+| **Operational visibility** | Live per-object progress, throughput, activity logs per run, and webhook notifications to any JSON endpoint. |
+| **In-place updates** | The console checks for releases and updates itself, with checksum verification and automatic rollback of the previous binary. |
+
+## Architecture
+
+```
+                    ┌──────────────────────────────┐
+   Proxmox nodes    │        ProxBack server       │      Object storage
+ ┌──────────────┐   │                              │   ┌──────────────────┐
+ │ node helper  │──▶│  chunker → dedup → compress  │──▶│  Backblaze B2    │
+ │ (vzdump)     │   │        ▲                     │   │  S3 / MinIO      │
+ └──────────────┘   │        │                     │   └──────────────────┘
+ ┌──────────────┐   │   scheduler · retention      │
+ │ guest agent  │──▶│   web console · REST API     │
+ │ (file level) │   │   SQLite state               │
+ └──────────────┘   └──────────────────────────────┘
+```
+
+The **node helper** is a small service on each Proxmox node. It streams
+`vzdump --stdout` for backup and pipes `qmrestore` for recovery, so consistency,
+storage-type support, and guest-agent quiescing are handled by Proxmox itself rather than
+reimplemented. The **server** owns chunking, deduplication, scheduling, retention, and all
+credentials — helpers and agents never see your storage keys.
+
+## Requirements
+
+- Proxmox VE 7 or later, with an API token
+- A Linux VM or container for the server (1 vCPU, 1 GB RAM, 10 GB disk is sufficient)
+- An S3-compatible bucket
+- Root SSH access to each Proxmox node, for automated helper deployment
+
+## Installation
+
+Download the latest release, then on the machine that will run the server:
+
+```bash
+curl -fsSLO https://github.com/tlaskar-git/ProxBack/releases/latest/download/proxback-server-linux-amd64
+curl -fsSLO https://github.com/tlaskar-git/ProxBack/releases/latest/download/proxback-helper-linux-amd64
+curl -fsSLO https://github.com/tlaskar-git/ProxBack/releases/latest/download/install.sh
+chmod +x install.sh && sudo ./install.sh
+```
+
+The installer creates a service account, installs to `/opt/proxback`, stores state in
+`/var/lib/proxback`, and enables the `proxback` systemd unit.
+
+Open `http://<server>:8443` and sign in with **admin** / **admin**. The console will
+require you to change the password before it stops warning you.
+
+> The server speaks plain HTTP by design. Terminate TLS with a reverse proxy, or keep it on
+> a trusted management network.
+
+## First-run configuration
+
+**1. Connect Proxmox.** In the Proxmox UI, create an API token under
+*Datacenter → Permissions → API Tokens*, then grant it a role carrying `VM.Audit`,
+`VM.Snapshot`, `VM.Backup`, and `Datastore.Audit` on path `/`:
+
+```bash
+pveum acl modify / -token 'root@pam!proxback' -role PVEVMAdmin
+```
+
+Add the host in *Proxmox Hosts → Add Host*. If the token cannot see any guests, ProxBack
+says so explicitly rather than showing an empty list.
+
+**2. Deploy node helpers.** In *Proxmox Hosts → Node helpers → Deploy helper*, choose a
+node and supply its SSH credentials. ProxBack installs and enrols the helper itself. The
+node's SSH host key fingerprint is shown for confirmation before anything executes, and
+the password is used only for that connection — it is never stored.
+
+**3. Add storage.** In *Storage Targets*, supply your bucket endpoint and keys. For
+Backblaze B2 use `https://s3.<region>.backblazeb2.com` with path-style addressing enabled.
+Every target is verified with a write/read/delete probe before it is accepted.
+
+**4. Create a backup job.** Choose virtual machines individually or by tag, pick a target,
+then set the schedule: hourly, daily, weekly on chosen days, or monthly on a chosen date,
+with the time picked directly. The console confirms in plain language — *"Runs every Sunday
+and Saturday at 02:00. Next run Saturday 1 Aug, 02:00"* — and states the server's time zone.
+Cron remains available under Advanced for unusual cadences.
+
+## Monitoring
+
+The Monitor page shows runs in flight as live sessions: overall progress, current
+throughput with a short history, elapsed and estimated remaining time, and beneath it the
+**objects in the session** — every virtual machine with its own progress, size, bytes read,
+deduplication saving, and state. Finished runs drop into a history table; opening any run
+shows the same object breakdown alongside a timestamped activity log of exactly what
+happened. Runs can be cancelled while active, retried after a failure, and removed from
+history individually or in bulk.
+
+## Recovery
+
+Restore points are listed per protected object, showing the full-to-incremental chain.
+Recovery options:
+
+- **Restore in place** — overwrite the original virtual machine.
+- **Restore alongside** — recover to a new VMID for verification or granular extraction,
+  optionally onto a different Proxmox storage.
+- **File-level restore** — for agent-protected sources, unpack to any path on the guest.
+- **Verify** — re-read and hash every chunk without writing anything, to confirm a restore
+  point is sound.
+
+Every chunk is validated against its SHA-256 during recovery; a corrupted or truncated
+transfer fails loudly rather than producing a silently damaged disk.
+
+## Configuration reference
+
+Settings live in the console under *Settings*.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| Concurrency | 2 | Backup objects processed simultaneously |
+| Parallel chunk uploads | 4 | Chunks in flight per stream. Object stores charge a fixed latency per object; overlapping uploads hides it |
+| Compression | zstd | Per-chunk compression, applied after chunking |
+| Upload limit | unlimited | Ceiling in Mbps, shared across all runs |
+| Webhook URL, Notify on | off | JSON run summaries to any endpoint |
+
+Environment overrides: `PROXBACK_UPDATE_REPO` points the updater at a different
+repository; `PROXBACK_GC_GRACE` adjusts how long unreferenced chunks are protected
+(default 24h, which is what allows an interrupted backup to resume rather than restart).
+
+## Operating notes
+
+**Interrupted backups resume.** Chunks uploaded by a run that was cancelled or failed are
+retained, so the next attempt deduplicates against them instead of starting over.
+
+**Updates respect running work.** The updater refuses to install while backups are in
+flight, since the restart would cancel them.
+
+**Retention is per job.** After each successful run, restore points beyond the keep count
+are removed and chunks referenced by no remaining restore point are collected.
+
+## Building from source
+
+Requires Go 1.26+ and Node 22+.
 
 ```bash
 git clone https://github.com/tlaskar-git/ProxBack.git
 cd ProxBack
+
+cd web && npm install && npm run build && cd ..
+rm -rf internal/api/webdist && cp -r web/dist internal/api/webdist
+
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o out/proxback-server ./cmd/proxback-server
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o out/proxback-helper ./cmd/proxback-helper
+```
+
+Run the test suite, which exercises the full stack against bundled Proxmox and S3
+simulators:
+
+```bash
+go test ./... -timeout 15m
+```
+
+To try the product without touching real infrastructure:
+
+```bash
 go run ./cmd/s3-sim  --listen :19000 &
 go run ./cmd/pve-sim --listen :18006 &
 go run ./cmd/proxback-server --listen :8443 --data ./data
 ```
 
-Open http://localhost:8443 and sign in with the default credentials — username **admin**,
-password **admin**. The UI will nag you to change the password; do that first (Settings →
-Password). Then:
-
-1. **Proxmox Hosts → Add Host** — base URL `http://127.0.0.1:18006`, token id
-   `root@pam!proxback`, any secret.
-2. **Storage Targets → Add Target** — endpoint `http://127.0.0.1:19000`, region
-   `us-east-1`, bucket `proxback`, any keys, **path-style on**.
-3. **Virtual Machines → Backup Now** on any of the simulated VMs, follow the wizard, and
-   watch the run in **Monitor**. Run it twice to see deduplication (second run uploads 0 B).
-
-## Installing on a Proxmox VM or LXC (production)
-
-ProxBack runs as a systemd service inside a Debian/Ubuntu VM or LXC on (or near) your
-Proxmox cluster.
-
-### 1. Build the binaries
-
-On any machine with **Go 1.26+** and **Node 22+**:
-
-```bash
-git clone https://github.com/tlaskar-git/ProxBack.git
-cd ProxBack
-
-# Web UI → embedded into the server binary
-cd web && npm install && npm run build && cd ..
-rm -rf internal/api/webdist && cp -r web/dist internal/api/webdist
-
-# Server (Linux) and agents (Linux + Windows)
-mkdir -p out
-GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -o out/proxback-server               ./cmd/proxback-server
-GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -o out/proxback-agent-linux-amd64    ./cmd/proxback-agent
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o out/proxback-agent-windows-amd64.exe ./cmd/proxback-agent
-```
-
-### 2. Install the server
-
-Copy `out/*` plus `deploy/install.sh` and `deploy/proxback.service` to the target machine,
-then as root:
-
-```bash
-sudo ./install.sh
-```
-
-The installer creates a `proxback` system user, installs the server to `/opt/proxback`,
-stores state in `/var/lib/proxback`, stages the agent binaries for the web UI's download
-page, and enables the `proxback` systemd service.
-
-### 3. First sign-in
-
-Open `http://<server-ip>:8443`. Sign in with **admin** / **admin**, then **change the
-password immediately** — the login page, the dashboard banner, and the server log all
-remind you until you do. Changing the password also revokes every other session.
-
-> **Security notes**
-> - The server speaks plain HTTP. Put it behind a TLS reverse proxy (nginx, Caddy,
->   Traefik) or keep it on a trusted management network.
-> - Secrets (Proxmox token secrets, S3 keys) are AES-GCM encrypted at rest with a key file
->   stored next to the database. Back up `/var/lib/proxback` if you back up the server.
-
-### 4. Connect your Proxmox host
-
-1. In the Proxmox UI: **Datacenter → Permissions → API Tokens → Add** (e.g.
-   `root@pam!proxback`). Either disable privilege separation or grant the token
-   `VM.Audit`, `VM.Snapshot`, `VM.Backup`, and `Datastore.Audit`.
-2. In ProxBack: **Proxmox Hosts → Add Host** — base URL `https://your-host:8006`, the
-   token id and secret, and enable **insecure TLS** if the host still uses its default
-   self-signed certificate.
-3. **Deploy the node helper to each Proxmox node** (required for agentless VM image
-   backup — real Proxmox has no disk-export API). In ProxBack: **Proxmox Hosts → Node
-   helpers → Deploy helper** — pick the node, enter its SSH address and root password, and
-   ProxBack installs and enrols the helper itself. The first attempt shows the node's SSH
-   host-key fingerprint for confirmation before anything runs; the password is used for
-   that one connection and never stored. (A manual one-line install is still available
-   behind "prefer to install manually" for nodes the server cannot SSH to.)
-
-   The helper is a small systemd service that streams backups through Proxmox's own
-   `vzdump` (snapshot-consistent, every storage type, qemu-guest-agent freeze) and restores
-   through `qmrestore`. Without a helper on a VM's node, backup runs for that VM fail with
-   an actionable error; file-level agent backups work regardless.
-
-### 5. Add a storage target
-
-**Storage Targets → Add Target.** For Backblaze B2:
-
-- Endpoint `https://s3.<region>.backblazeb2.com` (e.g. `https://s3.us-west-004.backblazeb2.com`)
-- Region `<region>` (e.g. `us-west-004`)
-- Your bucket name and an application key with read/write access to that bucket
-- **Path-style on**
-
-Every target gets a connection test (write/read/delete of a probe object) so a typo fails
-loudly before your first backup, not during it.
-
-### 6. Create jobs, restore, deploy agents
-
-- **Backup Jobs → Create Job** — pick VMs manually or **by Proxmox tag** (dynamic
-  membership), or an agent + folders; then a target, a schedule (manual, hourly, daily,
-  weekly, or any cron expression), and a keep-last-N retention. Job rows show the next
-  scheduled run.
-- **Restore Points** shows each source's full → incremental chain. Restores go to the
-  original VMID or side by side into a free VMID; every chunk is hash-verified during the
-  stream. The **Verify** button health-checks a point on demand (full chunk re-download +
-  hash check) — the result appears in Monitor like any other run.
-- **Monitor** lists every run; click one to open its detail view — live metrics, the full
-  error text, and a timestamped activity log of exactly what happened (which VM, which
-  path, bytes, dedup, retention pruning). Finished runs can be deleted individually or
-  cleared in bulk; restore points are never affected.
-- **Settings → Notifications** — set a webhook URL and choose failures-only or all runs;
-  every finished backup/restore/verify POSTs a JSON summary there.
-- **Agents** — generate a single-use enrollment token and copy the one-line install
-  command for Linux (bash) or Windows (PowerShell), or download the binary and pass
-  `--server` and `--token` yourself. Agents heartbeat every 15 s and never hold S3
-  credentials: chunks flow through the server.
-
-## Updating
-
-ProxBack updates itself from this repository's GitHub releases:
-
-- **Settings → Software update** shows the installed version, checks the latest release,
-  and — when a newer version with a binary for your platform exists — offers a one-click
-  **Install update**. The new binary is downloaded, verified against the release's
-  `checksums.txt`, swapped in place (the previous binary is kept as `proxback-server.old`),
-  and the service restarts itself into the new build (`Restart=always` in the shipped
-  systemd unit). Expect a few seconds of downtime; let running jobs finish first.
-- Running outside systemd (or on Windows), the update is installed the same way but you
-  restart the process yourself.
-- Air-gapped or building from source? `git pull && go build` and replace the binary — the
-  in-app updater is optional.
-- The update source can be overridden with the `PROXBACK_UPDATE_REPO` environment variable
-  (`owner/name`), e.g. to point a fleet at your own fork.
-
-## Building and testing from source
-
-```bash
-go vet ./...
-go test ./... -timeout 10m     # includes the full E2E scenario (sims + server in-process)
-cd web && npm install && npm run build
-```
-
-The E2E suite proves: full backup, dedup on unchanged re-run, true incrementals after
-mutation (with parent chains), byte-identical VM restores (including side-by-side to a new
-VMID), agent file backup/restore round-trips, retention pruning with orphan-chunk GC,
-index/bucket reconciliation after out-of-band chunk loss, and auth enforcement — including
-the default-credential lifecycle.
+Add the simulated host (`http://127.0.0.1:18006`, any token) and target
+(`http://127.0.0.1:19000`, any keys, path-style on), then run a job.
 
 ## Repository layout
 
-| Path | What it is |
+| Path | Contents |
 |---|---|
-| `cmd/proxback-server` | The server (REST API + embedded web UI + backup engine) |
-| `cmd/proxback-agent` | In-guest agent for Windows/Linux file-level backup |
-| `cmd/pve-sim` | Proxmox VE API simulator used by the E2E suite and the quick start |
-| `cmd/s3-sim` | S3-compatible object store simulator |
-| `internal/` | Engine, PVE client, S3 client, store, scheduler, agent manager, API |
-| `web/` | React + Vite + Tailwind control panel (built into the server binary) |
-| `deploy/` | `install.sh` and systemd units |
-| `e2e/` | End-to-end test driving the whole stack through the public API |
-| `PLAN.md` | Architecture spec and the REST API contract |
+| `cmd/proxback-server` | Server: REST API, web console, backup engine |
+| `cmd/proxback-helper` | Node service for image backup and recovery |
+| `cmd/proxback-agent` | In-guest agent for file-level protection |
+| `cmd/pve-sim`, `cmd/s3-sim` | Simulators used by the test suite |
+| `internal/engine` | Chunking, deduplication, compression, verification |
+| `internal/sched` | Scheduling, retention, run orchestration |
+| `web/` | React console, compiled into the server binary |
+| `e2e/` | End-to-end suite driving the whole stack through the public API |
+| `PLAN.md` | Architecture notes and the REST API contract |
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

@@ -26,7 +26,13 @@ func main() {
 	listen := flag.String("listen", ":8443", "address to listen on (plain HTTP; terminate TLS in front of this)")
 	dataDir := flag.String("data", "./data", "data directory for the SQLite database, encryption key and agent downloads")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn or error")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {

@@ -1,23 +1,38 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertTriangle, Ban, ScrollText, Trash2 } from 'lucide-react'
-import { cancelRun, deleteRun, errorMessage, getRun, getRunLog } from '../api'
-import type { ID, JobRun, RunLogLine } from '../api'
+import type { ReactNode } from 'react'
+import { AlertTriangle, Ban, RotateCcw, ScrollText, Trash2 } from 'lucide-react'
+import { cancelRun, deleteRun, errorMessage, getRun, getRunLog, retryRun } from '../api'
+import type { ID, RunDetail, RunLogLine } from '../api'
 import { Modal } from './Modal'
 import { useConfirm } from './Confirm'
+import { SourceBreakdown } from './RunLive'
 import { useToast } from './Toast'
-import { Button, Metric, Num, ProgressBar, RunStatusPill, Spinner } from './ui'
+import { Button, Num, ProgressBar, RunStatusPill, Spinner } from './ui'
 import {
+  clampPct,
   formatBytes,
   formatDateTime,
   formatDuration,
   formatRatio,
   formatRelative,
+  formatThroughput,
   formatTime,
 } from '../lib/format'
 
+/** One figure in the modal's metric strip. */
+function Figure({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="min-w-0">
+      <dt className="eyebrow">{label}</dt>
+      <dd className="figure-lg mt-0.5 truncate text-[15px] leading-5 text-slate-100">{value}</dd>
+    </div>
+  )
+}
+
 /**
- * Everything about one run: live metrics, the full untruncated error, and the
- * persisted activity log. Polls while the run is still going.
+ * Everything about one run: live metrics, the per-object breakdown, the full
+ * untruncated error, and the persisted activity log. Polls while the run is
+ * still going.
  */
 export function RunDetailModal({
   runId,
@@ -30,7 +45,7 @@ export function RunDetailModal({
 }) {
   const toast = useToast()
   const confirm = useConfirm()
-  const [run, setRun] = useState<JobRun | null>(null)
+  const [run, setRun] = useState<RunDetail | null>(null)
   const [lines, setLines] = useState<RunLogLine[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -93,6 +108,21 @@ export function RunDetailModal({
     }
   }
 
+  const onRetry = async () => {
+    if (!run) return
+    setBusy(true)
+    try {
+      await retryRun(run.id)
+      toast.success(`Retrying “${run.jobName}”.`, 'Watch it on the Monitor page.')
+      onChanged()
+      onClose()
+    } catch (err) {
+      toast.error('Could not retry the run', errorMessage(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const onDelete = async () => {
     if (!run) return
     const ok = await confirm({
@@ -121,12 +151,13 @@ export function RunDetailModal({
   }
 
   const running = run?.status === 'running'
+  const failed = run?.status === 'failed' || run?.status === 'canceled'
 
   return (
     <Modal
       open={runId !== null}
       onClose={onClose}
-      width="lg"
+      width="xl"
       title={run ? run.jobName : 'Run detail'}
       subtitle={
         run
@@ -138,6 +169,7 @@ export function RunDetailModal({
       footer={
         <>
           <Button onClick={onClose}>Close</Button>
+          <div className="flex-1" />
           {running ? (
             <Button
               variant="danger"
@@ -148,14 +180,26 @@ export function RunDetailModal({
               Cancel run
             </Button>
           ) : run ? (
-            <Button
-              variant="danger"
-              loading={busy}
-              icon={<Trash2 className="size-4" aria-hidden />}
-              onClick={() => void onDelete()}
-            >
-              Delete from history
-            </Button>
+            <>
+              {failed ? (
+                <Button
+                  variant="primary"
+                  loading={busy}
+                  icon={<RotateCcw className="size-4" aria-hidden />}
+                  onClick={() => void onRetry()}
+                >
+                  Retry
+                </Button>
+              ) : null}
+              <Button
+                variant="danger"
+                loading={busy}
+                icon={<Trash2 className="size-4" aria-hidden />}
+                onClick={() => void onDelete()}
+              >
+                Delete from history
+              </Button>
+            </>
           ) : null}
         </>
       }
@@ -173,24 +217,33 @@ export function RunDetailModal({
         <div className="space-y-5">
           <div className="flex flex-wrap items-center gap-3">
             <RunStatusPill status={run.status} />
-            <span className="text-xs text-slate-500">{run.currentStep}</span>
+            <span className="text-meta text-slate-500">{run.currentStep}</span>
+            {running ? (
+              <span className="ml-auto text-meta text-slate-500">
+                <Num className="text-accent-300">{formatThroughput(run.throughputBps)}</Num>
+              </span>
+            ) : null}
           </div>
 
-          {running ? <ProgressBar value={run.progressPct} active /> : null}
+          {running ? (
+            <div className="flex items-center gap-3">
+              <ProgressBar value={run.progressPct} active />
+              <Num className="w-10 shrink-0 text-right text-meta text-accent-300">
+                {clampPct(run.progressPct).toFixed(0)}%
+              </Num>
+            </div>
+          ) : null}
 
-          <dl className="grid grid-cols-2 gap-4 rounded-lg border border-slate-800 bg-slate-950/40 px-4 py-3 sm:grid-cols-4">
-            <Metric label="Processed" value={<Num>{formatBytes(run.bytesProcessed)}</Num>} />
-            <Metric label="Uploaded" value={<Num>{formatBytes(run.bytesUploaded)}</Num>} />
-            <Metric label="Dedup" value={<Num>{formatRatio(run.dedupRatio)}</Num>} />
-            <Metric
-              label="Duration"
-              value={<Num>{formatDuration(run.startedAt, run.finishedAt)}</Num>}
-            />
+          <dl className="well grid grid-cols-2 gap-4 px-4 py-3 sm:grid-cols-4">
+            <Figure label="Read" value={formatBytes(run.bytesProcessed)} />
+            <Figure label="Uploaded" value={formatBytes(run.bytesUploaded)} />
+            <Figure label="Dedup" value={formatRatio(run.dedupRatio)} />
+            <Figure label="Duration" value={formatDuration(run.startedAt, run.finishedAt)} />
           </dl>
 
           {run.error ? (
             <div className="space-y-1.5 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3">
-              <p className="flex items-center gap-2 text-xs font-medium text-red-200">
+              <p className="flex items-center gap-2 text-meta font-medium text-red-200">
                 <AlertTriangle className="size-3.5" aria-hidden />
                 Failure
               </p>
@@ -201,16 +254,21 @@ export function RunDetailModal({
           ) : null}
 
           <div>
-            <p className="mb-2 flex items-center gap-2 text-[11px] tracking-wide text-slate-500 uppercase">
+            <p className="eyebrow mb-2 text-slate-400">Objects in this session</p>
+            <SourceBreakdown sources={run.sources} />
+          </div>
+
+          <div>
+            <p className="eyebrow mb-2 flex items-center gap-2 text-slate-400">
               <ScrollText className="size-3.5" aria-hidden />
               Activity log
             </p>
             {lines.length === 0 ? (
-              <p className="rounded-lg border border-slate-800 bg-slate-950/40 px-4 py-3 text-xs text-slate-500">
+              <p className="well px-4 py-3 text-meta text-slate-500">
                 No log entries for this run. Runs from earlier versions have no stored log.
               </p>
             ) : (
-              <div className="max-h-72 space-y-1 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3">
+              <div className="well max-h-72 space-y-1 overflow-y-auto px-4 py-3">
                 {lines.map((entry, i) => (
                   <p key={i} className="flex gap-3 font-mono text-xs leading-relaxed">
                     <span className="shrink-0 tabular-nums text-slate-600">

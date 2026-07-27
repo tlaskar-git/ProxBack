@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -681,6 +682,24 @@ func TestMigrationUpgradesOldDatabase(t *testing.T) {
 		         '[{"hostId":"h1","vmid":100,"name":"web-01"}]', '2026-01-01T00:00:00Z')`); err != nil {
 		t.Fatalf("insert legacy job: %v", err)
 	}
+	// The schedule column held "manual" or a bare cron expression before
+	// v0.4.0. One job per conversion the migration has to make.
+	for _, legacy := range []struct{ id, schedule string }{
+		{"j-manual", "manual"},
+		{"j-empty", ""},
+		{"j-hourly", "0 * * * *"},
+		{"j-daily", "0 2 * * *"},
+		{"j-weekly", "0 3 * * 0"},
+		{"j-monthly", "0 1 1 * *"},
+		{"j-custom", "*/15 * * * *"},
+	} {
+		if _, err := db.Exec(
+			`INSERT INTO jobs (id, name, kind, target_id, schedule, retention, enabled, sources, created_at)
+			 VALUES (?, ?, 'vm', 't1', ?, 3, 1, '[{"hostId":"h1","vmid":100}]', '2026-01-01T00:00:00Z')`,
+			legacy.id, legacy.id, legacy.schedule); err != nil {
+			t.Fatalf("insert legacy job %s: %v", legacy.id, err)
+		}
+	}
 	// An enrollment token issued before helpers existed: it predates the purpose
 	// column and must still enroll an agent afterwards.
 	if _, err := db.Exec(
@@ -777,14 +796,62 @@ func TestMigrationUpgradesOldDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load legacy job: %v", err)
 	}
-	if job.Name != "legacy-nightly" || job.Schedule != "0 3 * * *" || job.Retention != 5 || !job.Enabled {
+	if job.Name != "legacy-nightly" || job.Retention != 5 || !job.Enabled {
 		t.Fatalf("legacy job changed: %+v", job)
+	}
+	// "0 3 * * *" is a daily 03:00 backup, so it becomes the preset rather than
+	// a custom expression — and, crucially, keeps firing at exactly 03:00.
+	if job.Schedule.Cron() != "0 3 * * *" || job.Schedule.Label() != "Daily at 03:00" {
+		t.Fatalf("legacy schedule = %+v (cron %q, label %q)",
+			job.Schedule, job.Schedule.Cron(), job.Schedule.Label())
 	}
 	if len(job.Sources) != 1 || job.Sources[0].VMID != 100 {
 		t.Fatalf("legacy job sources = %+v", job.Sources)
 	}
 	if job.TagFilter != "" {
 		t.Fatalf("legacy job tagFilter = %q, want empty", job.TagFilter)
+	}
+
+	// 3b. Every legacy schedule form converts to the structured object, and the
+	// stored column really is JSON afterwards — nothing keeps a bare cron string.
+	for _, want := range []struct {
+		id       string
+		schedule store.Schedule
+		label    string
+		cron     string
+	}{
+		{"j-manual", store.ManualSchedule(), "Manual", ""},
+		{"j-empty", store.ManualSchedule(), "Manual", ""},
+		{"j-hourly", store.Schedule{Kind: store.ScheduleHourly}, "Every hour at :00", "0 * * * *"},
+		{"j-daily", store.Schedule{Kind: store.ScheduleDaily, Time: "02:00"}, "Daily at 02:00", "0 2 * * *"},
+		{"j-weekly", store.Schedule{Kind: store.ScheduleWeekly, Time: "03:00", Weekdays: []int{0}},
+			"Weekly on Sun at 03:00", "0 3 * * 0"},
+		{"j-monthly", store.Schedule{Kind: store.ScheduleMonthly, Time: "01:00", DayOfMonth: 1},
+			"Monthly on day 1 at 01:00", "0 1 1 * *"},
+		// Anything a preset cannot express keeps its expression verbatim.
+		{"j-custom", store.Schedule{Kind: store.ScheduleAdvanced, CronExpr: "*/15 * * * *"},
+			"Custom (*/15 * * * *)", "*/15 * * * *"},
+	} {
+		migrated, err := st.JobByID(ctx, want.id)
+		if err != nil {
+			t.Fatalf("load migrated job %s: %v", want.id, err)
+		}
+		if !reflect.DeepEqual(migrated.Schedule, want.schedule.Normalized()) {
+			t.Errorf("%s migrated to %+v, want %+v", want.id, migrated.Schedule, want.schedule.Normalized())
+		}
+		if got := migrated.Schedule.Label(); got != want.label {
+			t.Errorf("%s label = %q, want %q", want.id, got, want.label)
+		}
+		if got := migrated.Schedule.Cron(); got != want.cron {
+			t.Errorf("%s cron = %q, want %q", want.id, got, want.cron)
+		}
+		var raw string
+		if err := st.DB().QueryRowContext(ctx, `SELECT schedule FROM jobs WHERE id = ?`, want.id).Scan(&raw); err != nil {
+			t.Fatalf("read migrated schedule column of %s: %v", want.id, err)
+		}
+		if !strings.HasPrefix(raw, `{"kind":`) {
+			t.Errorf("%s schedule column = %q, want the JSON object", want.id, raw)
+		}
 	}
 
 	// 4. The new columns are writable on the upgraded database.
@@ -858,6 +925,35 @@ func TestMigrationUpgradesOldDatabase(t *testing.T) {
 	defer again.Close()
 	if _, err := again.JobByID(ctx, "j1"); err != nil {
 		t.Fatalf("job missing after reopen: %v", err)
+	}
+	// The schedule conversion runs on every open, so it has to be idempotent:
+	// an already-converted row must survive the second pass unchanged.
+	reopened, err := again.JobByID(ctx, "j-daily")
+	if err != nil {
+		t.Fatalf("load converted job after reopen: %v", err)
+	}
+	if reopened.Schedule.Kind != store.ScheduleDaily || reopened.Schedule.Time != "02:00" {
+		t.Fatalf("a second migration pass changed the schedule: %+v", reopened.Schedule)
+	}
+	// run_sources arrived in v0.4.0: a database written before it gains the
+	// table on open, and the run rows of the upgraded database can use it.
+	for _, column := range []string{"run_id", "seq", "status", "size_bytes", "bytes_processed"} {
+		if !hasColumn(t, again, "run_sources", column) {
+			t.Fatalf("migration did not create run_sources.%s", column)
+		}
+	}
+	upgradedRun, err := again.CreateRun(ctx, &store.JobRun{JobID: "j1", JobName: "legacy-nightly"})
+	if err != nil {
+		t.Fatalf("create run on the upgraded database: %v", err)
+	}
+	if err := again.ReplaceRunSources(ctx, upgradedRun.ID, []store.RunSource{
+		{Seq: 0, Name: "web-01", Kind: store.SourceVM, Node: "pve1", SizeBytes: 32 << 20},
+	}); err != nil {
+		t.Fatalf("write run sources on the upgraded database: %v", err)
+	}
+	sources, err := again.RunSources(ctx, upgradedRun.ID)
+	if err != nil || len(sources) != 1 || sources[0].Status != store.SourcePending {
+		t.Fatalf("run sources on the upgraded database = %+v (%v)", sources, err)
 	}
 }
 

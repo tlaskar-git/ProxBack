@@ -76,7 +76,7 @@ function AgentTable({ agents, onChanged }: { agents: Agent[]; onChanged: () => v
     <div className="overflow-x-auto">
       <table className="w-full min-w-[48rem] text-sm">
         <thead>
-          <tr className="border-b border-slate-800 text-left text-[11px] tracking-wide text-slate-500 uppercase">
+          <tr className="border-b border-slate-800 text-left text-micro font-semibold tracking-wide text-slate-500 uppercase">
             <th className="px-5 py-2.5 font-medium">Hostname</th>
             <th className="px-5 py-2.5 font-medium">Platform</th>
             <th className="px-5 py-2.5 font-medium">Version</th>

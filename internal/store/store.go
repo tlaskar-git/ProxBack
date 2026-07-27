@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
@@ -110,6 +111,7 @@ CREATE TABLE IF NOT EXISTS vms_cache (
 	maxdisk    INTEGER NOT NULL DEFAULT 0,
 	maxmem     INTEGER NOT NULL DEFAULT 0,
 	uptime     INTEGER NOT NULL DEFAULT 0,
+	tags       TEXT NOT NULL DEFAULT '',
 	updated_at TEXT NOT NULL,
 	PRIMARY KEY (host_id, vmid)
 );
@@ -143,8 +145,23 @@ CREATE TABLE IF NOT EXISTS enroll_tokens (
 	token      TEXT PRIMARY KEY,
 	created_at TEXT NOT NULL,
 	expires_at TEXT NOT NULL,
-	used_at    TEXT
+	used_at    TEXT,
+	purpose    TEXT NOT NULL DEFAULT 'agent'
 );
+
+CREATE TABLE IF NOT EXISTS helpers (
+	id                TEXT PRIMARY KEY,
+	node              TEXT NOT NULL,
+	address           TEXT NOT NULL,
+	port              INTEGER NOT NULL DEFAULT 8007,
+	version           TEXT NOT NULL,
+	access_secret_enc BLOB NOT NULL,
+	api_key_hash      TEXT NOT NULL,
+	last_seen         TEXT,
+	registered_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_helpers_key ON helpers(api_key_hash);
+CREATE INDEX IF NOT EXISTS idx_helpers_node ON helpers(node);
 
 CREATE TABLE IF NOT EXISTS jobs (
 	id         TEXT PRIMARY KEY,
@@ -155,6 +172,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 	retention  INTEGER NOT NULL DEFAULT 7,
 	enabled    INTEGER NOT NULL DEFAULT 1,
 	sources    TEXT NOT NULL DEFAULT '[]',
+	tag_filter TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL
 );
 
@@ -206,11 +224,48 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 `
 
+// addedColumns lists columns introduced after a table's original definition.
+// The schema above uses CREATE TABLE IF NOT EXISTS, so databases created by an
+// earlier ProxBack release keep their original column set and are upgraded in
+// place by ALTER TABLE. Every entry must be additive and carry a default so
+// existing rows stay valid; never remove or reorder entries.
+var addedColumns = []struct{ table, column, definition string }{
+	{"vms_cache", "tags", "TEXT NOT NULL DEFAULT ''"},
+	{"jobs", "tag_filter", "TEXT NOT NULL DEFAULT ''"},
+	// Enrollment tokens are shared by agents and node helpers; tokens written
+	// before helpers existed are agent tokens.
+	{"enroll_tokens", "purpose", "TEXT NOT NULL DEFAULT 'agent'"},
+}
+
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
+	for _, c := range addedColumns {
+		if err := s.addColumn(ctx, c.table, c.column, c.definition); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// addColumn applies an additive schema upgrade, treating "column already
+// exists" as success so the migration is idempotent.
+func (s *Store) addColumn(ctx context.Context, table, column, definition string) error {
+	stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, definition)
+	if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+		if isDuplicateColumn(err) {
+			return nil
+		}
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+// isDuplicateColumn reports whether err is SQLite's complaint about adding a
+// column that is already present.
+func isDuplicateColumn(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column name")
 }
 
 // ---------------------------------------------------------------- encryption

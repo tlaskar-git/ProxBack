@@ -11,13 +11,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,15 +53,16 @@ type apiHost struct {
 }
 
 type apiVM struct {
-	VMID     int    `json:"vmid"`
-	Name     string `json:"name"`
-	Node     string `json:"node"`
-	Status   string `json:"status"`
-	MaxDisk  int64  `json:"maxdisk"`
-	MaxMem   int64  `json:"maxmem"`
-	Uptime   int64  `json:"uptime"`
-	HostID   string `json:"hostId"`
-	HostName string `json:"hostName"`
+	VMID     int      `json:"vmid"`
+	Name     string   `json:"name"`
+	Node     string   `json:"node"`
+	Status   string   `json:"status"`
+	Tags     []string `json:"tags"`
+	MaxDisk  int64    `json:"maxdisk"`
+	MaxMem   int64    `json:"maxmem"`
+	Uptime   int64    `json:"uptime"`
+	HostID   string   `json:"hostId"`
+	HostName string   `json:"hostName"`
 }
 
 type apiTarget struct {
@@ -104,6 +108,8 @@ type apiJob struct {
 	Retention  int            `json:"retention"`
 	Enabled    bool           `json:"enabled"`
 	Sources    []apiJobSource `json:"sources"`
+	TagFilter  *string        `json:"tagFilter"`
+	NextRun    *string        `json:"nextRun"`
 	LastRun    *apiRun        `json:"lastRun"`
 }
 
@@ -138,6 +144,17 @@ type apiAgent struct {
 	RegisteredAt string  `json:"registeredAt"`
 }
 
+type apiHelper struct {
+	ID           string  `json:"id"`
+	Node         string  `json:"node"`
+	Address      string  `json:"address"`
+	Port         int     `json:"port"`
+	Version      string  `json:"version"`
+	Status       string  `json:"status"`
+	LastSeen     *string `json:"lastSeen"`
+	RegisteredAt string  `json:"registeredAt"`
+}
+
 type apiDashboard struct {
 	VMCount     int `json:"vmCount"`
 	AgentCount  int `json:"agentCount"`
@@ -157,6 +174,186 @@ type apiDashboard struct {
 type apiSettings struct {
 	ServerName  string `json:"serverName"`
 	Concurrency int    `json:"concurrency"`
+	WebhookURL  string `json:"webhookUrl"`
+	NotifyOn    string `json:"notifyOn"`
+}
+
+// webhookPayload mirrors the notification body in the contract.
+type webhookPayload struct {
+	Event          string  `json:"event"`
+	Server         string  `json:"server"`
+	Job            string  `json:"job"`
+	Kind           string  `json:"kind"`
+	Status         string  `json:"status"`
+	BytesProcessed int64   `json:"bytesProcessed"`
+	BytesUploaded  int64   `json:"bytesUploaded"`
+	DedupRatio     float64 `json:"dedupRatio"`
+	Error          string  `json:"error"`
+	StartedAt      string  `json:"startedAt"`
+	FinishedAt     string  `json:"finishedAt"`
+	DurationSec    float64 `json:"durationSec"`
+}
+
+// webhookCollector is a stand-in for the operator's automation endpoint.
+type webhookCollector struct {
+	url string
+
+	mu       sync.Mutex
+	payloads []webhookPayload
+}
+
+func (c *webhookCollector) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p webhookPayload
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		c.mu.Lock()
+		c.payloads = append(c.payloads, p)
+		c.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
+
+func (c *webhookCollector) all() []webhookPayload {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]webhookPayload(nil), c.payloads...)
+}
+
+// ---------------------------------------------------------------- fake node helper
+
+// helperRequest is one call a node helper received.
+type helperRequest struct {
+	Method string
+	Path   string
+	Query  string
+	Auth   string
+	Bytes  int
+}
+
+// nodeHelper is an in-process stand-in for the proxback-helper daemon that runs
+// as root on a Proxmox node. It answers the same three endpoints: /healthz,
+// /export/{vmid} (a deterministic archive instead of a real vzdump stream) and
+// /import/{vmid} (capturing what would have gone into qmrestore).
+type nodeHelper struct {
+	node    string
+	secret  string
+	content []byte
+	url     string
+	port    int
+
+	mu       sync.Mutex
+	requests []helperRequest
+	imported map[int][]byte
+}
+
+func newNodeHelper(t *testing.T, node string, size int, seed uint64) *nodeHelper {
+	t.Helper()
+	nh := &nodeHelper{
+		node:     node,
+		secret:   "e2e-helper-access-secret-" + node,
+		content:  pseudoBytes(size, seed),
+		imported: map[int][]byte{},
+	}
+	srv := httptest.NewServer(nh.handler())
+	t.Cleanup(srv.Close)
+	nh.url = srv.URL
+	host, port, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split helper url %s: %v", srv.URL, err)
+	}
+	if nh.port, err = strconv.Atoi(port); err != nil {
+		t.Fatalf("helper port %q: %v", port, err)
+	}
+	if host != "127.0.0.1" {
+		t.Fatalf("helper listening on %s, want 127.0.0.1 so the server can reach it", host)
+	}
+	return nh
+}
+
+func (nh *nodeHelper) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		nh.record(r, 0)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"node":%q,"version":"e2e"}`, nh.node)
+	})
+	mux.HandleFunc("/export/", func(w http.ResponseWriter, r *http.Request) {
+		if !nh.authorized(w, r) {
+			return
+		}
+		nh.record(r, len(nh.content))
+		// Chunked, exactly like the real helper: no Content-Length is knowable.
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(nh.content)
+	})
+	mux.HandleFunc("/import/", func(w http.ResponseWriter, r *http.Request) {
+		if !nh.authorized(w, r) {
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		nh.record(r, len(raw))
+		vmid, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/import/"))
+		if err != nil {
+			http.Error(w, "bad vmid", http.StatusBadRequest)
+			return
+		}
+		nh.mu.Lock()
+		nh.imported[vmid] = raw
+		nh.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	return mux
+}
+
+func (nh *nodeHelper) authorized(w http.ResponseWriter, r *http.Request) bool {
+	if r.Header.Get("Authorization") == "Bearer "+nh.secret {
+		return true
+	}
+	nh.record(r, 0)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write([]byte(`{"error":"invalid access secret"}`))
+	return false
+}
+
+func (nh *nodeHelper) record(r *http.Request, n int) {
+	nh.mu.Lock()
+	defer nh.mu.Unlock()
+	nh.requests = append(nh.requests, helperRequest{
+		Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery,
+		Auth: r.Header.Get("Authorization"), Bytes: n,
+	})
+}
+
+func (nh *nodeHelper) seen() []helperRequest {
+	nh.mu.Lock()
+	defer nh.mu.Unlock()
+	return append([]helperRequest(nil), nh.requests...)
+}
+
+// matching returns every recorded call to one method/path pair.
+func (nh *nodeHelper) matching(method, path string) []helperRequest {
+	var out []helperRequest
+	for _, r := range nh.seen() {
+		if r.Method == method && r.Path == path {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (nh *nodeHelper) importedFor(vmid int) []byte {
+	nh.mu.Lock()
+	defer nh.mu.Unlock()
+	return nh.imported[vmid]
 }
 
 // ---------------------------------------------------------------- harness
@@ -170,11 +367,19 @@ type harness struct {
 	s3URL    string
 	dataDir  string
 	instance *app.App
+	hook     *webhookCollector
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// 0. Webhook collector. It is started first so it outlives the server and
+	// still answers notifications fired during shutdown.
+	hook := &webhookCollector{}
+	hookSrv := httptest.NewServer(hook.handler())
+	t.Cleanup(hookSrv.Close)
+	hook.url = hookSrv.URL + "/proxback"
 
 	// 1. S3 simulator.
 	s3, err := s3sim.New("")
@@ -217,6 +422,26 @@ func newHarness(t *testing.T) *harness {
 		s3URL:    s3srv.URL,
 		dataDir:  dataDir,
 		instance: instance,
+		hook:     hook,
+	}
+}
+
+// awaitWebhook waits for a delivered payload matching pred. Delivery is
+// asynchronous by design, so polling is the only honest way to assert on it.
+func (h *harness) awaitWebhook(timeout time.Duration, pred func(webhookPayload) bool) webhookPayload {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		for _, p := range h.hook.all() {
+			if pred(p) {
+				return p
+			}
+		}
+		if !time.Now().Before(deadline) {
+			h.t.Fatalf("no matching webhook payload within %s (received %d: %+v)",
+				timeout, len(h.hook.all()), h.hook.all())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -281,8 +506,9 @@ func (h *harness) waitRun(runID string, timeout time.Duration) apiRun {
 	return run
 }
 
-// runJob triggers a job and waits for it to succeed.
-func (h *harness) runJob(jobID string) apiRun {
+// startRun triggers a job and returns the new run id without judging the
+// outcome, for the cases where a failure is the expected result.
+func (h *harness) startRun(jobID string) string {
 	h.t.Helper()
 	var started struct {
 		RunID string `json:"runId"`
@@ -291,7 +517,26 @@ func (h *harness) runJob(jobID string) apiRun {
 	if started.RunID == "" {
 		h.t.Fatal("run trigger returned an empty runId")
 	}
-	run := h.waitRun(started.RunID, 90*time.Second)
+	return started.RunID
+}
+
+// verify starts a restore point verification and returns the new run id.
+func (h *harness) verify(backupID string) string {
+	h.t.Helper()
+	var started struct {
+		RunID string `json:"runId"`
+	}
+	h.ok(http.MethodPost, "/api/backups/"+backupID+"/verify", nil, &started)
+	if started.RunID == "" {
+		h.t.Fatal("verify returned an empty runId")
+	}
+	return started.RunID
+}
+
+// runJob triggers a job and waits for it to succeed.
+func (h *harness) runJob(jobID string) apiRun {
+	h.t.Helper()
+	run := h.waitRun(h.startRun(jobID), 90*time.Second)
 	if run.Status != "success" {
 		h.t.Fatalf("run %s finished %q: %s (step %q)", run.ID, run.Status, run.Error, run.CurrentStep)
 	}
@@ -299,6 +544,80 @@ func (h *harness) runJob(jobID string) apiRun {
 		h.t.Fatalf("successful run %s has no finishedAt", run.ID)
 	}
 	return run
+}
+
+// helperCall performs a helper-facing API call the way the real daemon does:
+// with its own client (no browser session) and an optional bearer key.
+func (h *harness) helperCall(method, path, bearer string, body any) (int, []byte) {
+	h.t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			h.t.Fatalf("encode %s %s: %v", method, path, err)
+		}
+		rdr = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, h.base+path, rdr) //nolint:noctx // test helper
+	if err != nil {
+		h.t.Fatalf("build %s %s: %v", method, path, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		h.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.t.Fatalf("%s %s: read body: %v", method, path, err)
+	}
+	return resp.StatusCode, raw
+}
+
+// registerHelper enrolls a fake node helper through the real registration
+// endpoint and returns the status plus the decoded response.
+func (h *harness) registerHelper(nh *nodeHelper, token string) (int, struct {
+	HelperID string `json:"helperId"`
+	APIKey   string `json:"apiKey"`
+}) {
+	h.t.Helper()
+	var out struct {
+		HelperID string `json:"helperId"`
+		APIKey   string `json:"apiKey"`
+	}
+	code, raw := h.helperCall(http.MethodPost, "/api/helpers/register", "", map[string]any{
+		"token":        token,
+		"node":         nh.node,
+		"port":         nh.port,
+		"version":      "e2e",
+		"accessSecret": nh.secret,
+	})
+	if code == http.StatusOK {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			h.t.Fatalf("decode registration %s: %v", raw, err)
+		}
+	}
+	return code, out
+}
+
+// login re-authenticates the browser session.
+func (h *harness) login() {
+	h.t.Helper()
+	var out struct {
+		User apiUser `json:"user"`
+	}
+	h.ok(http.MethodPost, "/api/login", map[string]string{
+		"username": adminUser, "password": adminPass,
+	}, &out)
+	if out.User.Username != adminUser {
+		h.t.Fatalf("re-login returned %+v", out.User)
+	}
 }
 
 // fetchRaw downloads a simulator byte stream.
@@ -340,6 +659,31 @@ func (h *harness) objects(bucket, prefix string) []s3target.Object {
 		h.t.Fatalf("list %s/%s: %v", bucket, prefix, err)
 	}
 	return objs
+}
+
+// manifest reads a restore point's manifest object straight off the target so
+// the test can reach the chunk hashes the engine recorded.
+func (h *harness) manifest(bucket, sourceKind, sourceID, backupID string) engine.Manifest {
+	h.t.Helper()
+	key := engine.ManifestKey(sourceKind, sourceID, backupID)
+	raw, err := h.s3Client(bucket).GetBytes(context.Background(), key)
+	if err != nil {
+		h.t.Fatalf("read manifest %s: %v", key, err)
+	}
+	var m engine.Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		h.t.Fatalf("decode manifest %s: %v", key, err)
+	}
+	return m
+}
+
+// corruptChunk overwrites a chunk object with garbage of the same length,
+// simulating silent bit rot on the storage target.
+func (h *harness) corruptChunk(bucket, sha string, size int64) {
+	h.t.Helper()
+	if err := h.s3Client(bucket).Put(context.Background(), engine.ChunkKey(sha), pseudoBytes(int(size), 0xC0FFEE)); err != nil {
+		h.t.Fatalf("corrupt chunk %s: %v", sha, err)
+	}
 }
 
 func (h *harness) chunkBytes(bucket string) (count int, total int64) {
@@ -542,6 +886,10 @@ func TestEndToEnd(t *testing.T) {
 		if len(nodes) != 2 {
 			t.Fatalf("guests span %d nodes, want 2", len(nodes))
 		}
+		// Proxmox reports tags as one semicolon separated string; the API must
+		// surface them as a lower-cased, sorted array — never null.
+		assertTags(t, "live", vms)
+
 		var cached []apiVM
 		h.ok(http.MethodGet, "/api/vms", nil, &cached)
 		if len(cached) != 4 {
@@ -552,6 +900,8 @@ func TestEndToEnd(t *testing.T) {
 				t.Fatalf("cached guest missing host info: %+v", v)
 			}
 		}
+		// Tags survive the round trip through vms_cache.
+		assertTags(t, "cached", cached)
 	})
 
 	var vmJob apiJob
@@ -1008,7 +1358,306 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
-	t.Run("14-misc-contract-checks", func(t *testing.T) {
+	// ---- Tag filtered jobs: dynamic membership from the cached inventory -----
+	var tagJob apiJob
+	t.Run("14-tag-filter-job", func(t *testing.T) {
+		// sources may be empty when a tagFilter is set: membership is resolved
+		// at run start, so guests tagged later are picked up automatically.
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name":      "prod-tagged",
+			"kind":      "vm",
+			"targetId":  vmTarget.ID,
+			"schedule":  "manual",
+			"retention": 2,
+			"enabled":   true,
+			"sources":   []map[string]any{},
+			"tagFilter": "prod",
+		}, &tagJob)
+		if tagJob.ID == "" || tagJob.TagFilter == nil || *tagJob.TagFilter != "prod" {
+			t.Fatalf("tag filtered job = %+v (tagFilter %v)", tagJob, tagJob.TagFilter)
+		}
+		if len(tagJob.Sources) != 0 {
+			t.Fatalf("tag filtered job invented static sources: %+v", tagJob.Sources)
+		}
+
+		// A tag filter is meaningless for agent jobs.
+		code, body := h.do(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "tagged-agent", "kind": "agent", "targetId": agtTarget.ID,
+			"sources":   []map[string]any{{"agentId": agentInfo.ID, "paths": []string{srcDir}}},
+			"tagFilter": "prod",
+		})
+		if code != http.StatusBadRequest {
+			t.Fatalf("agent job with a tagFilter = %d (%s), want 400", code, body)
+		}
+		// Without either sources or a tag filter a vm job has no membership.
+		code, body = h.do(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "empty-vm-job", "kind": "vm", "targetId": vmTarget.ID,
+			"sources": []map[string]any{},
+		})
+		if code != http.StatusBadRequest {
+			t.Fatalf("vm job without sources or tagFilter = %d (%s), want 400", code, body)
+		}
+
+		// web-01 (prod;web, 2 disks) and db-01 (prod;db, 1 disk) match; the two
+		// dev guests must not. Their content is already on the target.
+		run := h.runJob(tagJob.ID)
+		if run.BytesProcessed != int64(48*mib) {
+			t.Fatalf("tag filtered run processed %d bytes, want %d (web-01 + db-01)",
+				run.BytesProcessed, 48*mib)
+		}
+		if run.BytesUploaded != 0 {
+			t.Fatalf("tag filtered run uploaded %d bytes, want 0 (all chunks known)", run.BytesUploaded)
+		}
+
+		var backups []apiBackup
+		h.ok(http.MethodGet, "/api/backups?jobId="+tagJob.ID, nil, &backups)
+		if len(backups) != 2 {
+			t.Fatalf("tag filtered run produced %d restore points, want 2: %+v", len(backups), backups)
+		}
+		got := map[string]string{}
+		for _, b := range backups {
+			got[b.SourceID] = b.SourceName
+		}
+		for sourceID, name := range map[string]string{
+			host.ID + "_100": "web-01",
+			host.ID + "_101": "db-01",
+		} {
+			if got[sourceID] != name {
+				t.Fatalf("tag filtered run backed up %v, want %s as %s", got, sourceID, name)
+			}
+		}
+
+		// A filter that matches nothing fails the run with a clear message
+		// rather than silently succeeding with an empty backup.
+		var orphan apiJob
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "staging-tagged", "kind": "vm", "targetId": vmTarget.ID,
+			"schedule": "manual", "retention": 2, "enabled": true,
+			"sources": []map[string]any{}, "tagFilter": "staging",
+		}, &orphan)
+		failed := h.waitRun(h.startRun(orphan.ID), 60*time.Second)
+		if failed.Status != "failed" {
+			t.Fatalf("run of an unmatched tag filter finished %q", failed.Status)
+		}
+		if !strings.Contains(failed.Error, `no VMs carry tag "staging"`) {
+			t.Fatalf("unmatched tag filter error = %q", failed.Error)
+		}
+		h.ok(http.MethodDelete, "/api/jobs/"+orphan.ID, nil, nil)
+
+		// Clearing the filter is possible, and then sources are required again.
+		var cleared apiJob
+		h.ok(http.MethodPatch, "/api/jobs/"+tagJob.ID, map[string]any{
+			"tagFilter": "", "sources": []map[string]any{{"hostId": host.ID, "vmid": 100, "name": "web-01"}},
+		}, &cleared)
+		if cleared.TagFilter != nil {
+			t.Fatalf("cleared tagFilter = %v, want null", *cleared.TagFilter)
+		}
+		// Put it back for the verify subtest's restore points.
+		h.ok(http.MethodPatch, "/api/jobs/"+tagJob.ID, map[string]any{
+			"tagFilter": "PROD", "sources": []map[string]any{},
+		}, &cleared)
+		if cleared.TagFilter == nil || *cleared.TagFilter != "prod" {
+			t.Fatalf("tagFilter was not normalised to lower case: %v", cleared.TagFilter)
+		}
+	})
+
+	// ---- Restore point verification ---------------------------------------
+	t.Run("15-verify-restore-point", func(t *testing.T) {
+		var backups []apiBackup
+		h.ok(http.MethodGet, "/api/backups?jobId="+tagJob.ID, nil, &backups)
+		var point apiBackup
+		for _, b := range backups {
+			if b.SourceName == "web-01" {
+				point = b
+			}
+		}
+		if point.ID == "" {
+			t.Fatalf("no web-01 restore point to verify: %+v", backups)
+		}
+
+		run := h.waitRun(h.verify(point.ID), 90*time.Second)
+		if run.Status != "success" {
+			t.Fatalf("verify of a healthy restore point finished %q: %s", run.Status, run.Error)
+		}
+		if run.JobName != "Verify web-01" {
+			t.Fatalf("verify run jobName = %q, want %q", run.JobName, "Verify web-01")
+		}
+		if run.JobID != "" {
+			t.Fatalf("verify run is attached to job %q, want none", run.JobID)
+		}
+		if run.BytesProcessed != point.SizeBytes {
+			t.Fatalf("verify read %d bytes, want the whole point (%d)", run.BytesProcessed, point.SizeBytes)
+		}
+		if run.BytesUploaded != 0 {
+			t.Fatalf("verify uploaded %d bytes, want 0", run.BytesUploaded)
+		}
+
+		// Unknown restore points 404.
+		if code, body := h.do(http.MethodPost, "/api/backups/does-not-exist/verify", nil); code != http.StatusNotFound {
+			t.Fatalf("verify of an unknown backup = %d (%s), want 404", code, body)
+		}
+
+		// Now rot one chunk on the target. The manifest still points at it, so
+		// verification must fail on the hash.
+		man := h.manifest(vmBucket, point.SourceKind, point.SourceID, point.ID)
+		if len(man.Disks) == 0 || len(man.Disks[0].Chunks) == 0 {
+			t.Fatalf("manifest has no chunks: %+v", man)
+		}
+		bad := man.Disks[0].Chunks[0]
+		h.corruptChunk(vmBucket, bad.Sha256, bad.Size)
+
+		run = h.waitRun(h.verify(point.ID), 90*time.Second)
+		if run.Status != "failed" {
+			t.Fatalf("verify of a corrupted restore point finished %q", run.Status)
+		}
+		if !strings.Contains(run.Error, "chunk hash verification failed") {
+			t.Fatalf("verify error = %q, want a hash verification failure", run.Error)
+		}
+	})
+
+	// ---- Webhook notifications --------------------------------------------
+	t.Run("16-webhook-notifications", func(t *testing.T) {
+		// Nothing configured yet.
+		if code, body := h.do(http.MethodPost, "/api/settings/test-webhook", nil); code != http.StatusBadRequest {
+			t.Fatalf("test-webhook without a saved URL = %d (%s), want 400", code, body)
+		}
+		if code, body := h.do(http.MethodPut, "/api/settings", map[string]any{"notifyOn": "sometimes"}); code != http.StatusBadRequest {
+			t.Fatalf("PUT settings with a bogus notifyOn = %d (%s), want 400", code, body)
+		}
+		if code, body := h.do(http.MethodPut, "/api/settings", map[string]any{"webhookUrl": "ftp://nope"}); code != http.StatusBadRequest {
+			t.Fatalf("PUT settings with a non-http webhookUrl = %d (%s), want 400", code, body)
+		}
+
+		var settings apiSettings
+		h.ok(http.MethodPut, "/api/settings", map[string]any{
+			"webhookUrl": h.hook.url, "notifyOn": "all",
+		}, &settings)
+		if settings.WebhookURL != h.hook.url || settings.NotifyOn != "all" {
+			t.Fatalf("saved notification settings = %+v", settings)
+		}
+
+		run := h.runJob(vmJob.ID)
+		p := h.awaitWebhook(30*time.Second, func(p webhookPayload) bool {
+			return p.Job == "nightly-vms" && p.Status == "success"
+		})
+		if p.Event != "run.finished" {
+			t.Fatalf("payload event = %q, want run.finished", p.Event)
+		}
+		if p.Kind != "vm" {
+			t.Fatalf("payload kind = %q, want vm", p.Kind)
+		}
+		if p.Server != "lab" {
+			t.Fatalf("payload server = %q, want the configured serverName", p.Server)
+		}
+		if p.BytesProcessed != run.BytesProcessed {
+			t.Fatalf("payload bytesProcessed = %d, want %d", p.BytesProcessed, run.BytesProcessed)
+		}
+		if p.StartedAt == "" || p.FinishedAt == "" || p.DurationSec < 0 {
+			t.Fatalf("payload timing = %+v", p)
+		}
+		if p.Error != "" {
+			t.Fatalf("successful run reported error %q", p.Error)
+		}
+
+		// The test endpoint posts a sample payload to the saved URL.
+		var probe struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		}
+		h.ok(http.MethodPost, "/api/settings/test-webhook", nil, &probe)
+		if !probe.OK {
+			t.Fatalf("test-webhook returned ok=false: %s", probe.Error)
+		}
+		sample := h.awaitWebhook(15*time.Second, func(p webhookPayload) bool { return p.Job == "Webhook test" })
+		if sample.Event != "run.finished" || sample.Status != "success" || sample.Server != "lab" {
+			t.Fatalf("sample payload = %+v", sample)
+		}
+
+		// notifyOn=failures must stay quiet for successes and still report
+		// failures.
+		h.ok(http.MethodPut, "/api/settings", map[string]any{"notifyOn": "failures"}, &settings)
+		if settings.NotifyOn != "failures" {
+			t.Fatalf("notifyOn = %q", settings.NotifyOn)
+		}
+		before := len(h.hook.all())
+		h.runJob(vmJob.ID)
+
+		var orphan apiJob
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "unmatched-tag", "kind": "vm", "targetId": vmTarget.ID,
+			"schedule": "manual", "retention": 2, "enabled": true,
+			"sources": []map[string]any{}, "tagFilter": "nowhere",
+		}, &orphan)
+		failed := h.waitRun(h.startRun(orphan.ID), 60*time.Second)
+		if failed.Status != "failed" {
+			t.Fatalf("expected the unmatched tag job to fail, got %q", failed.Status)
+		}
+		fp := h.awaitWebhook(30*time.Second, func(p webhookPayload) bool {
+			return p.Job == "unmatched-tag" && p.Status == "failed"
+		})
+		if fp.Error == "" {
+			t.Fatalf("failure payload carries no error: %+v", fp)
+		}
+		for _, p := range h.hook.all()[before:] {
+			if p.Status == "success" {
+				t.Fatalf("notifyOn=failures still delivered a success payload: %+v", p)
+			}
+		}
+		h.ok(http.MethodDelete, "/api/jobs/"+orphan.ID, nil, nil)
+	})
+
+	// ---- nextRun ----------------------------------------------------------
+	t.Run("17-next-run", func(t *testing.T) {
+		var jobs []apiJob
+		h.ok(http.MethodGet, "/api/jobs", nil, &jobs)
+		if len(jobs) == 0 {
+			t.Fatal("no jobs to inspect")
+		}
+		for _, j := range jobs {
+			if j.Schedule == "manual" && j.NextRun != nil {
+				t.Fatalf("manual job %q reports nextRun %q, want null", j.Name, *j.NextRun)
+			}
+		}
+
+		var job apiJob
+		h.ok(http.MethodPatch, "/api/jobs/"+vmJob.ID, map[string]any{"schedule": "0 2 * * *"}, &job)
+		if job.NextRun == nil {
+			t.Fatal("a scheduled, enabled job reports a null nextRun")
+		}
+		next, err := time.Parse(time.RFC3339, *job.NextRun)
+		if err != nil {
+			t.Fatalf("nextRun %q is not RFC3339: %v", *job.NextRun, err)
+		}
+		if !next.After(time.Now()) {
+			t.Fatalf("nextRun %s is not in the future", next)
+		}
+		if next.Sub(time.Now()) > 25*time.Hour {
+			t.Fatalf("nextRun %s is more than a day out for a daily schedule", next)
+		}
+
+		// Disabled jobs never fire, so they report no next run.
+		h.ok(http.MethodPatch, "/api/jobs/"+vmJob.ID, map[string]any{"enabled": false}, &job)
+		if job.NextRun != nil {
+			t.Fatalf("disabled job reports nextRun %q, want null", *job.NextRun)
+		}
+
+		// Back to a manual, enabled job for the remaining checks.
+		h.ok(http.MethodPatch, "/api/jobs/"+vmJob.ID, map[string]any{
+			"schedule": "manual", "enabled": true,
+		}, &job)
+		if job.NextRun != nil {
+			t.Fatalf("manual job reports nextRun %q, want null", *job.NextRun)
+		}
+		if job.Schedule != "manual" || !job.Enabled {
+			t.Fatalf("job not restored to manual/enabled: %+v", job)
+		}
+		// An unparsable cron spec is rejected outright.
+		if code, body := h.do(http.MethodPatch, "/api/jobs/"+vmJob.ID, map[string]any{"schedule": "not a cron"}); code != http.StatusBadRequest {
+			t.Fatalf("PATCH with an invalid schedule = %d (%s), want 400", code, body)
+		}
+	})
+
+	t.Run("18-misc-contract-checks", func(t *testing.T) {
 		// 409 when a job is already running.
 		var started struct {
 			RunID string `json:"runId"`
@@ -1060,9 +1709,331 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("GET /api/jobs after logout = %d, want 401", code)
 		}
 	})
+
+	// ---- Node helper: the real-Proxmox agentless path ----------------------
+	//
+	// mail-01 (#103) lives on pve2 and is untouched by every subtest above, so
+	// giving pve2 a helper cannot disturb the extension-backed guests on pve1.
+	helper := newNodeHelper(t, "pve2", 12*mib, 0xC0FFEE01)
+	var helperKey string
+	var helperInfo apiHelper
+
+	t.Run("19-node-helper-enrollment", func(t *testing.T) {
+		h.login() // the previous subtest logged out
+
+		var helpers []apiHelper
+		h.ok(http.MethodGet, "/api/helpers", nil, &helpers)
+		if len(helpers) != 0 {
+			t.Fatalf("a fresh install already knows helpers: %+v", helpers)
+		}
+
+		var enroll struct {
+			Token     string `json:"token"`
+			ExpiresAt string `json:"expiresAt"`
+		}
+		h.ok(http.MethodPost, "/api/helpers/enroll-token", nil, &enroll)
+		if enroll.Token == "" || enroll.ExpiresAt == "" {
+			t.Fatalf("helper enroll token response = %+v", enroll)
+		}
+
+		code, res := h.registerHelper(helper, enroll.Token)
+		if code != http.StatusOK {
+			t.Fatalf("helper registration = %d", code)
+		}
+		if res.HelperID == "" || res.APIKey == "" {
+			t.Fatalf("helper registration returned %+v", res)
+		}
+		helperKey = res.APIKey
+
+		// Single use, and an agent token is not a helper token.
+		if code, _ := h.registerHelper(helper, enroll.Token); code != http.StatusUnauthorized {
+			t.Fatalf("reusing a helper enrollment token = %d, want 401", code)
+		}
+		var agentEnroll struct {
+			Token string `json:"token"`
+		}
+		h.ok(http.MethodPost, "/api/agents/enroll-token", nil, &agentEnroll)
+		if code, _ := h.registerHelper(helper, agentEnroll.Token); code != http.StatusUnauthorized {
+			t.Fatalf("an agent enrollment token registered a helper = %d, want 401", code)
+		}
+
+		// Heartbeats need the helper's own API key.
+		if code, body := h.helperCall(http.MethodPost, "/api/helpers/heartbeat", "", nil); code != http.StatusUnauthorized {
+			t.Fatalf("helper heartbeat without a key = %d (%s), want 401", code, body)
+		}
+		if code, body := h.helperCall(http.MethodPost, "/api/helpers/heartbeat", "not-the-key", nil); code != http.StatusUnauthorized {
+			t.Fatalf("helper heartbeat with a wrong key = %d (%s), want 401", code, body)
+		}
+		if code, body := h.helperCall(http.MethodPost, "/api/helpers/heartbeat", helperKey, map[string]any{}); code != http.StatusOK {
+			t.Fatalf("helper heartbeat = %d (%s), want 200", code, body)
+		}
+
+		h.ok(http.MethodGet, "/api/helpers", nil, &helpers)
+		if len(helpers) != 1 {
+			t.Fatalf("helper list = %+v, want exactly one", helpers)
+		}
+		helperInfo = helpers[0]
+		if helperInfo.Node != "pve2" || helperInfo.Port != helper.port {
+			t.Fatalf("registered helper = %+v, want node pve2 on port %d", helperInfo, helper.port)
+		}
+		// The address is learned from the connection, never from the body.
+		if helperInfo.Address != "127.0.0.1" {
+			t.Fatalf("helper address = %q, want the request's remote IP", helperInfo.Address)
+		}
+		if helperInfo.Status != "online" || helperInfo.LastSeen == nil {
+			t.Fatalf("heartbeating helper reports %+v, want online", helperInfo)
+		}
+		if helperInfo.Version != "e2e" || helperInfo.RegisteredAt == "" {
+			t.Fatalf("helper metadata = %+v", helperInfo)
+		}
+		if strings.Contains(string(mustJSON(t, helpers)), helper.secret) {
+			t.Fatal("helper listing leaked the access secret")
+		}
+
+		// The install one-liner downloads the helper binary by this name.
+		if err := os.WriteFile(filepath.Join(h.dataDir, "downloads", "proxback-helper-linux-amd64"),
+			[]byte("ELF-fake-helper"), 0o644); err != nil {
+			t.Fatalf("stage helper download: %v", err)
+		}
+		code2, body := h.do(http.MethodGet, "/downloads/proxback-helper-linux-amd64", nil)
+		if code2 != http.StatusOK || string(body) != "ELF-fake-helper" {
+			t.Fatalf("helper download = %d (%s)", code2, body)
+		}
+	})
+
+	var helperJob apiJob
+	var helperPoint apiBackup
+	mailSource := host.ID + "_103"
+
+	t.Run("20-helper-backed-vm-backup", func(t *testing.T) {
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name":      "mail-via-helper",
+			"kind":      "vm",
+			"targetId":  vmTarget.ID,
+			"schedule":  "manual",
+			"retention": 2,
+			"enabled":   true,
+			"sources":   []map[string]any{{"hostId": host.ID, "vmid": 103, "name": "mail-01"}},
+		}, &helperJob)
+		if helperJob.ID == "" {
+			t.Fatalf("helper job = %+v", helperJob)
+		}
+
+		run := h.runJob(helperJob.ID)
+		if run.BytesProcessed != int64(12*mib) {
+			t.Fatalf("helper backup processed %d bytes, want the whole %d byte archive",
+				run.BytesProcessed, 12*mib)
+		}
+		if run.BytesUploaded != int64(12*mib) {
+			t.Fatalf("first helper backup uploaded %d bytes, want %d", run.BytesUploaded, 12*mib)
+		}
+		if !strings.Contains(run.CurrentStep, "Completed") {
+			t.Fatalf("helper backup finished on step %q", run.CurrentStep)
+		}
+
+		// The archive really came from the helper, with the access secret it
+		// generated at enrollment.
+		exports := helper.matching(http.MethodGet, "/export/103")
+		if len(exports) != 1 {
+			t.Fatalf("helper saw %d exports of vm 103, want 1: %+v", len(exports), helper.seen())
+		}
+		if exports[0].Auth != "Bearer "+helper.secret {
+			t.Fatalf("export authorization = %q, want the helper's access secret", exports[0].Auth)
+		}
+
+		// A whole guest is one manifest stream named "vma".
+		var backups []apiBackup
+		h.ok(http.MethodGet, "/api/backups?sourceKind=vm&sourceId="+mailSource, nil, &backups)
+		if len(backups) != 1 {
+			t.Fatalf("mail-01 restore points = %d, want 1", len(backups))
+		}
+		helperPoint = backups[0]
+		if len(helperPoint.Disks) != 1 || helperPoint.Disks[0].Name != "vma" {
+			t.Fatalf("helper backup disks = %+v, want exactly [{vma}]", helperPoint.Disks)
+		}
+		if helperPoint.Disks[0].SizeBytes != int64(12*mib) || helperPoint.SizeBytes != int64(12*mib) {
+			t.Fatalf("helper backup sizes = %+v", helperPoint)
+		}
+		if helperPoint.Kind != "full" || helperPoint.SourceName != "mail-01" {
+			t.Fatalf("helper backup metadata = %+v", helperPoint)
+		}
+		man := h.manifest(vmBucket, helperPoint.SourceKind, helperPoint.SourceID, helperPoint.ID)
+		if len(man.Disks) != 1 || man.Disks[0].Name != "vma" || len(man.Disks[0].Chunks) != 3 {
+			t.Fatalf("stored manifest = %+v, want one vma stream of 3 chunks", man.Disks)
+		}
+
+		// An unchanged re-run still asks the helper for the archive but stores
+		// nothing new.
+		again := h.runJob(helperJob.ID)
+		if again.BytesUploaded != 0 {
+			t.Fatalf("unchanged helper re-run uploaded %d bytes, want 0", again.BytesUploaded)
+		}
+		if again.DedupRatio < 0.999 {
+			t.Fatalf("unchanged helper re-run dedupRatio = %v, want ~1", again.DedupRatio)
+		}
+		if got := len(helper.matching(http.MethodGet, "/export/103")); got != 2 {
+			t.Fatalf("helper saw %d exports after the second run, want 2", got)
+		}
+
+		// Nodes without a helper are untouched: pve1 guests keep streaming
+		// per-disk through the export extension.
+		legacy := h.runJob(vmJob.ID)
+		if legacy.Status != "success" {
+			t.Fatalf("extension-backed job failed after a helper appeared: %s", legacy.Error)
+		}
+		var web []apiBackup
+		h.ok(http.MethodGet, "/api/backups?sourceKind=vm&sourceId="+host.ID+"_100", nil, &web)
+		if len(web) == 0 {
+			t.Fatal("web-01 has no restore points")
+		}
+		names := make([]string, 0, len(web[0].Disks))
+		for _, d := range web[0].Disks {
+			names = append(names, d.Name)
+		}
+		if strings.Join(names, ",") != "scsi0,scsi1" {
+			t.Fatalf("web-01 disks = %v, want the per-disk streams", names)
+		}
+	})
+
+	t.Run("21-helper-restore-is-byte-identical", func(t *testing.T) {
+		var started struct {
+			RunID string `json:"runId"`
+		}
+		// Side by side into a free vmid: no --force, because nothing is being
+		// overwritten.
+		h.ok(http.MethodPost, "/api/restores", map[string]any{
+			"backupId": helperPoint.ID,
+			"vm":       map[string]any{"hostId": host.ID, "node": "pve2", "vmid": 9993},
+		}, &started)
+		run := h.waitRun(started.RunID, 90*time.Second)
+		if run.Status != "success" {
+			t.Fatalf("helper restore %q: %s", run.Status, run.Error)
+		}
+		if run.BytesProcessed != int64(12*mib) {
+			t.Fatalf("helper restore processed %d bytes, want %d", run.BytesProcessed, 12*mib)
+		}
+
+		got := helper.importedFor(9993)
+		if len(got) != len(helper.content) {
+			t.Fatalf("helper received %d bytes, exported %d", len(got), len(helper.content))
+		}
+		if !bytes.Equal(got, helper.content) {
+			t.Fatal("restored archive differs from the one the helper exported")
+		}
+		imports := helper.matching(http.MethodPost, "/import/9993")
+		if len(imports) != 1 {
+			t.Fatalf("helper saw %d imports of 9993: %+v", len(imports), helper.seen())
+		}
+		if imports[0].Auth != "Bearer "+helper.secret {
+			t.Fatalf("import authorization = %q", imports[0].Auth)
+		}
+		if strings.Contains(imports[0].Query, "force") {
+			t.Fatalf("restore into a new vmid passed %q, want no force flag", imports[0].Query)
+		}
+		if strings.Contains(imports[0].Query, "storage") {
+			t.Fatalf("restore without a storage passed %q", imports[0].Query)
+		}
+
+		// Restoring onto the source vmid is the overwrite case, and the optional
+		// storage override reaches qmrestore.
+		h.ok(http.MethodPost, "/api/restores", map[string]any{
+			"backupId": helperPoint.ID,
+			"vm": map[string]any{
+				"hostId": host.ID, "node": "pve2", "vmid": 103, "storage": "local-lvm",
+			},
+		}, &started)
+		run = h.waitRun(started.RunID, 90*time.Second)
+		if run.Status != "success" {
+			t.Fatalf("in-place helper restore %q: %s", run.Status, run.Error)
+		}
+		imports = helper.matching(http.MethodPost, "/import/103")
+		if len(imports) != 1 {
+			t.Fatalf("helper saw %d imports of 103", len(imports))
+		}
+		if !strings.Contains(imports[0].Query, "force=1") {
+			t.Fatalf("in-place restore query = %q, want force=1", imports[0].Query)
+		}
+		if !strings.Contains(imports[0].Query, "storage=local-lvm") {
+			t.Fatalf("in-place restore query = %q, want the storage override", imports[0].Query)
+		}
+		if !bytes.Equal(helper.importedFor(103), helper.content) {
+			t.Fatal("in-place restored archive differs from the exported one")
+		}
+
+		// A whole-guest archive cannot be restored to a node without a helper,
+		// and the operator is told exactly what to do about it.
+		h.ok(http.MethodPost, "/api/restores", map[string]any{
+			"backupId": helperPoint.ID,
+			"vm":       map[string]any{"hostId": host.ID, "node": "pve1", "vmid": 9994},
+		}, &started)
+		failed := h.waitRun(started.RunID, 90*time.Second)
+		if failed.Status != "failed" {
+			t.Fatalf("restore to a helperless node finished %q", failed.Status)
+		}
+		if !strings.Contains(failed.Error, "no ProxBack node helper installed") ||
+			!strings.Contains(failed.Error, `node "pve1"`) {
+			t.Fatalf("helperless restore error = %q", failed.Error)
+		}
+
+		// Removing the registration is possible, and then the node is helperless
+		// again.
+		h.ok(http.MethodDelete, "/api/helpers/"+helperInfo.ID, nil, nil)
+		var helpers []apiHelper
+		h.ok(http.MethodGet, "/api/helpers", nil, &helpers)
+		if len(helpers) != 0 {
+			t.Fatalf("helper list after delete = %+v", helpers)
+		}
+		if code, _ := h.do(http.MethodDelete, "/api/helpers/"+helperInfo.ID, nil); code != http.StatusNotFound {
+			t.Fatalf("deleting an unknown helper = %d, want 404", code)
+		}
+		// Its API key stops working immediately.
+		if code, _ := h.helperCall(http.MethodPost, "/api/helpers/heartbeat", helperKey, nil); code != http.StatusUnauthorized {
+			t.Fatalf("a deleted helper's key still heartbeats = %d, want 401", code)
+		}
+		// mail-01 falls straight back to the per-disk extension path, which is
+		// what the simulator implements. (On a real host the extension answers
+		// 501 and the run fails with the install-the-helper message instead —
+		// see TestMapExportErrorExplainsAMissingNodeHelper.)
+		mail := h.runJob(helperJob.ID)
+		if mail.BytesProcessed != int64(16*mib) {
+			t.Fatalf("extension-backed mail-01 processed %d bytes, want the 16 MiB disk",
+				mail.BytesProcessed)
+		}
+		var mailPoints []apiBackup
+		h.ok(http.MethodGet, "/api/backups?sourceKind=vm&sourceId="+mailSource, nil, &mailPoints)
+		if len(mailPoints) == 0 {
+			t.Fatal("mail-01 has no restore points")
+		}
+		if len(mailPoints[0].Disks) != 1 || mailPoints[0].Disks[0].Name != "scsi0" {
+			t.Fatalf("newest mail-01 point = %+v, want the per-disk scsi0 stream", mailPoints[0].Disks)
+		}
+	})
 }
 
 // ---------------------------------------------------------------- test data
+
+// assertTags checks an inventory listing against the simulator's tag topology.
+func assertTags(t *testing.T, what string, vms []apiVM) {
+	t.Helper()
+	want := map[int][]string{
+		100: {"prod", "web"}, // web-01
+		101: {"db", "prod"},  // db-01
+		102: {"dev"},         // app-01
+		103: {"dev", "mail"}, // mail-01
+	}
+	for _, v := range vms {
+		if v.Tags == nil {
+			t.Fatalf("%s guest %d (%s) has null tags, want an array", what, v.VMID, v.Name)
+		}
+		expected, known := want[v.VMID]
+		if !known {
+			continue
+		}
+		if strings.Join(v.Tags, ",") != strings.Join(expected, ",") {
+			t.Fatalf("%s guest %d (%s) tags = %v, want %v", what, v.VMID, v.Name, v.Tags, expected)
+		}
+	}
+}
 
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()

@@ -12,6 +12,7 @@ import {
   EmptyState,
   ErrorBlock,
   IconButton,
+  Num,
   PageHeader,
   SectionNote,
   SkeletonRows,
@@ -87,7 +88,7 @@ function AgentTable({ agents, onChanged }: { agents: Agent[]; onChanged: () => v
         </thead>
         <tbody className="divide-y divide-slate-800/70">
           {agents.map((agent) => (
-            <tr key={String(agent.id)} className="transition-colors hover:bg-slate-800/30">
+            <tr key={String(agent.id)} className="transition-colors duration-150 hover:bg-slate-800/30">
               <td className="px-5 py-3">
                 <div className="flex items-center gap-2.5">
                   <span className="flex size-7 shrink-0 items-center justify-center rounded-lg border border-slate-800 bg-slate-950/60 text-accent-400">
@@ -105,15 +106,15 @@ function AgentTable({ agents, onChanged }: { agents: Agent[]; onChanged: () => v
               <td className="px-5 py-3">
                 <StatusPill tone={toneForStatus(agent.status)} label={agent.status} />
               </td>
-              <td className="px-5 py-3 whitespace-nowrap text-slate-400">
-                {formatRelative(agent.lastSeen)}
+              <td className="px-5 py-3 whitespace-nowrap">
+                <Num className="text-slate-400">{formatRelative(agent.lastSeen)}</Num>
               </td>
-              <td className="px-5 py-3 whitespace-nowrap text-slate-500">
-                {formatDateTime(agent.registeredAt)}
+              <td className="px-5 py-3 whitespace-nowrap">
+                <Num className="text-slate-500">{formatDateTime(agent.registeredAt)}</Num>
               </td>
               <td className="px-5 py-3 text-right">
                 <IconButton
-                  variant="danger"
+                  variant="dangerQuiet"
                   aria-label={`Remove ${agent.hostname}`}
                   title="Remove agent"
                   loading={deleting === String(agent.id)}

@@ -1,14 +1,26 @@
 import { useCallback, useState } from 'react'
 import type { FormEvent } from 'react'
-import { Plug, Plus, RefreshCw, Server, Trash2 } from 'lucide-react'
-import { createHost, deleteHost, errorMessage, listHosts, testHost } from '../api'
-import type { Host, HostCreate, ID } from '../api'
+import { KeyRound, Plug, Plus, RefreshCw, Server, Trash2 } from 'lucide-react'
+import {
+  createHelperEnrollToken,
+  createHost,
+  deleteHelper,
+  deleteHost,
+  errorMessage,
+  HELPER_DOWNLOAD,
+  listHelpers,
+  listHosts,
+  testHost,
+} from '../api'
+import type { EnrollToken, Helper, Host, HostCreate, ID } from '../api'
+import { CopyField } from '../components/CopyField'
 import { Modal } from '../components/Modal'
 import { useConfirm } from '../components/Confirm'
 import { useToast } from '../components/Toast'
 import {
   Button,
   Card,
+  CardHeader,
   Checkbox,
   EmptyState,
   ErrorBlock,
@@ -16,6 +28,7 @@ import {
   IconButton,
   Input,
   Metric,
+  Num,
   PageHeader,
   SectionNote,
   SkeletonCards,
@@ -283,7 +296,7 @@ function HostCard({
 
       <dl className="mt-5 grid grid-cols-2 gap-4">
         <Metric label="Token ID" value={<span className="font-mono text-xs">{host.tokenId}</span>} />
-        <Metric label="Last seen" value={formatRelative(host.lastSeen)} />
+        <Metric label="Last seen" value={<Num>{formatRelative(host.lastSeen)}</Num>} />
         <Metric label="TLS" value={host.insecureTLS ? 'Self-signed allowed' : 'Verified'} />
       </dl>
 
@@ -307,7 +320,7 @@ function HostCard({
           Test Connection
         </Button>
         <IconButton
-          variant="danger"
+          variant="dangerQuiet"
           aria-label={`Remove ${host.name}`}
           title="Remove host"
           className="ml-auto"
@@ -391,11 +404,189 @@ export function HostsPage() {
         </div>
       )}
 
+      <HelpersSection />
+
       <AddHostModal
         open={addOpen}
         onClose={() => setAddOpen(false)}
         onCreated={() => void refresh()}
       />
     </>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Node helpers
+ *
+ * Agentless VM image backup on a real Proxmox host runs through a helper
+ * service on each node (real PVE has no disk-export API). Deployment mirrors
+ * the agent flow: single-use token, one command pasted on the node.
+ * ------------------------------------------------------------------------- */
+
+function helperInstallCommand(origin: string, token: string): string {
+  return [
+    `curl -fsSL ${origin}${HELPER_DOWNLOAD} -o /usr/local/bin/proxback-helper`,
+    'chmod +x /usr/local/bin/proxback-helper',
+    `/usr/local/bin/proxback-helper --server ${origin} --token ${token} --install`,
+  ].join(' && ')
+}
+
+function HelpersSection() {
+  const toast = useToast()
+  const confirm = useConfirm()
+  const loader = useCallback(() => listHelpers(), [])
+  const { data, loading, error, reload, refresh } = useAsync(loader)
+  const helpers = data ?? []
+
+  const [token, setToken] = useState<EnrollToken | null>(null)
+  const [generating, setGenerating] = useState(false)
+  const [deleting, setDeleting] = useState<string | null>(null)
+  const origin = typeof window === 'undefined' ? '' : window.location.origin
+
+  const onGenerate = async () => {
+    setGenerating(true)
+    try {
+      const next = await createHelperEnrollToken()
+      setToken(next)
+      toast.success('Helper enrollment token generated.', 'Single use — expires after 24 hours.')
+    } catch (err) {
+      toast.error('Could not generate token', errorMessage(err))
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  const onDelete = async (helper: Helper) => {
+    const ok = await confirm({
+      title: 'Remove node helper',
+      message: (
+        <>
+          Remove the helper for node{' '}
+          <span className="font-medium text-slate-100">{helper.node}</span>? Agentless image backups
+          and restores for VMs on that node stop working until a helper is deployed again.
+        </>
+      ),
+      confirmLabel: 'Remove helper',
+    })
+    if (!ok) return
+    setDeleting(String(helper.id))
+    try {
+      await deleteHelper(helper.id)
+      toast.success(`Helper for “${helper.node}” removed.`)
+      void refresh()
+    } catch (err) {
+      toast.error('Could not remove helper', errorMessage(err))
+    } finally {
+      setDeleting(null)
+    }
+  }
+
+  return (
+    <Card className="mt-6">
+      <CardHeader
+        title="Node helpers"
+        subtitle="One per Proxmox node — streams VM image backups through vzdump and restores through qmrestore. Required for agentless backup of real hosts."
+        actions={
+          <>
+            <Button
+              size="sm"
+              icon={<RefreshCw className="size-3.5" aria-hidden />}
+              onClick={() => void reload()}
+              loading={loading}
+            >
+              Refresh
+            </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              loading={generating}
+              icon={<KeyRound className="size-3.5" aria-hidden />}
+              onClick={() => void onGenerate()}
+            >
+              {token ? 'Generate new token' : 'Deploy helper'}
+            </Button>
+          </>
+        }
+      />
+
+      {error && !data ? (
+        <div className="px-5 py-5">
+          <ErrorBlock message={error} onRetry={() => void reload()} />
+        </div>
+      ) : helpers.length > 0 ? (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[42rem] text-sm">
+            <thead>
+              <tr className="border-b border-slate-800 text-left text-[11px] tracking-wide text-slate-500 uppercase">
+                <th className="px-5 py-2.5 font-medium">Node</th>
+                <th className="px-5 py-2.5 font-medium">Address</th>
+                <th className="px-5 py-2.5 font-medium">Version</th>
+                <th className="px-5 py-2.5 font-medium">Status</th>
+                <th className="px-5 py-2.5 font-medium">Last seen</th>
+                <th className="px-5 py-2.5" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/70">
+              {helpers.map((helper) => (
+                <tr
+                  key={String(helper.id)}
+                  className="transition-colors duration-150 hover:bg-slate-800/30"
+                >
+                  <td className="px-5 py-3 font-medium text-slate-100">{helper.node}</td>
+                  <td className="px-5 py-3 font-mono text-xs whitespace-nowrap text-slate-400">
+                    {helper.address}:{helper.port}
+                  </td>
+                  <td className="px-5 py-3 font-mono text-xs whitespace-nowrap text-slate-400">
+                    {helper.version}
+                  </td>
+                  <td className="px-5 py-3">
+                    <StatusPill tone={toneForStatus(helper.status)} label={helper.status} />
+                  </td>
+                  <td className="px-5 py-3 whitespace-nowrap">
+                    <Num className="text-slate-400">{formatRelative(helper.lastSeen)}</Num>
+                  </td>
+                  <td className="px-5 py-3 text-right">
+                    <IconButton
+                      variant="dangerQuiet"
+                      aria-label={`Remove helper for ${helper.node}`}
+                      title="Remove helper"
+                      loading={deleting === String(helper.id)}
+                      onClick={() => void onDelete(helper)}
+                    >
+                      <Trash2 className="size-4" aria-hidden />
+                    </IconButton>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : !token ? (
+        <div className="px-5 py-5">
+          <SectionNote>
+            No node helpers yet — agentless VM backups will fail with an “install the node helper”
+            error until each node runs one. Press Deploy helper, then paste the command into a root
+            shell on every Proxmox node.
+          </SectionNote>
+        </div>
+      ) : null}
+
+      {token ? (
+        <div className="space-y-4 border-t border-slate-800 px-5 py-5">
+          <CopyField
+            label="Enrollment token"
+            value={token.token}
+            copyLabel="Token"
+            caption={`Single use — expires ${formatRelative(token.expiresAt)}. Generate one token per node.`}
+          />
+          <CopyField
+            label="Proxmox node — root shell"
+            value={helperInstallCommand(origin, token.token)}
+            copyLabel="Helper install command"
+            caption="Downloads the helper, installs the systemd unit, and registers this node. Run on the node itself (needs vzdump and qmrestore)."
+          />
+        </div>
+      ) : null}
+    </Card>
   )
 }

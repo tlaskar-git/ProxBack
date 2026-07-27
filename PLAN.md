@@ -75,10 +75,49 @@ proxback/
 Backup flow (agentless): snapshot VM → export each disk stream through the engine → delete
 snapshot → write manifest per disk (one backupID covers all disks of the VM).
 
+## Node helper (real-PVE agentless backup; v0.3.0)
+
+Real Proxmox has no disk-export API, so agentless image backup of a real host runs through
+a **node helper**: a single root binary (`cmd/proxback-helper`) installed as a systemd
+service on each PVE node. It wraps PVE's own tooling — export streams
+`vzdump <vmid> --mode snapshot --compress 0 --stdout` (a VMA archive; snapshot consistency,
+all storage types, qemu-agent freeze handled by PVE itself) and import pipes the archive
+into `qmrestore - <vmid>`. The simulator's `proxback-export`/`proxback-import` extension
+remains as the test/dev path; when a VM's node has no registered helper and the extension
+answers 404/501, the run fails with an actionable "install the node helper" error.
+
+- Enrollment mirrors agents: UI generates a single-use token (24 h); the install one-liner
+  downloads `/downloads/proxback-helper-linux-amd64` from the server and runs
+  `proxback-helper --server <url> --token <t> --install`. On registration the helper
+  generates its own access secret; the server stores it encrypted and authenticates to the
+  helper with `Authorization: Bearer <secret>`.
+- Helper HTTP API (listens on :8007 by default, plain HTTP on the management network):
+  - `GET  /healthz` → `{"node","version"}` (unauthenticated)
+  - `GET  /export/{vmid}` → VMA stream (vzdump --stdout)
+  - `POST /import/{vmid}?storage=<s>` ← VMA stream (qmrestore from stdin)
+- Server REST additions (session auth unless noted):
+  - `POST /api/helpers/enroll-token` → `{"token","expiresAt"}`
+  - `GET  /api/helpers` → `[{"id","node","address","port","version","status":"online"|
+    "offline","lastSeen","registeredAt"}]`
+  - `DELETE /api/helpers/{id}`
+  - Helper-facing: `POST /api/helpers/register` `{token,node,port,version,accessSecret}` →
+    `{"helperId","apiKey"}` (address learned from the connection's remote IP);
+    `POST /api/helpers/heartbeat` (Bearer apiKey, 30 s cadence; online = seen within 90 s)
+- Backup via helper: matched by PVE node name; the whole VM streams as ONE disk entry
+  named `vma` in the manifest (`disks:[{"name":"vma",...}]`). No explicit PVE snapshot
+  calls — vzdump owns consistency. Restore via helper streams the `vma` entry into
+  `/import/{vmid}`. Sim-backed VMs (no helper registered, extension present) keep the
+  per-disk path unchanged.
+- E2E: a fake in-process helper (httptest) registers via the real enrollment flow, serves
+  a deterministic VMA-stand-in stream for export and captures imports; the suite proves
+  helper-path backup, dedup on re-run, and byte-identical helper restore.
+
 `cmd/pve-sim` serves this API subset with 2 nodes / 4 configurable fake VMs whose disk
 content is deterministic pseudo-random data (seeded per VM, a few MiB each) that can be
 **mutated** via a sim-only endpoint (`POST /sim/mutate/{vmid}`) so E2E can prove incrementals
 upload fewer chunks. Auth: accepts any PVEAPIToken header (records it for assertions).
+Sim guests carry PVE-style tags (semicolon-separated `tags` field in the qemu listing):
+web-01 `prod;web`, db-01 `prod;db`, app-01 `dev`, mail-01 `dev;mail`.
 
 ## Agent design (file-level path)
 
@@ -123,7 +162,9 @@ Proxmox hosts
 - `POST /api/hosts/{id}/test` → `{"ok":bool,"nodes":int,"error"?}`
 - `DELETE /api/hosts/{id}`
 - `GET  /api/hosts/{id}/vms` → live inventory
-  `[{"vmid","name","node","status","maxdisk","maxmem","uptime"}]` (also refreshes vms_cache)
+  `[{"vmid","name","node","status","maxdisk","maxmem","uptime","tags":["prod","web"]}]`
+  (also refreshes vms_cache; `tags` parsed from PVE's semicolon-separated `tags` field,
+  lower-cased, sorted, may be empty)
 - `GET  /api/vms` → cached inventory across all hosts, same shape + `hostId`,`hostName`
 
 S3 targets
@@ -135,10 +176,18 @@ S3 targets
 
 Jobs
 - `GET  /api/jobs` → `[{"id","name","kind":"vm"|"agent","targetId","targetName","schedule",
-  "retention","enabled","sources":[...],"lastRun":JobRun|null}]`
+  "retention","enabled","sources":[...],"tagFilter":string|null,"nextRun":RFC3339|null,
+  "lastRun":JobRun|null}]`
   - vm job sources: `[{"hostId","vmid","name"}]`; agent job: `{"agentId","paths":[...]}`
-- `POST /api/jobs` `{name,kind,targetId,schedule("manual"|cron5),retention,sources,enabled}`
-- `PATCH /api/jobs/{id}` (same fields, partial)
+  - `tagFilter` (vm jobs only): when set, membership is dynamic — at run start the job
+    resolves to every cached VM carrying that tag (sources array may be empty); VMs added
+    to Proxmox later with the tag are picked up automatically. A run with zero matching
+    VMs fails with a clear error.
+  - `nextRun`: next scheduled fire time computed from the cron schedule; null for
+    "manual" schedules and disabled jobs.
+- `POST /api/jobs` `{name,kind,targetId,schedule("manual"|cron5),retention,sources,
+  tagFilter?,enabled}`
+- `PATCH /api/jobs/{id}` (same fields, partial; setting tagFilter:"" clears it)
 - `DELETE /api/jobs/{id}`
 - `POST /api/jobs/{id}/run` → `{"runId"}` (409 if already running)
 - `GET  /api/runs?jobId=&limit=` → `[JobRun]`
@@ -152,6 +201,10 @@ Restore points & restore
 - `GET  /api/backups?sourceKind=&sourceId=&targetId=` → `[{"id","jobId","sourceKind",
   "sourceId","sourceName","targetId","createdAt","sizeBytes","uploadedBytes","kind":"full"|
   "incremental","parentId"?,"disks":[{"name","sizeBytes"}]}]`
+- `POST /api/backups/{id}/verify` → `{"runId"}` — health-check run (jobName
+  "Verify <sourceName>") that downloads every chunk of the restore point and validates its
+  SHA-256 + sizes without writing anywhere; success means the point is restorable.
+  409 when a verify for the same backup is already running.
 - `DELETE /api/backups/{id}`
 - `POST /api/restores` `{backupId, vm?:{hostId,node,vmid}, agent?:{agentId,destPath}}`
   → `{"runId"}` (restore runs appear in /api/runs with jobName "Restore …")
@@ -169,7 +222,17 @@ Agents
   - `GET  /api/agents/restores/{runId}/stream` → tar stream for restore
 
 Settings
-- `GET/PUT /api/settings` → `{"serverName","concurrency"}`
+- `GET/PUT /api/settings` → `{"serverName","concurrency","webhookUrl","notifyOn"}`
+  - `webhookUrl`: empty disables notifications. `notifyOn`: `"off"|"failures"|"all"`.
+- `POST /api/settings/test-webhook` → `{"ok":bool,"error"?}` — sends a sample payload to
+  the saved webhook URL.
+
+Notifications: when a backup/restore/verify run finishes and notifyOn matches, the server
+POSTs JSON to webhookUrl (10 s timeout; failures are logged, never block runs):
+`{"event":"run.finished","server":serverName,"job":jobName,"kind":"vm"|"agent"|"restore"|
+"verify","status","bytesProcessed","bytesUploaded","dedupRatio","error"?,"startedAt",
+"finishedAt","durationSec"}`. The payload is plain JSON usable by ntfy, Gotify, Discord
+(via webhook proxy), or any automation endpoint.
 
 Software update (session auth; release source is the GitHub repo, overridable via
 `PROXBACK_UPDATE_REPO` / `PROXBACK_UPDATE_API` env vars)

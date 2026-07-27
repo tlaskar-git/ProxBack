@@ -123,6 +123,11 @@ export interface VM {
   maxdisk: number
   maxmem: number
   uptime: number
+  /**
+   * Proxmox tags for this guest — lower-cased and sorted by the server, and
+   * possibly empty. Jobs can target a tag instead of a fixed VM list.
+   */
+  tags: string[]
 }
 
 /** Cached inventory row from `GET /api/vms` — same shape plus host attribution. */
@@ -197,6 +202,17 @@ export interface Job {
   retention: number
   enabled: boolean
   sources: JobSources
+  /**
+   * VM jobs only. When set, membership is dynamic: at run start the job
+   * resolves to every cached VM carrying this tag, so guests tagged later in
+   * Proxmox are picked up automatically and `sources` may be empty.
+   */
+  tagFilter: string | null
+  /**
+   * Next scheduled fire time (RFC 3339), or null for manual schedules and
+   * disabled jobs.
+   */
+  nextRun: string | null
   lastRun: JobRun | null
 }
 
@@ -208,6 +224,8 @@ export interface JobCreate {
   retention: number
   sources: JobSources
   enabled: boolean
+  /** VM jobs only. Empty string clears an existing tag filter. */
+  tagFilter?: string
 }
 
 export type JobPatch = Partial<JobCreate>
@@ -270,6 +288,11 @@ export interface RestoreVMTarget {
   hostId: ID
   node: string
   vmid: number
+  /**
+   * Proxmox storage the restored disks land on (vzdump-based `vma` restore
+   * points only). Empty lets qmrestore use the storage recorded in the backup.
+   */
+  storage?: string
 }
 
 export interface RestoreAgentTarget {
@@ -303,11 +326,41 @@ export interface EnrollToken {
   expiresAt: string
 }
 
+/* Node helpers ------------------------------------------------------------- */
+
+/**
+ * A ProxBack node helper: a root service on a Proxmox node that streams
+ * `vzdump --stdout` / `qmrestore` so agentless VM image backup works on real
+ * hosts (which have no disk-export API).
+ */
+export interface Helper {
+  id: ID
+  /** Proxmox node name this helper serves (matched against VM inventory). */
+  node: string
+  address: string
+  port: number
+  version: string
+  status: 'online' | 'offline'
+  lastSeen: string
+  registeredAt: string
+}
+
 /* Settings ---------------------------------------------------------------- */
+
+/** When the server POSTs a run summary to `webhookUrl`. */
+export type NotifyOn = 'off' | 'failures' | 'all'
 
 export interface Settings {
   serverName: string
   concurrency: number
+  /** Empty disables notifications entirely. */
+  webhookUrl: string
+  notifyOn: NotifyOn
+}
+
+export interface WebhookTestResult {
+  ok: boolean
+  error?: string
 }
 
 /* ---------------------------------------------------------------------------
@@ -604,6 +657,17 @@ export function listBackups(query: BackupQuery = {}): Promise<Backup[]> {
   })
 }
 
+/**
+ * Starts a health-check run that re-downloads every chunk of the restore point
+ * and validates its SHA-256. Rejects with a 409 `ApiError` when a verification
+ * of the same restore point is already in flight.
+ */
+export function verifyBackup(id: ID): Promise<RunRef> {
+  return request<RunRef>(`/api/backups/${encodeURIComponent(String(id))}/verify`, {
+    method: 'POST',
+  })
+}
+
 export function deleteBackup(id: ID): Promise<void> {
   return request<void>(`/api/backups/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
 }
@@ -624,6 +688,22 @@ export function createEnrollToken(): Promise<EnrollToken> {
   return request<EnrollToken>('/api/agents/enroll-token', { method: 'POST' })
 }
 
+/* ---------------------------------------------------------------------------
+ * Node helpers
+ * ------------------------------------------------------------------------- */
+
+export function listHelpers(): Promise<Helper[]> {
+  return request<Helper[]>('/api/helpers')
+}
+
+export function createHelperEnrollToken(): Promise<EnrollToken> {
+  return request<EnrollToken>('/api/helpers/enroll-token', { method: 'POST' })
+}
+
+export function deleteHelper(id: ID): Promise<void> {
+  return request<void>(`/api/helpers/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
+}
+
 export function deleteAgent(id: ID): Promise<void> {
   return request<void>(`/api/agents/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
 }
@@ -640,6 +720,11 @@ export function putSettings(input: Settings): Promise<Settings> {
   return request<Settings>('/api/settings', { method: 'PUT', body: { ...input } })
 }
 
+/** Sends a sample payload to the saved webhook URL. Never throws on a 200. */
+export function testWebhook(): Promise<WebhookTestResult> {
+  return request<WebhookTestResult>('/api/settings/test-webhook', { method: 'POST' })
+}
+
 /* ---------------------------------------------------------------------------
  * Download paths for the agent binaries (served by the Go server).
  * ------------------------------------------------------------------------- */
@@ -648,6 +733,8 @@ export const AGENT_DOWNLOADS = {
   linux: '/downloads/proxback-agent-linux-amd64',
   windows: '/downloads/proxback-agent-windows-amd64.exe',
 } as const
+
+export const HELPER_DOWNLOAD = '/downloads/proxback-helper-linux-amd64' as const
 
 /* ---------------------------------------------------------------------------
  * Job source helpers
@@ -671,6 +758,28 @@ export function vmSourcesOf(job: Pick<Job, 'sources'>): VMJobSource[] {
   const sources: unknown = job.sources
   if (!Array.isArray(sources)) return []
   return (sources as unknown[]).filter(isVMJobSource)
+}
+
+/**
+ * The Proxmox tags of an inventory row, tolerant of servers that omit the
+ * field entirely.
+ */
+export function tagsOf(vm: Pick<VM, 'tags'>): string[] {
+  const tags: unknown = vm.tags
+  if (!Array.isArray(tags)) return []
+  return tags.filter((tag): tag is string => typeof tag === 'string' && tag.length > 0)
+}
+
+/** Sorted union of every tag present in an inventory list. */
+export function allTagsOf(vms: Pick<VM, 'tags'>[]): string[] {
+  const seen = new Set<string>()
+  for (const vm of vms) for (const tag of tagsOf(vm)) seen.add(tag)
+  return [...seen].sort((a, b) => a.localeCompare(b))
+}
+
+/** VMs currently carrying `tag` — what a tag-filtered job resolves to today. */
+export function vmsWithTag<T extends Pick<VM, 'tags'>>(vms: T[], tag: string): T[] {
+  return vms.filter((vm) => tagsOf(vm).includes(tag))
 }
 
 /** The agent source of a job, or `null` for VM jobs. */

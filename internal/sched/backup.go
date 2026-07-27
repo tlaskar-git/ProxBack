@@ -65,24 +65,57 @@ func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *sto
 // ---------------------------------------------------------------- vm backups
 
 type vmPlan struct {
-	client     *pve.Client
-	hostID     string
-	node       string
-	vmid       int
-	name       string
-	sourceID   string
-	disks      []pve.DiskInfo
+	client   *pve.Client
+	hostID   string
+	node     string
+	vmid     int
+	name     string
+	sourceID string
+	disks    []pve.DiskInfo
+	// helper is the node helper that owns this guest's node, or nil when the node
+	// has none and the export extension has to be tried instead.
+	helper     *store.NodeHelper
 	totalBytes int64
 }
 
+// resolveTagFilter expands a job's tag filter into concrete VM sources from the
+// cached inventory. Membership is therefore dynamic: guests tagged in Proxmox
+// after the job was created are picked up on the next run.
+func (m *Manager) resolveTagFilter(ctx context.Context, job *store.Job) (store.JobSources, error) {
+	vms, err := m.st.ListCachedVMs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := store.JobSources{}
+	for _, v := range vms {
+		if !v.HasTag(job.TagFilter) {
+			continue
+		}
+		out = append(out, store.JobSource{HostID: v.HostID, VMID: v.VMID, Name: v.Name})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no VMs carry tag %q", job.TagFilter)
+	}
+	m.log.Info("tag filter resolved", "job", job.Name, "tag", job.TagFilter, "vms", len(out))
+	return out, nil
+}
+
 func (m *Manager) planVMJob(ctx context.Context, job *store.Job) ([]vmPlan, int64, error) {
-	if len(job.Sources) == 0 {
+	sources := job.Sources
+	if job.TagFilter != "" {
+		resolved, err := m.resolveTagFilter(ctx, job)
+		if err != nil {
+			return nil, 0, err
+		}
+		sources = resolved
+	}
+	if len(sources) == 0 {
 		return nil, 0, errors.New("sched: vm job has no sources")
 	}
 	var total int64
-	plans := make([]vmPlan, 0, len(job.Sources))
+	plans := make([]vmPlan, 0, len(sources))
 	clients := map[string]*pve.Client{}
-	for _, src := range job.Sources {
+	for _, src := range sources {
 		if src.HostID == "" || src.VMID == 0 {
 			return nil, 0, errors.New("sched: vm job source needs hostId and vmid")
 		}
@@ -128,8 +161,13 @@ func (m *Manager) planVMJob(ctx context.Context, job *store.Job) ([]vmPlan, int6
 		if len(p.disks) == 0 {
 			return nil, 0, fmt.Errorf("sched: vm %d has no backup-eligible disks", src.VMID)
 		}
+		// The guest's disk sizes are the progress estimate for both paths; a
+		// vzdump archive's real size is only known once it has been produced.
 		for _, d := range p.disks {
 			p.totalBytes += d.SizeBytes
+		}
+		if p.helper, err = m.helperForNode(ctx, p.node); err != nil {
+			return nil, 0, err
 		}
 		total += p.totalBytes
 		plans = append(plans, p)
@@ -151,18 +189,25 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 		}
 		before := sess.Stats()
 
-		sess.SetStep("Snapshotting " + p.name)
-		upid, err := p.client.CreateSnapshot(ctx, p.node, p.vmid, snapname)
-		if err != nil {
-			return statsPtr(sess), fmt.Errorf("snapshot %s: %w", p.name, err)
-		}
-		if err := p.client.WaitTask(ctx, p.node, upid, SnapshotTaskTimeout); err != nil {
-			return statsPtr(sess), fmt.Errorf("snapshot %s: %w", p.name, err)
-		}
-
-		disks, err := m.exportDisks(ctx, sess, p, snapname)
-		if err != nil {
-			return statsPtr(sess), err
+		var disks []engine.DiskManifest
+		if p.helper != nil {
+			// vzdump owns snapshot consistency, so ProxBack must not create one.
+			var err error
+			if disks, err = m.backupViaHelper(ctx, sess, p); err != nil {
+				return statsPtr(sess), err
+			}
+		} else {
+			sess.SetStep("Snapshotting " + p.name)
+			upid, err := p.client.CreateSnapshot(ctx, p.node, p.vmid, snapname)
+			if err != nil {
+				return statsPtr(sess), fmt.Errorf("snapshot %s: %w", p.name, err)
+			}
+			if err := p.client.WaitTask(ctx, p.node, upid, SnapshotTaskTimeout); err != nil {
+				return statsPtr(sess), fmt.Errorf("snapshot %s: %w", p.name, err)
+			}
+			if disks, err = m.exportDisks(ctx, sess, p, snapname); err != nil {
+				return statsPtr(sess), err
+			}
 		}
 		after := sess.Stats()
 
@@ -246,7 +291,9 @@ func (m *Manager) exportDisks(ctx context.Context, sess *engine.Session, p vmPla
 		sess.SetStep(fmt.Sprintf("Backing up %s %s", p.name, d.Name))
 		stream, err := p.client.ExportDisk(ctx, p.node, p.vmid, d.Name, snapname)
 		if err != nil {
-			return nil, err
+			// Only the simulator implements the export extension. On a real node
+			// the answer is "no such endpoint", which means the node needs a helper.
+			return nil, mapExportError(err, p.node)
 		}
 		dm, err := sess.BackupStream(ctx, d.Name, stream)
 		closeErr := stream.Close()

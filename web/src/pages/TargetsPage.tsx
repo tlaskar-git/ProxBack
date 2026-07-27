@@ -306,7 +306,7 @@ function TargetCard({ target, onChanged }: { target: Target; onChanged: () => vo
           Test
         </Button>
         <IconButton
-          variant="danger"
+          variant="dangerQuiet"
           aria-label={`Remove ${target.name}`}
           title="Remove target"
           className="ml-auto"

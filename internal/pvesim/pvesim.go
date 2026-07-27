@@ -37,6 +37,7 @@ type simVM struct {
 	Name      string
 	Node      string
 	Status    string
+	Tags      string // PVE-style semicolon separated tag list
 	MaxMem    int64
 	Uptime    int64
 	DiskNames []string
@@ -74,13 +75,14 @@ func New(log *slog.Logger) *Sim {
 		vmid  int
 		name  string
 		node  string
+		tags  string
 		disks []string
 	}
 	defs := []def{
-		{100, "web-01", "pve1", []string{"scsi0", "scsi1"}},
-		{101, "db-01", "pve1", []string{"scsi0"}},
-		{102, "app-01", "pve2", []string{"scsi0"}},
-		{103, "mail-01", "pve2", []string{"scsi0"}},
+		{100, "web-01", "pve1", "prod;web", []string{"scsi0", "scsi1"}},
+		{101, "db-01", "pve1", "prod;db", []string{"scsi0"}},
+		{102, "app-01", "pve2", "dev", []string{"scsi0"}},
+		{103, "mail-01", "pve2", "dev;mail", []string{"scsi0"}},
 	}
 	for _, d := range defs {
 		vm := &simVM{
@@ -88,6 +90,7 @@ func New(log *slog.Logger) *Sim {
 			Name:      d.name,
 			Node:      d.node,
 			Status:    "running",
+			Tags:      d.tags,
 			MaxMem:    2 << 30,
 			Uptime:    int64(3600 * (d.vmid - 99)),
 			DiskNames: d.disks,
@@ -292,6 +295,7 @@ func (s *Sim) handleQemuList(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]any{
 			"vmid": vm.VMID, "name": vm.Name, "status": vm.Status,
 			"maxdisk": maxdisk, "maxmem": vm.MaxMem, "uptime": vm.Uptime,
+			"tags": vm.Tags,
 			"cpus": 2, "diskread": 0, "diskwrite": 0,
 		})
 	}
@@ -320,6 +324,7 @@ func (s *Sim) handleConfig(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	cfg := map[string]any{
 		"name":    vm.Name,
+		"tags":    vm.Tags,
 		"cores":   2,
 		"memory":  vm.MaxMem / (1 << 20),
 		"ostype":  "l26",

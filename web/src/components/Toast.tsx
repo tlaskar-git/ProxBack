@@ -1,21 +1,28 @@
 import { createContext, useCallback, useContext, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { CheckCircle2, Info, X, XCircle } from 'lucide-react'
+import { ArrowRight, CheckCircle2, Info, X, XCircle } from 'lucide-react'
 import { cn } from '../lib/cn'
 
 export type ToastKind = 'success' | 'error' | 'info'
+
+/** Optional one-tap follow-up, e.g. “View in Monitor”. */
+export interface ToastAction {
+  label: string
+  onClick: () => void
+}
 
 interface Toast {
   id: number
   kind: ToastKind
   title: string
   detail?: string
+  action?: ToastAction
 }
 
 interface ToastApi {
-  success: (title: string, detail?: string) => void
-  error: (title: string, detail?: string) => void
-  info: (title: string, detail?: string) => void
+  success: (title: string, detail?: string, action?: ToastAction) => void
+  error: (title: string, detail?: string, action?: ToastAction) => void
+  info: (title: string, detail?: string, action?: ToastAction) => void
 }
 
 const ToastContext = createContext<ToastApi | null>(null)
@@ -44,19 +51,19 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const push = useCallback(
-    (kind: ToastKind, title: string, detail?: string) => {
+    (kind: ToastKind, title: string, detail?: string, action?: ToastAction) => {
       const id = nextId.current++
-      setToasts((current) => [...current.slice(-4), { id, kind, title, detail }])
-      window.setTimeout(() => dismiss(id), kind === 'error' ? 8000 : 4500)
+      setToasts((current) => [...current.slice(-4), { id, kind, title, detail, action }])
+      window.setTimeout(() => dismiss(id), kind === 'error' || action ? 8000 : 4500)
     },
     [dismiss],
   )
 
   const api = useMemo<ToastApi>(
     () => ({
-      success: (title, detail) => push('success', title, detail),
-      error: (title, detail) => push('error', title, detail),
-      info: (title, detail) => push('info', title, detail),
+      success: (title, detail, action) => push('success', title, detail, action),
+      error: (title, detail, action) => push('error', title, detail, action),
+      info: (title, detail, action) => push('info', title, detail, action),
     }),
     [push],
   )
@@ -85,11 +92,24 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   {toast.detail}
                 </p>
               ) : null}
+              {toast.action ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    toast.action?.onClick()
+                    dismiss(toast.id)
+                  }}
+                  className="mt-2 inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-900/60 px-2 py-1 text-[11px] font-medium text-slate-200 transition-colors duration-150 hover:border-slate-600 hover:bg-slate-800 hover:text-white"
+                >
+                  {toast.action.label}
+                  <ArrowRight className="size-3" aria-hidden />
+                </button>
+              ) : null}
             </div>
             <button
               type="button"
               onClick={() => dismiss(toast.id)}
-              className="-mr-1 -mt-0.5 rounded-md p-1 text-slate-500 transition hover:bg-white/5 hover:text-slate-300"
+              className="-mr-1 -mt-0.5 rounded-md p-1 text-slate-500 transition-colors duration-150 hover:bg-white/5 hover:text-slate-300"
               aria-label="Dismiss notification"
             >
               <X className="size-3.5" aria-hidden />

@@ -20,6 +20,7 @@ import {
   CardHeader,
   EmptyState,
   ErrorBlock,
+  Num,
   PageHeader,
   ProgressBar,
   RunStatusPill,
@@ -31,11 +32,17 @@ import {
   clampPct,
   formatBytes,
   formatCount,
+  formatDateTime,
   formatDuration,
   formatRatio,
   formatRelative,
 } from '../lib/format'
 
+/**
+ * One stat tile. The five of them are a single visual family: same 16px
+ * padding, same tinted icon square, same 11px uppercase label, same 28px
+ * mono value.
+ */
 function StatCard({
   icon: Icon,
   label,
@@ -50,15 +57,19 @@ function StatCard({
   return (
     <Link
       to={to}
-      className="group rounded-xl border border-slate-800 bg-slate-900/60 px-5 py-4 transition-colors hover:border-slate-700 hover:bg-slate-900"
+      className="group flex items-center gap-3.5 rounded-xl border border-slate-800 bg-slate-900/60 p-4 transition-colors duration-150 hover:border-slate-700 hover:bg-slate-900"
     >
-      <div className="flex items-center justify-between">
-        <p className="text-[11px] font-medium tracking-wide text-slate-500 uppercase">{label}</p>
-        <Icon className="size-4 text-slate-600 transition-colors group-hover:text-accent-400" aria-hidden />
-      </div>
-      <p className="mt-2.5 text-3xl font-semibold tracking-tight text-white">
-        {formatCount(value)}
-      </p>
+      <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-slate-800 bg-slate-950/60 text-slate-500 transition-colors duration-150 group-hover:border-accent-500/30 group-hover:bg-accent-500/10 group-hover:text-accent-400">
+        <Icon className="size-4" aria-hidden />
+      </span>
+      <span className="min-w-0">
+        <span className="block text-[11px] font-medium tracking-wide text-slate-500 uppercase">
+          {label}
+        </span>
+        <Num className="mt-0.5 block text-[28px] leading-8 font-semibold text-white">
+          {formatCount(value)}
+        </Num>
+      </span>
     </Link>
   )
 }
@@ -107,7 +118,7 @@ function OutcomeChart({ stats }: { stats: DashboardStats }) {
               <OutcomeDonut slices={slices} />
             </Suspense>
             <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-              <span className="text-2xl font-semibold text-white">{formatCount(total)}</span>
+              <Num className="text-2xl font-semibold text-white">{formatCount(total)}</Num>
               <span className="text-[11px] tracking-wide text-slate-500 uppercase">runs</span>
             </div>
           </>
@@ -123,7 +134,9 @@ function OutcomeChart({ stats }: { stats: DashboardStats }) {
               aria-hidden
             />
             <dt className="flex-1 text-sm text-slate-400">{slice.name}</dt>
-            <dd className="text-sm font-medium text-slate-100">{formatCount(slice.value)}</dd>
+            <dd className="text-sm font-medium text-slate-100">
+              <Num>{formatCount(slice.value)}</Num>
+            </dd>
           </div>
         ))}
       </dl>
@@ -143,21 +156,31 @@ function StorageCard({ stats }: { stats: DashboardStats }) {
       <div className="space-y-5 px-5 py-5">
         <div className="grid gap-4 sm:grid-cols-2">
           <div>
-            <p className="text-[11px] tracking-wide text-slate-500 uppercase">Stored on target</p>
-            <p className="mt-1 text-2xl font-semibold text-white">{formatBytes(stored)}</p>
+            <p className="text-[11px] font-medium tracking-wide text-slate-500 uppercase">
+              Stored on target
+            </p>
+            <Num className="mt-0.5 block text-[28px] leading-8 font-semibold text-white">
+              {formatBytes(stored)}
+            </Num>
           </div>
           <div>
-            <p className="text-[11px] tracking-wide text-slate-500 uppercase">
+            <p className="text-[11px] font-medium tracking-wide text-slate-500 uppercase">
               Saved by deduplication
             </p>
-            <p className="mt-1 text-2xl font-semibold text-emerald-400">{formatBytes(saved)}</p>
+            <Num className="mt-0.5 block text-[28px] leading-8 font-semibold text-emerald-400">
+              {formatBytes(saved)}
+            </Num>
           </div>
         </div>
 
         <div>
           <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
-            <span>Logical protected data — {formatBytes(logical)}</span>
-            <span className="text-emerald-400">{clampPct(savedPct).toFixed(0)}% saved</span>
+            <span>
+              Logical protected data — <Num>{formatBytes(logical)}</Num>
+            </span>
+            <span className="text-emerald-400">
+              <Num>{clampPct(savedPct).toFixed(0)}%</Num> saved
+            </span>
           </div>
           <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-slate-800">
             <div
@@ -190,18 +213,19 @@ function StorageCard({ stats }: { stats: DashboardStats }) {
 function RecentRunsTable({ runs }: { runs: JobRun[] }) {
   if (runs.length === 0) {
     return (
-      <div className="px-5 py-12 text-center">
-        <p className="text-sm text-slate-400">No backup runs yet.</p>
-        <p className="mt-1 text-xs text-slate-500">
-          Create a backup job and run it to see activity here.
-        </p>
-        <Link
-          to="/jobs"
-          className="mt-4 inline-flex items-center gap-1.5 text-xs font-medium text-accent-400 hover:text-accent-300"
-        >
-          Go to backup jobs
-        </Link>
-      </div>
+      <EmptyState
+        className="border-0 bg-transparent"
+        icon={<Activity className="size-5" aria-hidden />}
+        title="No backup runs yet"
+        description="Create a backup job and run it — every run, restore, and verification lands here."
+        action={
+          <Link to="/jobs">
+            <Button variant="primary" icon={<CalendarClock className="size-4" aria-hidden />}>
+              Go to backup jobs
+            </Button>
+          </Link>
+        }
+      />
     )
   }
 
@@ -221,37 +245,46 @@ function RecentRunsTable({ runs }: { runs: JobRun[] }) {
         </thead>
         <tbody className="divide-y divide-slate-800/70">
           {runs.map((run) => (
-            <tr key={String(run.id)} className="transition-colors hover:bg-slate-800/30">
+            <tr
+              key={String(run.id)}
+              className="align-top transition-colors duration-150 hover:bg-slate-800/30"
+            >
               <td className="max-w-[16rem] px-5 py-3">
                 <p className="truncate font-medium text-slate-100">{run.jobName}</p>
-                {run.status === 'running' ? (
-                  <div className="mt-1.5 flex items-center gap-2">
-                    <ProgressBar value={run.progressPct} active className="max-w-32" />
-                    <span className="text-[11px] text-slate-500">
-                      {clampPct(run.progressPct).toFixed(0)}%
+                <div className="mt-1.5 flex h-4 items-center gap-2">
+                  {run.status === 'running' ? (
+                    <>
+                      <ProgressBar value={run.progressPct} active className="max-w-32" />
+                      <Num className="shrink-0 text-[11px] text-accent-300">
+                        {clampPct(run.progressPct).toFixed(0)}%
+                      </Num>
+                    </>
+                  ) : run.error ? (
+                    <span className="truncate text-[11px] text-red-400/90" title={run.error}>
+                      {run.error}
                     </span>
-                  </div>
-                ) : run.error ? (
-                  <p className="mt-0.5 truncate text-xs text-red-400/80">{run.error}</p>
-                ) : null}
+                  ) : null}
+                </div>
               </td>
-              <td className="px-5 py-3">
+              <td className="px-5 py-3 whitespace-nowrap">
                 <RunStatusPill status={run.status} />
               </td>
-              <td className="px-5 py-3 whitespace-nowrap text-slate-400">
-                {formatRelative(run.startedAt)}
+              <td className="px-5 py-3 whitespace-nowrap" title={formatDateTime(run.startedAt)}>
+                <Num className="text-slate-400">{formatRelative(run.startedAt)}</Num>
               </td>
-              <td className="px-5 py-3 whitespace-nowrap text-slate-400">
-                {formatDuration(run.startedAt, run.finishedAt)}
+              <td className="px-5 py-3 whitespace-nowrap">
+                <Num className="text-slate-400">
+                  {formatDuration(run.startedAt, run.finishedAt)}
+                </Num>
               </td>
-              <td className="px-5 py-3 text-right whitespace-nowrap text-slate-300">
-                {formatBytes(run.bytesProcessed)}
+              <td className="px-5 py-3 text-right whitespace-nowrap">
+                <Num className="text-slate-300">{formatBytes(run.bytesProcessed)}</Num>
               </td>
-              <td className="px-5 py-3 text-right whitespace-nowrap text-slate-300">
-                {formatBytes(run.bytesUploaded)}
+              <td className="px-5 py-3 text-right whitespace-nowrap">
+                <Num className="text-slate-300">{formatBytes(run.bytesUploaded)}</Num>
               </td>
-              <td className="px-5 py-3 text-right whitespace-nowrap text-emerald-400">
-                {formatRatio(run.dedupRatio)}
+              <td className="px-5 py-3 text-right whitespace-nowrap">
+                <Num className="text-emerald-400">{formatRatio(run.dedupRatio)}</Num>
               </td>
             </tr>
           ))}
@@ -314,7 +347,7 @@ export function DashboardPage() {
         <StatCard icon={CalendarClock} label="Backup jobs" value={data.jobCount} to="/jobs" />
       </div>
 
-      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+      <div className="mt-6 grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader
             title="Last 24 hours"
@@ -337,7 +370,7 @@ export function DashboardPage() {
         <StorageCard stats={data} />
       </div>
 
-      <Card className="mt-4">
+      <Card className="mt-6">
         <CardHeader
           title="Recent runs"
           subtitle="Newest first"
@@ -354,7 +387,7 @@ export function DashboardPage() {
       </Card>
 
       {data.hostCount === 0 || data.targetCount === 0 ? (
-        <div className="mt-4">
+        <div className="mt-6">
           <EmptyState
             icon={data.hostCount === 0 ? <Server className="size-5" aria-hidden /> : <HardDrive className="size-5" aria-hidden />}
             title={data.hostCount === 0 ? 'Add your first Proxmox host' : 'Add a storage target'}

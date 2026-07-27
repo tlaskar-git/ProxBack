@@ -14,17 +14,33 @@ import {
 } from 'lucide-react'
 import {
   agentSourceOf,
+  allTagsOf,
   createJob,
   errorMessage,
   patchJob,
+  tagsOf,
   vmSourcesOf,
+  vmsWithTag,
 } from '../api'
 import type { Agent, CachedVM, ID, Job, JobCreate, JobKind, JobSources, Target } from '../api'
 import { cn } from '../lib/cn'
-import { describeSchedule, formatBytes, isValidCron } from '../lib/format'
+import { describeSchedule, formatBytes, formatCount, isValidCron } from '../lib/format'
 import { Modal } from './Modal'
 import { useToast } from './Toast'
-import { Button, Field, IconButton, Input, SectionNote, StatusPill, Toggle, toneForStatus } from './ui'
+import {
+  Button,
+  Chip,
+  ChipButton,
+  Field,
+  IconButton,
+  Input,
+  Num,
+  SectionNote,
+  Segmented,
+  StatusPill,
+  Toggle,
+  toneForStatus,
+} from './ui'
 
 type ScheduleMode = 'manual' | 'hourly' | 'daily' | 'weekly' | 'custom'
 
@@ -36,10 +52,20 @@ const CRON_PRESETS: Record<Exclude<ScheduleMode, 'manual' | 'custom'>, string> =
 
 const STEPS = ['Sources', 'Target', 'Schedule', 'Retention', 'Review'] as const
 
+/** How a VM job picks its members: a fixed list, or every VM carrying a tag. */
+type VMSourceMode = 'manual' | 'tag'
+
+const SOURCE_MODES: { value: VMSourceMode; label: string }[] = [
+  { value: 'manual', label: 'Pick VMs manually' },
+  { value: 'tag', label: 'By Proxmox tag' },
+]
+
 interface WizardState {
   name: string
   kind: JobKind
+  sourceMode: VMSourceMode
   selectedVMs: CachedVM[]
+  tagFilter: string
   agentId: ID | ''
   paths: string[]
   targetId: ID | ''
@@ -68,10 +94,13 @@ function initialState(
   if (editJob) {
     const agentSource = agentSourceOf(editJob)
     const wanted = new Set(vmSourcesOf(editJob).map((source) => vmKey(source.hostId, source.vmid)))
+    const tagFilter = editJob.tagFilter ?? ''
     return {
       name: editJob.name,
       kind: editJob.kind,
+      sourceMode: tagFilter ? 'tag' : 'manual',
       selectedVMs: vms.filter((vm) => wanted.has(vmKey(vm.hostId, vm.vmid))),
+      tagFilter,
       agentId: agentSource?.agentId ?? '',
       paths: agentSource?.paths ?? [],
       targetId: editJob.targetId,
@@ -85,7 +114,9 @@ function initialState(
   return {
     name: initialVM ? `Backup — ${initialVM.name}` : '',
     kind: 'vm',
+    sourceMode: 'manual',
     selectedVMs: initialVM ? [initialVM] : [],
+    tagFilter: '',
     agentId: '',
     paths: [],
     targetId: '',
@@ -151,7 +182,7 @@ function SelectTile({
       disabled={disabled}
       aria-pressed={selected}
       className={cn(
-        'flex w-full items-start gap-3 rounded-xl border px-4 py-3.5 text-left transition',
+        'flex w-full items-start gap-3 rounded-xl border px-4 py-3.5 text-left transition-colors duration-150',
         selected
           ? 'border-accent-500/50 bg-accent-500/10'
           : 'border-slate-800 bg-slate-950/40 hover:border-slate-700 hover:bg-slate-900/60',
@@ -245,13 +276,19 @@ export function JobWizard({
   const selectedTarget = targets.find((target) => String(target.id) === String(state.targetId))
   const selectedAgent = agents.find((agent) => String(agent.id) === String(state.agentId))
 
+  const availableTags = useMemo(() => allTagsOf(vms), [vms])
+  const tagMatches = useMemo(
+    () => (state.tagFilter ? vmsWithTag(vms, state.tagFilter) : []),
+    [vms, state.tagFilter],
+  )
+  const byTag = state.kind === 'vm' && state.sourceMode === 'tag'
+
   const stepValid = (index: number): boolean => {
     switch (index) {
       case 0:
         if (!state.name.trim()) return false
-        return state.kind === 'vm'
-          ? state.selectedVMs.length > 0
-          : state.agentId !== '' && state.paths.length > 0
+        if (state.kind === 'agent') return state.agentId !== '' && state.paths.length > 0
+        return byTag ? state.tagFilter !== '' : state.selectedVMs.length > 0
       case 1:
         return state.targetId !== ''
       case 2:
@@ -292,7 +329,10 @@ export function JobWizard({
     setError(null)
     const sources: JobSources =
       state.kind === 'vm'
-        ? state.selectedVMs.map((vm) => ({ hostId: vm.hostId, vmid: vm.vmid, name: vm.name }))
+        ? byTag
+          ? // Tag-filtered jobs resolve their members at run start.
+            []
+          : state.selectedVMs.map((vm) => ({ hostId: vm.hostId, vmid: vm.vmid, name: vm.name }))
         : { agentId: state.agentId as ID, paths: state.paths }
 
     const payload: JobCreate = {
@@ -303,6 +343,8 @@ export function JobWizard({
       retention: state.retention,
       sources,
       enabled: state.enabled,
+      // Only VM jobs carry a tag filter; "" clears one that was set before.
+      ...(state.kind === 'vm' ? { tagFilter: byTag ? state.tagFilter : '' } : {}),
     }
 
     setSubmitting(true)
@@ -413,81 +455,175 @@ export function JobWizard({
 
           {state.kind === 'vm' ? (
             <div className="space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs font-medium text-slate-400">
-                  Select virtual machines
-                  <span className="ml-2 text-slate-600">
-                    {state.selectedVMs.length} selected
-                  </span>
-                </p>
-                <div className="relative">
-                  <Search
-                    className="pointer-events-none absolute top-2.5 left-2.5 size-3.5 text-slate-600"
-                    aria-hidden
-                  />
-                  <Input
-                    value={query}
-                    placeholder="Filter by name, VMID, or node"
-                    className="w-64 py-1.5 pl-8 text-xs"
-                    onChange={(event) => setQuery(event.target.value)}
-                  />
-                </div>
-              </div>
+              <Segmented
+                label="How this job picks virtual machines"
+                value={state.sourceMode}
+                options={SOURCE_MODES}
+                onChange={(mode) => patch({ sourceMode: mode })}
+              />
 
-              {vms.length === 0 ? (
-                <p className="rounded-lg border border-dashed border-slate-800 bg-slate-950/40 px-4 py-8 text-center text-xs text-slate-500">
-                  No virtual machines in the inventory yet. Add a Proxmox host, then refresh the
-                  Virtual Machines page.
-                </p>
-              ) : (
-                <div className="max-h-72 space-y-2 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950/40 p-2">
-                  {filteredVMs.map((vm) => {
-                    const key = vmKey(vm.hostId, vm.vmid)
-                    const selected = selectedKeys.has(key)
-                    return (
-                      <button
-                        type="button"
-                        key={key}
-                        onClick={() => toggleVM(vm)}
-                        aria-pressed={selected}
-                        className={cn(
-                          'flex w-full items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition',
-                          selected
-                            ? 'border-accent-500/50 bg-accent-500/10'
-                            : 'border-transparent hover:bg-slate-800/50',
-                        )}
-                      >
-                        <span
-                          className={cn(
-                            'flex size-4 shrink-0 items-center justify-center rounded border',
-                            selected
-                              ? 'border-accent-400 bg-accent-500 text-white'
-                              : 'border-slate-600',
-                          )}
-                        >
-                          {selected ? <Check className="size-3" aria-hidden /> : null}
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate text-sm text-slate-200">
-                            {vm.name}
-                            <span className="ml-2 font-mono text-xs text-slate-500">
-                              #{vm.vmid}
-                            </span>
-                          </span>
-                          <span className="block truncate text-xs text-slate-500">
-                            {vm.hostName} · {vm.node} · {formatBytes(vm.maxdisk)} disk
-                          </span>
-                        </span>
-                        <StatusPill tone={toneForStatus(vm.status)} label={vm.status} />
-                      </button>
-                    )
-                  })}
-                  {filteredVMs.length === 0 ? (
-                    <p className="px-3 py-6 text-center text-xs text-slate-500">
-                      No virtual machine matches “{query}”.
+              {byTag ? (
+                <div className="space-y-3">
+                  {availableTags.length === 0 ? (
+                    <p className="rounded-lg border border-dashed border-slate-800 bg-slate-950/40 px-4 py-8 text-center text-xs text-slate-500">
+                      No Proxmox tags in the inventory yet. Set the Tags field on a guest in Proxmox,
+                      refresh the Virtual Machines page, then come back.
                     </p>
+                  ) : (
+                    <>
+                      <p className="text-xs font-medium text-slate-400">
+                        Pick one tag
+                        {state.tagFilter ? (
+                          <span className="ml-2 text-slate-600">{state.tagFilter}</span>
+                        ) : null}
+                      </p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {availableTags.map((tag) => (
+                          <ChipButton
+                            key={tag}
+                            selected={state.tagFilter === tag}
+                            onClick={() =>
+                              patch({ tagFilter: state.tagFilter === tag ? '' : tag })
+                            }
+                          >
+                            {tag}
+                            <span className="ml-1 text-slate-600">
+                              {vmsWithTag(vms, tag).length}
+                            </span>
+                          </ChipButton>
+                        ))}
+                      </div>
+                    </>
+                  )}
+
+                  <SectionNote>
+                    Membership is dynamic. Every VM carrying this tag when the job runs is included
+                    automatically — guests you tag later join on their own, and a guest drops out as
+                    soon as the tag comes off. The job never needs editing.
+                  </SectionNote>
+
+                  {state.tagFilter ? (
+                    <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-2">
+                      <p className="px-1 pb-1.5 text-xs text-slate-500">
+                        <Num>{formatCount(tagMatches.length)}</Num>{' '}
+                        {tagMatches.length === 1 ? 'VM carries' : 'VMs carry'} this tag right now
+                      </p>
+                      <ul className="max-h-44 space-y-0.5 overflow-y-auto">
+                        {tagMatches.map((vm) => (
+                          <li
+                            key={vmKey(vm.hostId, vm.vmid)}
+                            className="flex items-center gap-2 px-1 py-1 text-xs"
+                          >
+                            <Laptop className="size-3.5 shrink-0 text-slate-600" aria-hidden />
+                            <span className="truncate text-slate-300">{vm.name}</span>
+                            <Num className="shrink-0 text-slate-500">#{vm.vmid}</Num>
+                            <span className="ml-auto flex shrink-0 items-center gap-1">
+                              {tagsOf(vm)
+                                .filter((tag) => tag !== state.tagFilter)
+                                .slice(0, 3)
+                                .map((tag) => (
+                                  <Chip key={tag}>{tag}</Chip>
+                                ))}
+                            </span>
+                          </li>
+                        ))}
+                        {tagMatches.length === 0 ? (
+                          <li className="px-1 py-2 text-xs text-amber-400/80">
+                            Nothing carries this tag yet — a run that resolves to zero VMs fails.
+                          </li>
+                        ) : null}
+                      </ul>
+                    </div>
                   ) : null}
                 </div>
+              ) : (
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs font-medium text-slate-400">
+                      Select virtual machines
+                      <span className="ml-2 text-slate-600">
+                        {state.selectedVMs.length} selected
+                      </span>
+                    </p>
+                    <div className="relative">
+                      <Search
+                        className="pointer-events-none absolute top-2.5 left-2.5 size-3.5 text-slate-600"
+                        aria-hidden
+                      />
+                      <Input
+                        value={query}
+                        placeholder="Filter by name, VMID, or node"
+                        className="w-64 py-1.5 pl-8 text-xs"
+                        onChange={(event) => setQuery(event.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  {vms.length === 0 ? (
+                    <p className="rounded-lg border border-dashed border-slate-800 bg-slate-950/40 px-4 py-8 text-center text-xs text-slate-500">
+                      No virtual machines in the inventory yet. Add a Proxmox host, then refresh the
+                      Virtual Machines page.
+                    </p>
+                  ) : (
+                    <div className="max-h-72 space-y-2 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950/40 p-2">
+                      {filteredVMs.map((vm) => {
+                        const key = vmKey(vm.hostId, vm.vmid)
+                        const selected = selectedKeys.has(key)
+                        return (
+                          <button
+                            type="button"
+                            key={key}
+                            onClick={() => toggleVM(vm)}
+                            aria-pressed={selected}
+                            className={cn(
+                              'flex w-full items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors duration-150',
+                              selected
+                                ? 'border-accent-500/50 bg-accent-500/10'
+                                : 'border-transparent hover:bg-slate-800/50',
+                            )}
+                          >
+                            <span
+                              className={cn(
+                                'flex size-4 shrink-0 items-center justify-center rounded border',
+                                selected
+                                  ? 'border-accent-400 bg-accent-500 text-white'
+                                  : 'border-slate-600',
+                              )}
+                            >
+                              {selected ? <Check className="size-3" aria-hidden /> : null}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-sm text-slate-200">
+                                {vm.name}
+                                <span className="ml-2 font-mono text-xs text-slate-500">
+                                  #{vm.vmid}
+                                </span>
+                              </span>
+                              <span className="block truncate text-xs text-slate-500">
+                                {vm.hostName} · {vm.node} · {formatBytes(vm.maxdisk)} disk
+                              </span>
+                            </span>
+                            {tagsOf(vm).length > 0 ? (
+                              <span className="hidden shrink-0 items-center gap-1 sm:flex">
+                                {tagsOf(vm)
+                                  .slice(0, 3)
+                                  .map((tag) => (
+                                    <Chip key={tag}>{tag}</Chip>
+                                  ))}
+                              </span>
+                            ) : null}
+                            <StatusPill tone={toneForStatus(vm.status)} label={vm.status} />
+                          </button>
+                        )
+                      })}
+                      {filteredVMs.length === 0 ? (
+                        <p className="px-3 py-6 text-center text-xs text-slate-500">
+                          No virtual machine matches “{query}”.
+                        </p>
+                      ) : null}
+                    </div>
+                  )}
+                </>
               )}
             </div>
           ) : (
@@ -714,16 +850,25 @@ export function JobWizard({
               },
               {
                 label: 'Sources',
-                value:
-                  state.kind === 'vm'
-                    ? state.selectedVMs.length === 0
-                      ? '—'
-                      : state.selectedVMs
-                          .map((vm) => `${vm.name} (#${vm.vmid})`)
-                          .join(', ')
-                    : `${selectedAgent?.hostname ?? '—'} — ${state.paths.length} ${
-                        state.paths.length === 1 ? 'path' : 'paths'
-                      }`,
+                value: byTag ? (
+                  <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-1">
+                    Tag: <Chip tone="accent">{state.tagFilter || '—'}</Chip>
+                    <span className="text-slate-500">
+                      (currently <Num>{formatCount(tagMatches.length)}</Num>{' '}
+                      {tagMatches.length === 1 ? 'VM' : 'VMs'})
+                    </span>
+                  </span>
+                ) : state.kind === 'vm' ? (
+                  state.selectedVMs.length === 0 ? (
+                    '—'
+                  ) : (
+                    state.selectedVMs.map((vm) => `${vm.name} (#${vm.vmid})`).join(', ')
+                  )
+                ) : (
+                  `${selectedAgent?.hostname ?? '—'} — ${state.paths.length} ${
+                    state.paths.length === 1 ? 'path' : 'paths'
+                  }`
+                ),
               },
               { label: 'Target', value: selectedTarget?.name ?? '—' },
               { label: 'Schedule', value: describeSchedule(schedule) },

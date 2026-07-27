@@ -20,6 +20,8 @@ import (
 
 	"proxback/internal/agentmgr"
 	"proxback/internal/auth"
+	"proxback/internal/helpermgr"
+	"proxback/internal/notify"
 	"proxback/internal/sched"
 	"proxback/internal/store"
 )
@@ -35,6 +37,7 @@ type Config struct {
 	Store   *store.Store
 	Auth    *auth.Service
 	Agents  *agentmgr.Manager
+	Helpers *helpermgr.Manager
 	Sched   *sched.Manager
 	DataDir string
 	Logger  *slog.Logger
@@ -46,13 +49,15 @@ type Config struct {
 
 // Server is the ProxBack HTTP handler.
 type Server struct {
-	st      *store.Store
-	auth    *auth.Service
-	agents  *agentmgr.Manager
-	sched   *sched.Manager
-	dataDir string
-	log     *slog.Logger
-	restart func()
+	st       *store.Store
+	auth     *auth.Service
+	agents   *agentmgr.Manager
+	helpers  *helpermgr.Manager
+	sched    *sched.Manager
+	notifier *notify.Notifier
+	dataDir  string
+	log      *slog.Logger
+	restart  func()
 
 	spa    fs.FS
 	router chi.Router
@@ -60,8 +65,8 @@ type Server struct {
 
 // New builds the HTTP handler.
 func New(cfg Config) (*Server, error) {
-	if cfg.Store == nil || cfg.Auth == nil || cfg.Agents == nil || cfg.Sched == nil {
-		return nil, errors.New("api: store, auth, agents and sched are required")
+	if cfg.Store == nil || cfg.Auth == nil || cfg.Agents == nil || cfg.Helpers == nil || cfg.Sched == nil {
+		return nil, errors.New("api: store, auth, agents, helpers and sched are required")
 	}
 	log := cfg.Logger
 	if log == nil {
@@ -72,14 +77,16 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("api: embedded web assets: %w", err)
 	}
 	s := &Server{
-		st:      cfg.Store,
-		auth:    cfg.Auth,
-		agents:  cfg.Agents,
-		sched:   cfg.Sched,
-		dataDir: cfg.DataDir,
-		log:     log,
-		restart: cfg.OnRestartRequested,
-		spa:     spa,
+		st:       cfg.Store,
+		auth:     cfg.Auth,
+		agents:   cfg.Agents,
+		helpers:  cfg.Helpers,
+		sched:    cfg.Sched,
+		notifier: notify.New(log),
+		dataDir:  cfg.DataDir,
+		log:      log,
+		restart:  cfg.OnRestartRequested,
+		spa:      spa,
 	}
 	s.router = s.routes()
 	return s, nil
@@ -113,9 +120,10 @@ func (s *Server) apiRoutes() chi.Router {
 	r.Get("/setup/status", s.handleSetupStatus)
 	r.Post("/setup", s.handleSetup)
 	r.Post("/login", s.handleLogin)
-	// Agent registration authenticates with the single-use enrollment token in
-	// the body; an agent key does not exist yet at this point.
+	// Agent and node helper registration authenticate with the single-use
+	// enrollment token in the body; no permanent key exists yet at this point.
 	r.Post("/agents/register", s.handleAgentRegister)
+	r.Post("/helpers/register", s.handleHelperRegister)
 
 	// Agent API key authenticated routes.
 	r.Group(func(r chi.Router) {
@@ -125,6 +133,12 @@ func (s *Server) apiRoutes() chi.Router {
 		r.Post("/agents/runs/{runId}/complete", s.handleAgentComplete)
 		r.Post("/agents/runs/{runId}/fail", s.handleAgentFail)
 		r.Get("/agents/restores/{runId}/stream", s.handleAgentRestoreStream)
+	})
+
+	// Node helper API key authenticated routes.
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireHelper)
+		r.Post("/helpers/heartbeat", s.handleHelperHeartbeat)
 	})
 
 	// Session cookie authenticated routes.
@@ -163,6 +177,7 @@ func (s *Server) apiRoutes() chi.Router {
 		r.Post("/runs/{id}/cancel", s.handleCancelRun)
 
 		r.Get("/backups", s.handleListBackups)
+		r.Post("/backups/{id}/verify", s.handleVerifyBackup)
 		r.Delete("/backups/{id}", s.handleDeleteBackup)
 		r.Post("/restores", s.handleCreateRestore)
 
@@ -170,8 +185,13 @@ func (s *Server) apiRoutes() chi.Router {
 		r.Post("/agents/enroll-token", s.handleCreateEnrollToken)
 		r.Delete("/agents/{id}", s.handleDeleteAgent)
 
+		r.Get("/helpers", s.handleListHelpers)
+		r.Post("/helpers/enroll-token", s.handleCreateHelperEnrollToken)
+		r.Delete("/helpers/{id}", s.handleDeleteHelper)
+
 		r.Get("/settings", s.handleGetSettings)
 		r.Put("/settings", s.handlePutSettings)
+		r.Post("/settings/test-webhook", s.handleTestWebhook)
 	})
 	return r
 }
@@ -195,8 +215,9 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 type ctxKey string
 
 const (
-	ctxUser  ctxKey = "user"
-	ctxAgent ctxKey = "agent"
+	ctxUser   ctxKey = "user"
+	ctxAgent  ctxKey = "agent"
+	ctxHelper ctxKey = "helper"
 )
 
 func (s *Server) requireSession(next http.Handler) http.Handler {
@@ -243,6 +264,27 @@ func (s *Server) requireAgent(next http.Handler) http.Handler {
 func agentFrom(ctx context.Context) *store.Agent {
 	a, _ := ctx.Value(ctxAgent).(*store.Agent)
 	return a
+}
+
+func (s *Server) requireHelper(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := auth.BearerToken(r)
+		h, err := s.helpers.Authenticate(r.Context(), key)
+		if err != nil {
+			if errors.Is(err, helpermgr.ErrUnauthorized) {
+				writeError(w, http.StatusUnauthorized, "invalid node helper key")
+				return
+			}
+			s.serverError(w, err)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxHelper, h)))
+	})
+}
+
+func helperFrom(ctx context.Context) *store.NodeHelper {
+	h, _ := ctx.Value(ctxHelper).(*store.NodeHelper)
+	return h
 }
 
 // ---------------------------------------------------------------- helpers

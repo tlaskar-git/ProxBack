@@ -16,6 +16,8 @@ import (
 
 	"proxback/internal/agentmgr"
 	"proxback/internal/engine"
+	"proxback/internal/helperclient"
+	"proxback/internal/notify"
 	"proxback/internal/pve"
 	"proxback/internal/s3target"
 	"proxback/internal/store"
@@ -42,7 +44,11 @@ const maxConcurrency = 64
 type Manager struct {
 	st     *store.Store
 	agents *agentmgr.Manager
-	log    *slog.Logger
+	// helperClient talks to the node helpers that make agentless VM backup work
+	// on real Proxmox hosts.
+	helperClient *helperclient.Client
+	notifier     *notify.Notifier
+	log          *slog.Logger
 
 	cron *cron.Cron
 
@@ -56,6 +62,9 @@ type Manager struct {
 	cancels      map[string]context.CancelFunc
 	entries      map[string]cron.EntryID
 	targetActive map[string]int
+	// verifying maps a backup id to the id of the verify run in flight for it,
+	// so a second verify of the same restore point is rejected.
+	verifying map[string]string
 }
 
 // New builds a scheduler manager.
@@ -66,11 +75,14 @@ func New(st *store.Store, agents *agentmgr.Manager, log *slog.Logger) *Manager {
 	m := &Manager{
 		st:           st,
 		agents:       agents,
+		helperClient: helperclient.New(log),
+		notifier:     notify.New(log),
 		log:          log,
 		gate:         newGate(store.DefaultConcurrency),
 		cancels:      map[string]context.CancelFunc{},
 		entries:      map[string]cron.EntryID{},
 		targetActive: map[string]int{},
+		verifying:    map[string]string{},
 	}
 	m.cron = cron.New(cron.WithLogger(cron.DiscardLogger))
 	return m
@@ -175,6 +187,25 @@ func ValidateSchedule(spec string) error {
 	return nil
 }
 
+// NextRun returns the next time a schedule fires, in UTC. It is nil for manual
+// schedules, disabled jobs and specs the cron parser rejects — exactly the cases
+// where the API contract asks for a null nextRun.
+func NextRun(schedule string, enabled bool, now time.Time) *time.Time {
+	if !enabled || schedule == "" || schedule == ManualSchedule {
+		return nil
+	}
+	spec, err := cron.ParseStandard(schedule)
+	if err != nil {
+		return nil
+	}
+	next := spec.Next(now)
+	if next.IsZero() {
+		return nil
+	}
+	utc := next.UTC()
+	return &utc
+}
+
 func (m *Manager) baseContext() context.Context {
 	if m.baseCtx == nil {
 		return context.Background()
@@ -207,9 +238,9 @@ func (m *Manager) TriggerJob(ctx context.Context, jobID string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	m.launch(run, func(runCtx context.Context) (*engine.Stats, error) {
+	m.launch(run, job.Kind, func(runCtx context.Context) (*engine.Stats, error) {
 		return m.executeBackup(runCtx, run, job)
-	})
+	}, nil)
 	return run.ID, nil
 }
 
@@ -218,6 +249,10 @@ type VMRestoreTarget struct {
 	HostID string `json:"hostId"`
 	Node   string `json:"node"`
 	VMID   int    `json:"vmid"`
+	// Storage overrides where a helper-backed restore places the guest's disks
+	// (qmrestore --storage). Empty leaves the choice recorded in the archive.
+	// It has no effect on legacy per-disk restore points.
+	Storage string `json:"storage,omitempty"`
 }
 
 // AgentRestoreTarget is where an agent restore should be written.
@@ -255,9 +290,53 @@ func (m *Manager) TriggerRestore(ctx context.Context, spec RestoreSpec) (string,
 	if err != nil {
 		return "", err
 	}
-	m.launch(run, func(runCtx context.Context) (*engine.Stats, error) {
+	m.launch(run, store.RunKindRestore, func(runCtx context.Context) (*engine.Stats, error) {
 		return m.executeRestore(runCtx, run, backup, spec)
+	}, nil)
+	return run.ID, nil
+}
+
+// Verify starts a restore-point verification run and returns its id. The run
+// goes through the normal queue, so it honours the concurrency limit and can be
+// cancelled like any other run.
+func (m *Manager) Verify(ctx context.Context, backupID string) (string, error) {
+	backup, err := m.st.BackupByID(ctx, backupID)
+	if err != nil {
+		return "", err
+	}
+	m.mu.Lock()
+	if _, busy := m.verifying[backup.ID]; busy {
+		m.mu.Unlock()
+		return "", ErrAlreadyRunning
+	}
+	// Reserve the slot before the row exists so two concurrent requests cannot
+	// both get through.
+	m.verifying[backup.ID] = ""
+	m.mu.Unlock()
+
+	release := func() {
+		m.mu.Lock()
+		delete(m.verifying, backup.ID)
+		m.mu.Unlock()
+	}
+	run, err := m.st.CreateRun(ctx, &store.JobRun{
+		JobID:       "",
+		JobName:     "Verify " + backup.SourceName,
+		Kind:        store.RunKindVerify,
+		Status:      store.RunRunning,
+		CurrentStep: "Queued",
 	})
+	if err != nil {
+		release()
+		return "", err
+	}
+	m.mu.Lock()
+	m.verifying[backup.ID] = run.ID
+	m.mu.Unlock()
+
+	m.launch(run, store.RunKindVerify, func(runCtx context.Context) (*engine.Stats, error) {
+		return m.executeVerify(runCtx, run, backup)
+	}, release)
 	return run.ID, nil
 }
 
@@ -274,8 +353,10 @@ func (m *Manager) Cancel(runID string) error {
 }
 
 // launch runs fn on a worker goroutine, gated by the concurrency limit, and
-// records the terminal state of the run.
-func (m *Manager) launch(run *store.JobRun, fn func(context.Context) (*engine.Stats, error)) {
+// records the terminal state of the run. notifyKind is the run kind reported to
+// the notification webhook ("vm", "agent", "restore" or "verify"). onDone, when
+// non-nil, is invoked once the run has left the queue by any path.
+func (m *Manager) launch(run *store.JobRun, notifyKind string, fn func(context.Context) (*engine.Stats, error), onDone func()) {
 	runCtx, cancel := context.WithCancel(m.baseContext())
 	m.mu.Lock()
 	m.cancels[run.ID] = cancel
@@ -285,6 +366,9 @@ func (m *Manager) launch(run *store.JobRun, fn func(context.Context) (*engine.St
 	go func() {
 		defer m.wg.Done()
 		defer cancel()
+		if onDone != nil {
+			defer onDone()
+		}
 		defer func() {
 			m.mu.Lock()
 			delete(m.cancels, run.ID)
@@ -292,7 +376,7 @@ func (m *Manager) launch(run *store.JobRun, fn func(context.Context) (*engine.St
 		}()
 
 		if err := m.gate.Acquire(runCtx); err != nil {
-			m.finish(run.ID, nil, err)
+			m.finish(run.ID, notifyKind, nil, err)
 			return
 		}
 		defer m.gate.Release()
@@ -309,7 +393,7 @@ func (m *Manager) launch(run *store.JobRun, fn func(context.Context) (*engine.St
 			}()
 			return fn(runCtx)
 		}()
-		m.finish(run.ID, stats, err)
+		m.finish(run.ID, notifyKind, stats, err)
 	}()
 }
 
@@ -317,7 +401,7 @@ func (m *Manager) detached() context.Context {
 	return context.WithoutCancel(m.baseContext())
 }
 
-func (m *Manager) finish(runID string, stats *engine.Stats, runErr error) {
+func (m *Manager) finish(runID, notifyKind string, stats *engine.Stats, runErr error) {
 	ctx := m.detached()
 	cur, err := m.st.RunByID(ctx, runID)
 	if err != nil {
@@ -335,8 +419,9 @@ func (m *Manager) finish(runID string, stats *engine.Stats, runErr error) {
 			ratio = 0
 		}
 	}
-	if cur.Kind == store.RunKindRestore {
-		// Deduplication is a backup-side concept; a restore never uploads.
+	if cur.Kind == store.RunKindRestore || cur.Kind == store.RunKindVerify {
+		// Deduplication is a backup-side concept; restores and verifies read
+		// only, so a "100% deduplicated" ratio would be meaningless.
 		ratio = 0
 	}
 	status := store.RunSuccess
@@ -359,6 +444,56 @@ func (m *Manager) finish(runID string, stats *engine.Stats, runErr error) {
 		m.log.Info("run finished", "run", runID, "status", status,
 			"bytesProcessed", processed, "bytesUploaded", uploaded)
 	}
+	m.notifyFinished(cur, notifyKind, notify.Payload{
+		Event:          notify.EventRunFinished,
+		Job:            cur.JobName,
+		Kind:           notifyKind,
+		Status:         status,
+		BytesProcessed: processed,
+		BytesUploaded:  uploaded,
+		DedupRatio:     ratio,
+		Error:          msg,
+		StartedAt:      cur.StartedAt,
+	})
+}
+
+// notifyFinished fires the run webhook when the configured policy matches.
+// Delivery happens on its own goroutine so a slow or dead endpoint can never
+// hold up a run, and every failure is logged rather than propagated.
+func (m *Manager) notifyFinished(run *store.JobRun, notifyKind string, payload notify.Payload) {
+	ctx := m.detached()
+	settings, err := m.st.Settings(ctx)
+	if err != nil {
+		m.log.Warn("could not read settings for run notification", "run", run.ID, "error", err)
+		return
+	}
+	if settings.WebhookURL == "" {
+		return
+	}
+	switch settings.NotifyOn {
+	case store.NotifyAll:
+	case store.NotifyFailures:
+		if payload.Status == store.RunSuccess {
+			return
+		}
+	default: // "off" or anything unrecognised
+		return
+	}
+	if notifyKind == "" {
+		notifyKind = store.RunKindBackup
+		payload.Kind = notifyKind
+	}
+	payload.Server = settings.ServerName
+	payload.FinishedAt = store.Now()
+	if !payload.StartedAt.IsZero() {
+		payload.DurationSec = payload.FinishedAt.Sub(payload.StartedAt).Seconds()
+	}
+	url := settings.WebhookURL
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.notifier.Notify(m.detached(), url, payload)
+	}()
 }
 
 // ---------------------------------------------------------------- helpers

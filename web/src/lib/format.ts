@@ -133,6 +133,20 @@ export function describeSchedule(schedule: string | null | undefined): string {
   return CRON_LABELS[schedule.trim()] ?? `Cron · ${schedule}`
 }
 
+/**
+ * Next-run label for a job row. The server sends `nextRun: null` both for
+ * manual schedules and for disabled jobs, so say which one it is.
+ */
+export function describeNextRun(
+  nextRun: string | null | undefined,
+  job: { enabled: boolean; schedule: string },
+): string {
+  if (nextRun) return `Next run ${formatRelative(nextRun)}`
+  if (!job.enabled) return 'Disabled'
+  if (!job.schedule || job.schedule === 'manual') return 'Manual'
+  return 'Not scheduled'
+}
+
 /** Loose 5-field cron validation, good enough to catch typos in the UI. */
 export function isValidCron(expr: string): boolean {
   const fields = expr.trim().split(/\s+/)

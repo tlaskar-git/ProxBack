@@ -346,6 +346,25 @@ func (s *Session) RestoreDisk(ctx context.Context, dm DiskManifest, w io.Writer)
 	return nil
 }
 
+// VerifyBackup streams every chunk of every disk of a restore point through the
+// restore path's verification — per-chunk SHA-256 plus size checks — discarding
+// the data. It proves the point is restorable without writing anywhere.
+func (s *Session) VerifyBackup(ctx context.Context, m *Manifest) error {
+	if len(m.Disks) == 0 {
+		return fmt.Errorf("engine: backup %s has no disks to verify", m.BackupID)
+	}
+	for _, disk := range m.Disks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.SetStep(fmt.Sprintf("Verifying %s %s", m.SourceName, disk.Name))
+		if err := s.RestoreDisk(ctx, disk, io.Discard); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // GCResult summarises a garbage collection pass.
 type GCResult struct {
 	ManifestsScanned int

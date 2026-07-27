@@ -1,6 +1,8 @@
 package pve_test
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"proxback/internal/pve"
@@ -45,6 +47,59 @@ func TestParseDisks(t *testing.T) {
 	}
 	if disks[0].Volume != "local-lvm:vm-100-disk-0" {
 		t.Errorf("scsi0 volume = %q", disks[0].Volume)
+	}
+}
+
+func TestParseTags(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"", []string{}},
+		{"prod;web", []string{"prod", "web"}},
+		// Trimmed, lower-cased, sorted, empties dropped.
+		{" Web ;;PROD; ", []string{"prod", "web"}},
+		{"zeta;alpha;mid", []string{"alpha", "mid", "zeta"}},
+		// Duplicates collapse, and commas are tolerated alongside semicolons.
+		{"dev;dev,Dev", []string{"dev"}},
+		{";", []string{}},
+	}
+	for _, c := range cases {
+		got := pve.ParseTags(c.in)
+		if got == nil {
+			t.Fatalf("ParseTags(%q) returned nil, want an empty slice", c.in)
+		}
+		if strings.Join(got, "|") != strings.Join(c.want, "|") {
+			t.Errorf("ParseTags(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestVMDecodesTags(t *testing.T) {
+	// Exactly the shape a PVE guest listing returns: tags is one semicolon
+	// separated string, not an array.
+	const raw = `[
+		{"vmid":100,"name":"web-01","status":"running","maxdisk":33554432,"maxmem":2147483648,
+		 "uptime":3600,"tags":"prod;web"},
+		{"vmid":102,"name":"app-01","status":"running","maxdisk":16777216,"maxmem":2147483648,
+		 "uptime":3600}
+	]`
+	var vms []pve.VM
+	if err := json.Unmarshal([]byte(raw), &vms); err != nil {
+		t.Fatalf("decode guest listing: %v", err)
+	}
+	if len(vms) != 2 {
+		t.Fatalf("decoded %d guests, want 2", len(vms))
+	}
+	if vms[0].Name != "web-01" || vms[0].VMID != 100 || vms[0].MaxDisk != 32<<20 {
+		t.Fatalf("guest fields lost while decoding tags: %+v", vms[0])
+	}
+	if strings.Join(vms[0].Tags, ",") != "prod,web" {
+		t.Fatalf("web-01 tags = %v, want [prod web]", vms[0].Tags)
+	}
+	// A guest with no tags field must still yield an empty slice, never null.
+	if vms[1].Tags == nil || len(vms[1].Tags) != 0 {
+		t.Fatalf("untagged guest tags = %#v, want an empty slice", vms[1].Tags)
 	}
 }
 

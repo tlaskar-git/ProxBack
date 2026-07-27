@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   Activity,
   CalendarClock,
+  Clock,
   Database,
   Laptop,
   Pencil,
@@ -10,6 +11,7 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  Tag,
   Trash2,
 } from 'lucide-react'
 import {
@@ -31,9 +33,11 @@ import { useToast } from '../components/Toast'
 import {
   Button,
   Card,
+  Chip,
   EmptyState,
   ErrorBlock,
   IconButton,
+  Num,
   PageHeader,
   ProgressBar,
   RunStatusPill,
@@ -42,7 +46,13 @@ import {
   Toggle,
 } from '../components/ui'
 import { useAsync, usePolling } from '../lib/useAsync'
-import { clampPct, describeSchedule, formatBytes, formatRelative } from '../lib/format'
+import {
+  clampPct,
+  describeNextRun,
+  describeSchedule,
+  formatBytes,
+  formatRelative,
+} from '../lib/format'
 
 interface JobsData {
   jobs: Job[]
@@ -164,7 +174,16 @@ function JobRow({
             {!job.enabled ? <StatusPill tone="amber" label="disabled" /> : null}
           </div>
 
-          <p className="mt-1 truncate text-xs text-slate-500">{sourceSummary(job, agents)}</p>
+          {job.kind === 'vm' && job.tagFilter ? (
+            <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+              <Chip icon={<Tag className="size-2.5 shrink-0" aria-hidden />} title="Proxmox tag">
+                {job.tagFilter}
+              </Chip>
+              <span>every VM carrying this tag, resolved at run time</span>
+            </p>
+          ) : (
+            <p className="mt-1 truncate text-xs text-slate-500">{sourceSummary(job, agents)}</p>
+          )}
 
           <div className="mt-2.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs text-slate-500">
             <span className="inline-flex items-center gap-1.5">
@@ -175,14 +194,20 @@ function JobRow({
               <CalendarClock className="size-3.5 text-slate-600" aria-hidden />
               {describeSchedule(job.schedule)}
             </span>
-            <span>Keep last {job.retention}</span>
+            <span className="inline-flex items-center gap-1.5">
+              <Clock className="size-3.5 text-slate-600" aria-hidden />
+              {describeNextRun(job.nextRun, job)}
+            </span>
+            <span>
+              Keep last <Num>{job.retention}</Num>
+            </span>
             {lastRun ? (
               <span className="inline-flex items-center gap-2">
                 <RunStatusPill status={lastRun.status} />
                 <span>{formatRelative(lastRun.startedAt)}</span>
                 {lastRun.status !== 'running' ? (
                   <span className="text-slate-600">
-                    {formatBytes(lastRun.bytesUploaded)} uploaded
+                    <Num>{formatBytes(lastRun.bytesUploaded)}</Num> uploaded
                   </span>
                 ) : null}
               </span>
@@ -195,7 +220,7 @@ function JobRow({
             <div className="mt-3 max-w-xl">
               <div className="mb-1.5 flex items-center justify-between text-xs">
                 <span className="truncate text-slate-400">{lastRun.currentStep || 'Working…'}</span>
-                <span className="text-slate-500">{clampPct(lastRun.progressPct).toFixed(0)}%</span>
+                <Num className="text-slate-500">{clampPct(lastRun.progressPct).toFixed(0)}%</Num>
               </div>
               <ProgressBar value={lastRun.progressPct} active />
             </div>
@@ -229,7 +254,7 @@ function JobRow({
             <Pencil className="size-4" aria-hidden />
           </IconButton>
           <IconButton
-            variant="danger"
+            variant="dangerQuiet"
             aria-label={`Delete ${job.name}`}
             title="Delete job"
             loading={busy === 'delete'}

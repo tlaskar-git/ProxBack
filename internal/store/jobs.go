@@ -9,13 +9,14 @@ import (
 	"time"
 )
 
-const jobCols = `id, name, kind, target_id, schedule, retention, enabled, sources, created_at`
+const jobCols = `id, name, kind, target_id, schedule, retention, enabled, sources, tag_filter, created_at`
 
 func scanJob(sc interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var enabled int
 	var sources, created string
-	if err := sc.Scan(&j.ID, &j.Name, &j.Kind, &j.TargetID, &j.Schedule, &j.Retention, &enabled, &sources, &created); err != nil {
+	if err := sc.Scan(&j.ID, &j.Name, &j.Kind, &j.TargetID, &j.Schedule, &j.Retention, &enabled,
+		&sources, &j.TagFilter, &created); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -49,8 +50,9 @@ func (s *Store) CreateJob(ctx context.Context, j *Job) (*Job, error) {
 		return nil, fmt.Errorf("encode job sources: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO jobs (`+jobCols+`) VALUES (?,?,?,?,?,?,?,?,?)`,
-		j.ID, j.Name, j.Kind, j.TargetID, j.Schedule, j.Retention, boolInt(j.Enabled), string(raw), fmtTime(j.CreatedAt))
+		`INSERT INTO jobs (`+jobCols+`) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		j.ID, j.Name, j.Kind, j.TargetID, j.Schedule, j.Retention, boolInt(j.Enabled), string(raw),
+		j.TagFilter, fmtTime(j.CreatedAt))
 	if err != nil {
 		return nil, fmt.Errorf("create job: %w", err)
 	}
@@ -64,8 +66,8 @@ func (s *Store) UpdateJob(ctx context.Context, j *Job) error {
 		return fmt.Errorf("encode job sources: %w", err)
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET name=?, kind=?, target_id=?, schedule=?, retention=?, enabled=?, sources=? WHERE id=?`,
-		j.Name, j.Kind, j.TargetID, j.Schedule, j.Retention, boolInt(j.Enabled), string(raw), j.ID)
+		`UPDATE jobs SET name=?, kind=?, target_id=?, schedule=?, retention=?, enabled=?, sources=?, tag_filter=? WHERE id=?`,
+		j.Name, j.Kind, j.TargetID, j.Schedule, j.Retention, boolInt(j.Enabled), string(raw), j.TagFilter, j.ID)
 	if err != nil {
 		return fmt.Errorf("update job: %w", err)
 	}

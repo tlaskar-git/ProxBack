@@ -218,7 +218,15 @@
   .pb-overlay-in,
   .pb-modal-in,
   .pb-skeleton::after,
-  .pb-bar-active {
+  .pb-bar-active,
+  /* Decorative "live" dots; the loading spinner keeps turning because it is
+     the only signal that work is still in flight. */
+  .animate-pulse {
     animation: none;
+  }
+
+  /* Progress fills jump straight to their new width instead of sliding. */
+  .transition-\[width\] {
+    transition-duration: 1ms;
   }
 }

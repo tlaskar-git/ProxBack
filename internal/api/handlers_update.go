@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -50,6 +51,26 @@ func (s *Server) handleUpdateStatus(w http.ResponseWriter, r *http.Request) {
 // handleUpdateApply downloads the latest release binary, swaps it over the
 // running executable and, when wired, schedules a graceful restart.
 func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
+	// Installing an update restarts the server, which would cancel anything in
+	// flight and throw away its uploaded work. Refuse unless the operator
+	// explicitly overrides with ?force=1.
+	if r.URL.Query().Get("force") != "1" {
+		running, err := s.st.CountRunningRuns(r.Context())
+		if err != nil {
+			s.serverError(w, err)
+			return
+		}
+		if running > 0 {
+			noun := "run is"
+			if running > 1 {
+				noun = "runs are"
+			}
+			writeError(w, http.StatusConflict, fmt.Sprintf(
+				"%d %s still in progress — installing an update restarts the server and cancels them. "+
+					"Wait for them to finish, or cancel them first.", running, noun))
+			return
+		}
+	}
 	checker := update.New(s.log)
 	rel, err := checker.Latest(r.Context())
 	if err != nil {

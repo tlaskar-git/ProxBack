@@ -132,6 +132,11 @@ func requireLine(t *testing.T, lines []string, want string) string {
 // TestRunLogRecordsABackupRun is the test that keeps the run detail view honest:
 // a real two-disk VM backup has to explain itself in a handful of lines.
 func TestRunLogRecordsABackupRun(t *testing.T) {
+	// Collection normally spares chunks younger than a day, which every chunk in
+	// a test is. Disable the window so this test stays about the log lines a
+	// pruning run produces; the window itself is covered by the engine tests and
+	// by TestUnsuccessfulRunDoesNotCollectOrphanChunks.
+	t.Setenv(GCGraceEnv, "0")
 	h := newRunLogHarness(t)
 	ctx := context.Background()
 
@@ -200,6 +205,68 @@ func TestRunLogRecordsABackupRun(t *testing.T) {
 	// Each run keeps its own log.
 	if got := h.lines(first.ID); len(got) == 0 {
 		t.Fatal("the first run's log disappeared when the second one ran")
+	}
+}
+
+// TestUnsuccessfulRunDoesNotCollectOrphanChunks is the second half of the
+// interrupted-backup fix: a run that does not reach its manifests must not
+// garbage collect at all. Chunks it (or an earlier interrupted run) uploaded are
+// unreferenced by definition, and collecting them makes the retry re-upload
+// everything. The grace window is disabled here so the only thing that can keep
+// the chunk alive is the failure rule itself.
+func TestUnsuccessfulRunDoesNotCollectOrphanChunks(t *testing.T) {
+	t.Setenv(GCGraceEnv, "0")
+	h := newRunLogHarness(t)
+	ctx := context.Background()
+
+	eng, _, err := h.m.engineFor(ctx, h.target.ID)
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	// What an interrupted backup leaves on the target: an uploaded, indexed chunk
+	// that no manifest references yet.
+	orphan := make([]byte, 1<<20)
+	for i := range orphan {
+		orphan[i] = byte(i * 7)
+	}
+	sha, uploaded, err := eng.StoreChunk(ctx, orphan)
+	if err != nil || uploaded == 0 {
+		t.Fatalf("store orphan chunk: %d bytes, %v", uploaded, err)
+	}
+
+	// A run that fails before writing any manifest.
+	failing, err := h.st.CreateJob(ctx, &store.Job{
+		Name: "staging-tagged", Kind: store.SourceVM, TargetID: h.target.ID,
+		Schedule: ManualSchedule, Retention: 2, Enabled: true, TagFilter: "staging",
+	})
+	if err != nil {
+		t.Fatalf("create failing job: %v", err)
+	}
+	run := h.runJob(failing.ID)
+	if run.Status != store.RunFailed {
+		t.Fatalf("run finished %q, want failed", run.Status)
+	}
+	requireLine(t, h.lines(run.ID), "skipped garbage collection")
+
+	if has, err := eng.HasChunk(ctx, sha); err != nil || !has {
+		t.Fatalf("a failed run collected the chunk an interrupted backup had uploaded: %v, %v", has, err)
+	}
+
+	// A run that does succeed still collects it: the fix delays collection, it
+	// does not disable it.
+	good, err := h.st.CreateJob(ctx, &store.Job{
+		Name: "nightly-vms", Kind: store.SourceVM, TargetID: h.target.ID,
+		Schedule: ManualSchedule, Retention: 2, Enabled: true,
+		Sources: store.JobSources{{HostID: h.host.ID, VMID: 100, Name: "web-01"}},
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if ok := h.runJob(good.ID); ok.Status != store.RunSuccess {
+		t.Fatalf("backup run finished %q: %s", ok.Status, ok.Error)
+	}
+	if has, err := eng.HasChunk(ctx, sha); err != nil || has {
+		t.Fatalf("a successful run left the orphan chunk behind: %v, %v", has, err)
 	}
 }
 

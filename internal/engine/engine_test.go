@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"proxback/internal/engine"
 	"proxback/internal/s3sim"
@@ -323,6 +324,15 @@ func TestGarbageCollectOrphanChunks(t *testing.T) {
 
 	if err := eng.DeleteManifest(ctx, dropped.SourceKind, dropped.SourceID, dropped.BackupID); err != nil {
 		t.Fatalf("delete manifest: %v", err)
+	}
+	// Chunks are only collectable once they are older than the grace window that
+	// protects an interrupted run's uploads, so age them deliberately. The window
+	// itself is covered by TestGCGraceKeepsAnInterruptedBackupResumable.
+	aged := time.Now().Add(-2 * engine.DefaultGCGrace)
+	for _, sha := range []string{dmKeep.Chunks[0].Sha256, dmDrop.Chunks[0].Sha256} {
+		if err := st.SetChunkAddedAt(ctx, targetID, sha, aged); err != nil {
+			t.Fatalf("age chunk: %v", err)
+		}
 	}
 	res, err = eng.GC(ctx)
 	if err != nil {

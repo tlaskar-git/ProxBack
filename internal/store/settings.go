@@ -17,6 +17,18 @@ const DefaultServerName = "ProxBack"
 // DefaultNotifyOn disables run notifications until an operator opts in.
 const DefaultNotifyOn = NotifyOff
 
+// Throughput defaults. They apply to databases that have no such rows, which is
+// every database created before v0.3.2: the settings table is key/value, so an
+// upgrade needs nothing but this default handling.
+const (
+	// DefaultUploadConcurrency is how many chunk uploads run in parallel.
+	DefaultUploadConcurrency = 4
+	// DefaultCompression compresses chunks with zstd.
+	DefaultCompression = CompressionZstd
+	// DefaultUploadLimitMbps leaves upload throughput unlimited.
+	DefaultUploadLimitMbps = 0
+)
+
 func (s *Store) settingValue(ctx context.Context, key string) (string, error) {
 	var v string
 	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
@@ -42,9 +54,12 @@ func (s *Store) setSetting(ctx context.Context, key, value string) error {
 // Settings returns the global settings, filling in defaults for missing keys.
 func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	out := Settings{
-		ServerName:  DefaultServerName,
-		Concurrency: DefaultConcurrency,
-		NotifyOn:    DefaultNotifyOn,
+		ServerName:        DefaultServerName,
+		Concurrency:       DefaultConcurrency,
+		NotifyOn:          DefaultNotifyOn,
+		UploadConcurrency: DefaultUploadConcurrency,
+		Compression:       DefaultCompression,
+		UploadLimitMbps:   DefaultUploadLimitMbps,
 	}
 	name, err := s.settingValue(ctx, "serverName")
 	switch {
@@ -82,6 +97,36 @@ func (s *Store) Settings(ctx context.Context) (Settings, error) {
 	default:
 		return out, err
 	}
+	upConc, err := s.settingValue(ctx, "uploadConcurrency")
+	switch {
+	case err == nil:
+		if n, cerr := strconv.Atoi(upConc); cerr == nil && n >= MinUploadConcurrency && n <= MaxUploadConcurrency {
+			out.UploadConcurrency = n
+		}
+	case errors.Is(err, ErrNotFound):
+	default:
+		return out, err
+	}
+	compression, err := s.settingValue(ctx, "compression")
+	switch {
+	case err == nil:
+		if ValidCompression(compression) {
+			out.Compression = compression
+		}
+	case errors.Is(err, ErrNotFound):
+	default:
+		return out, err
+	}
+	limit, err := s.settingValue(ctx, "uploadLimitMbps")
+	switch {
+	case err == nil:
+		if n, cerr := strconv.Atoi(limit); cerr == nil && n >= MinUploadLimitMbps && n <= MaxUploadLimitMbps {
+			out.UploadLimitMbps = n
+		}
+	case errors.Is(err, ErrNotFound):
+	default:
+		return out, err
+	}
 	return out, nil
 }
 
@@ -97,6 +142,15 @@ func (s *Store) SaveSettings(ctx context.Context, st Settings) error {
 	if !ValidNotifyOn(st.NotifyOn) {
 		st.NotifyOn = DefaultNotifyOn
 	}
+	if st.UploadConcurrency < MinUploadConcurrency || st.UploadConcurrency > MaxUploadConcurrency {
+		st.UploadConcurrency = DefaultUploadConcurrency
+	}
+	if !ValidCompression(st.Compression) {
+		st.Compression = DefaultCompression
+	}
+	if st.UploadLimitMbps < MinUploadLimitMbps || st.UploadLimitMbps > MaxUploadLimitMbps {
+		st.UploadLimitMbps = DefaultUploadLimitMbps
+	}
 	if err := s.setSetting(ctx, "serverName", st.ServerName); err != nil {
 		return err
 	}
@@ -106,5 +160,14 @@ func (s *Store) SaveSettings(ctx context.Context, st Settings) error {
 	if err := s.setSetting(ctx, "webhookUrl", st.WebhookURL); err != nil {
 		return err
 	}
-	return s.setSetting(ctx, "notifyOn", st.NotifyOn)
+	if err := s.setSetting(ctx, "notifyOn", st.NotifyOn); err != nil {
+		return err
+	}
+	if err := s.setSetting(ctx, "uploadConcurrency", strconv.Itoa(st.UploadConcurrency)); err != nil {
+		return err
+	}
+	if err := s.setSetting(ctx, "compression", st.Compression); err != nil {
+		return err
+	}
+	return s.setSetting(ctx, "uploadLimitMbps", strconv.Itoa(st.UploadLimitMbps))
 }

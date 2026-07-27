@@ -6,6 +6,10 @@ ProxBack is a self-hosted, Veeam-style backup platform for [Proxmox VE](https://
   export), plus **optional in-guest agents** for file-level backup of individual machines.
 - **Incremental forever** — 4 MiB content chunks with SHA-256 deduplication. Unchanged data
   is never uploaded twice, and every restore point is self-contained via its manifest.
+- **Fast uploads** — chunks upload in parallel (object stores charge a fixed per-object
+  latency that serial uploads pay in full) and are zstd-compressed individually, after
+  chunking, so compression never disturbs deduplication. Both are tunable, with an
+  optional bandwidth cap, under Settings → Performance.
 - **S3-compatible storage targets** — Backblaze B2, MinIO, AWS S3, or anything
   S3-compatible (custom endpoint and path-style addressing supported).
 - **Web control panel** — a dark, button-first dashboard for hosts, VMs, backup jobs, live

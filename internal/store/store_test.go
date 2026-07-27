@@ -646,6 +646,12 @@ CREATE TABLE enroll_tokens (
 	expires_at TEXT NOT NULL,
 	used_at    TEXT
 );
+CREATE TABLE chunk_index (
+	target_id TEXT NOT NULL,
+	sha256    TEXT NOT NULL,
+	size      INTEGER NOT NULL,
+	PRIMARY KEY (target_id, sha256)
+);
 `
 
 // TestMigrationUpgradesOldDatabase proves an existing production database opens
@@ -682,6 +688,11 @@ func TestMigrationUpgradesOldDatabase(t *testing.T) {
 		 VALUES ('legacy-token', '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z', NULL)`); err != nil {
 		t.Fatalf("insert legacy enroll token: %v", err)
 	}
+	// A chunk indexed before chunk_index carried an upload timestamp.
+	if _, err := db.Exec(
+		`INSERT INTO chunk_index (target_id, sha256, size) VALUES ('t1', 'deadbeef', 4194304)`); err != nil {
+		t.Fatalf("insert legacy chunk: %v", err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("close old db: %v", err)
 	}
@@ -697,10 +708,47 @@ func TestMigrationUpgradesOldDatabase(t *testing.T) {
 		"vms_cache":     "tags",
 		"jobs":          "tag_filter",
 		"enroll_tokens": "purpose",
+		"chunk_index":   "added_at",
 	} {
 		if !hasColumn(t, st, table, column) {
 			t.Fatalf("migration did not add %s.%s", table, column)
 		}
+	}
+	// The legacy chunk row is stamped with the migration time rather than left
+	// blank: it is then treated as a recent upload and spared by the collection
+	// grace window for one window, which is the conservative choice.
+	added, err := st.ChunkAddedAt(ctx, "t1")
+	if err != nil {
+		t.Fatalf("chunk added-at: %v", err)
+	}
+	stamp, ok := added["deadbeef"]
+	if !ok {
+		t.Fatalf("legacy chunk disappeared from the index: %+v", added)
+	}
+	if stamp.IsZero() || time.Since(stamp) > time.Hour {
+		t.Fatalf("legacy chunk backfilled to %v, want the migration time", stamp)
+	}
+	// Timestamps written by an older release are rewritten in the fixed width
+	// layout, so rows from before and after the upgrade order against each other
+	// correctly. The legacy token's expiry is the one such column in the fixture.
+	var expiry string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT expires_at FROM enroll_tokens WHERE token = 'legacy-token'`).Scan(&expiry); err != nil {
+		t.Fatalf("read legacy expiry: %v", err)
+	}
+	if expiry != "2099-01-01T00:00:00.000000000Z" {
+		t.Fatalf("legacy timestamp = %q, want it normalised to the sortable layout", expiry)
+	}
+
+	// Settings that did not exist before read back as their defaults.
+	upgraded, err := st.Settings(ctx)
+	if err != nil {
+		t.Fatalf("settings on an upgraded database: %v", err)
+	}
+	if upgraded.UploadConcurrency != store.DefaultUploadConcurrency ||
+		upgraded.Compression != store.DefaultCompression ||
+		upgraded.UploadLimitMbps != store.DefaultUploadLimitMbps {
+		t.Fatalf("upgraded settings = %+v, want the throughput defaults", upgraded)
 	}
 	// Tables introduced by a later release are created outright.
 	if !hasColumn(t, st, "helpers", "access_secret_enc") {
@@ -883,5 +931,122 @@ func TestSettingsDefaults(t *testing.T) {
 	}
 	if s, err = st.Settings(ctx); err != nil || s.ServerName != "lab" || s.Concurrency != 5 {
 		t.Fatalf("saved settings = %+v (%v)", s, err)
+	}
+	// Saving a struct that predates the throughput fields must not persist zeros:
+	// they normalise to the defaults, which is what the engine then runs with.
+	if s.UploadConcurrency != store.DefaultUploadConcurrency || s.Compression != store.DefaultCompression {
+		t.Fatalf("throughput settings after a partial save = %+v", s)
+	}
+}
+
+// TestRestorePointsOrderChronologicallyWithinASecond guards the timestamp format
+// the ordering of every restore point depends on. Timestamps are stored as TEXT
+// and ordered as TEXT, so a variable width fraction (RFC3339Nano drops trailing
+// zeros) makes 15:04:05.100 sort after 15:04:05.120 and 15:04:05.000 sort after
+// everything — which hands the next backup the wrong parent and hands retention
+// the wrong restore point to prune.
+func TestRestorePointsOrderChronologicallyWithinASecond(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+
+	base := time.Date(2026, 7, 27, 15, 4, 5, 0, time.UTC)
+	// Fractions chosen to be exactly the pairs a variable width format gets wrong.
+	offsets := []time.Duration{
+		0,
+		100 * time.Millisecond,
+		120 * time.Millisecond,
+		500 * time.Millisecond,
+		850 * time.Millisecond,
+		900 * time.Millisecond,
+	}
+	var ids []string
+	for i, off := range offsets {
+		b, err := st.CreateBackup(ctx, &store.Backup{
+			SourceKind: store.SourceVM, SourceID: "h1_100", SourceName: "web-01", TargetID: "t1",
+			CreatedAt: base.Add(off), SizeBytes: int64(i),
+		})
+		if err != nil {
+			t.Fatalf("create backup %d: %v", i, err)
+		}
+		ids = append(ids, b.ID)
+	}
+
+	latest, err := st.LatestBackupForSource(ctx, store.SourceVM, "h1_100", "t1")
+	if err != nil {
+		t.Fatalf("latest backup: %v", err)
+	}
+	if latest.ID != ids[len(ids)-1] {
+		t.Fatalf("latest restore point is %s (created %s), want the last one written",
+			latest.ID, latest.CreatedAt)
+	}
+	list, err := st.ListBackups(ctx, store.BackupFilter{SourceKind: store.SourceVM, SourceID: "h1_100"})
+	if err != nil {
+		t.Fatalf("list backups: %v", err)
+	}
+	if len(list) != len(ids) {
+		t.Fatalf("listed %d restore points, want %d", len(list), len(ids))
+	}
+	for i, b := range list {
+		want := ids[len(ids)-1-i]
+		if b.ID != want {
+			t.Fatalf("restore point %d is %s (created %s), want %s — the listing is not newest first",
+				i, b.ID, b.CreatedAt, want)
+		}
+	}
+}
+
+// TestThroughputSettings covers the v0.3.2 settings the engine reads on every
+// run: their defaults on a database that has never seen them, a round trip, and
+// the normalisation of out-of-range values.
+func TestThroughputSettings(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+
+	s, err := st.Settings(ctx)
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	if s.UploadConcurrency != 4 || s.Compression != store.CompressionZstd || s.UploadLimitMbps != 0 {
+		t.Fatalf("throughput defaults = %+v, want 4 / zstd / 0", s)
+	}
+
+	s.UploadConcurrency = 16
+	s.Compression = store.CompressionOff
+	s.UploadLimitMbps = 250
+	if err := st.SaveSettings(ctx, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if s, err = st.Settings(ctx); err != nil ||
+		s.UploadConcurrency != 16 || s.Compression != store.CompressionOff || s.UploadLimitMbps != 250 {
+		t.Fatalf("saved throughput settings = %+v (%v)", s, err)
+	}
+
+	// Out-of-range or unknown values never reach the engine.
+	for _, bad := range []store.Settings{
+		{ServerName: "lab", Concurrency: 1, UploadConcurrency: 0, Compression: store.CompressionZstd},
+		{ServerName: "lab", Concurrency: 1, UploadConcurrency: 99, Compression: store.CompressionZstd},
+		{ServerName: "lab", Concurrency: 1, UploadConcurrency: 4, Compression: "gzip"},
+		{ServerName: "lab", Concurrency: 1, UploadConcurrency: 4, Compression: store.CompressionZstd, UploadLimitMbps: -1},
+		{ServerName: "lab", Concurrency: 1, UploadConcurrency: 4, Compression: store.CompressionZstd, UploadLimitMbps: 99999},
+	} {
+		if err := st.SaveSettings(ctx, bad); err != nil {
+			t.Fatalf("save %+v: %v", bad, err)
+		}
+		got, err := st.Settings(ctx)
+		if err != nil {
+			t.Fatalf("settings: %v", err)
+		}
+		if got.UploadConcurrency < store.MinUploadConcurrency || got.UploadConcurrency > store.MaxUploadConcurrency {
+			t.Fatalf("uploadConcurrency %d survived from %+v", got.UploadConcurrency, bad)
+		}
+		if !store.ValidCompression(got.Compression) {
+			t.Fatalf("compression %q survived from %+v", got.Compression, bad)
+		}
+		if got.UploadLimitMbps < store.MinUploadLimitMbps || got.UploadLimitMbps > store.MaxUploadLimitMbps {
+			t.Fatalf("uploadLimitMbps %d survived from %+v", got.UploadLimitMbps, bad)
+		}
+	}
+	if store.ValidCompression("gzip") || !store.ValidCompression(store.CompressionOff) {
+		t.Fatal("ValidCompression is wrong")
 	}
 }

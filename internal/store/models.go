@@ -323,6 +323,31 @@ func ValidNotifyOn(v string) bool {
 	}
 }
 
+// Chunk compression modes for the backup engine.
+const (
+	CompressionZstd = "zstd"
+	CompressionOff  = "off"
+)
+
+// ValidCompression reports whether v names a supported compression mode.
+func ValidCompression(v string) bool {
+	switch v {
+	case CompressionZstd, CompressionOff:
+		return true
+	default:
+		return false
+	}
+}
+
+// Bounds of the throughput settings, enforced on PUT /api/settings and again
+// when they are read back out of the database.
+const (
+	MinUploadConcurrency = 1
+	MaxUploadConcurrency = 16
+	MinUploadLimitMbps   = 0
+	MaxUploadLimitMbps   = 10000
+)
+
 // Settings holds global server settings.
 type Settings struct {
 	ServerName  string `json:"serverName"`
@@ -331,4 +356,11 @@ type Settings struct {
 	WebhookURL string `json:"webhookUrl"`
 	// NotifyOn is "off", "failures" or "all".
 	NotifyOn string `json:"notifyOn"`
+	// UploadConcurrency is how many chunk uploads a backup keeps in flight (1–16).
+	UploadConcurrency int `json:"uploadConcurrency"`
+	// Compression is the per-chunk compression mode, "zstd" or "off".
+	Compression string `json:"compression"`
+	// UploadLimitMbps caps upload throughput across the whole server in megabits
+	// per second; 0 is unlimited.
+	UploadLimitMbps int `json:"uploadLimitMbps"`
 }

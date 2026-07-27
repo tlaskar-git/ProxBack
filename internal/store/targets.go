@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 const targetCols = `id, name, endpoint, region, bucket, access_key, secret_key_enc, path_style, status, created_at`
@@ -114,12 +115,15 @@ func (s *Store) HasChunk(ctx context.Context, targetID, sha string) (bool, error
 	return n > 0, nil
 }
 
-// AddChunk records a chunk as present on the target.
+// AddChunk records a chunk as present on the target. The insert timestamp is
+// what protects a freshly uploaded chunk from orphan collection; re-recording a
+// chunk that is already indexed leaves it alone, so "added at" keeps meaning what
+// it says.
 func (s *Store) AddChunk(ctx context.Context, targetID, sha string, size int64) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO chunk_index (target_id, sha256, size) VALUES (?,?,?)
+		`INSERT INTO chunk_index (target_id, sha256, size, added_at) VALUES (?,?,?,?)
 		 ON CONFLICT(target_id, sha256) DO UPDATE SET size = excluded.size`,
-		targetID, sha, size)
+		targetID, sha, size, fmtTime(Now()))
 	if err != nil {
 		return fmt.Errorf("add chunk index: %w", err)
 	}
@@ -134,23 +138,40 @@ func (s *Store) DeleteChunk(ctx context.Context, targetID, sha string) error {
 	return nil
 }
 
-// ChunkShas returns every indexed chunk hash for a target.
-func (s *Store) ChunkShas(ctx context.Context, targetID string) ([]string, error) {
+// ChunkAddedAt returns every indexed chunk of a target keyed by hash, with the
+// time it was recorded. Garbage collection uses it to leave recent uploads alone:
+// an interrupted run's chunks are indexed but referenced by no manifest yet.
+func (s *Store) ChunkAddedAt(ctx context.Context, targetID string) (map[string]time.Time, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT sha256 FROM chunk_index WHERE target_id = ?`, targetID)
+		`SELECT sha256, added_at FROM chunk_index WHERE target_id = ?`, targetID)
 	if err != nil {
 		return nil, fmt.Errorf("list chunk index: %w", err)
 	}
 	defer rows.Close()
-	var shas []string
+	out := map[string]time.Time{}
 	for rows.Next() {
 		var sha string
-		if err := rows.Scan(&sha); err != nil {
+		var added sql.NullString
+		if err := rows.Scan(&sha, &added); err != nil {
 			return nil, fmt.Errorf("list chunk index: %w", err)
 		}
-		shas = append(shas, sha)
+		out[sha] = parseTime(added.String)
 	}
-	return shas, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list chunk index: %w", err)
+	}
+	return out, nil
+}
+
+// SetChunkAddedAt overrides a chunk's recorded upload time. It exists for tests
+// that need an aged chunk.
+func (s *Store) SetChunkAddedAt(ctx context.Context, targetID, sha string, t time.Time) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE chunk_index SET added_at = ? WHERE target_id = ? AND sha256 = ?`,
+		fmtTime(t), targetID, sha); err != nil {
+		return fmt.Errorf("set chunk added_at: %w", err)
+	}
+	return nil
 }
 
 // ChunkStats returns the number of indexed chunks and their total size for a

@@ -47,6 +47,38 @@ proxback/
     sizes, timestamps, job info. sourceKind = `vm` | `agent`.
 - **Full backup:** read source stream → chunk → hash → upload chunks not already present →
   write manifest.
+
+### Throughput (v0.3.2)
+
+Measured against a real install: a serial read→hash→upload loop used only ~52% of the
+available uplink, because nothing was read or hashed while a chunk was in flight.
+
+- **Parallel chunk uploads.** Chunks are read sequentially (cheap, preserves boundaries)
+  and uploaded through a bounded worker pool (`uploadConcurrency`, default 4, 1–16).
+  Manifest chunk **order must be preserved regardless of completion order** — workers
+  return results tagged with the chunk's sequence number and the manifest is assembled in
+  sequence. Any worker error fails the whole stream and cancels the rest.
+- **Per-chunk compression** (`compression`: `"zstd"` default, `"off"`). Compression happens
+  **after** chunking the raw stream, never before: chunk boundaries and the content address
+  stay on *plaintext*, so a change early in a disk does not shift every later chunk and
+  incremental dedup keeps working. Compressing the vzdump stream itself would cascade and
+  turn every incremental into a near-full — the helper therefore keeps `--compress 0`.
+  - The chunk key remains `chunks/<sha256-of-raw-chunk>`, so the dedup index, existing
+    chunks, and existing manifests are all unaffected.
+  - Stored object layout: compressed chunks carry a 4-byte magic `PBZ1` followed by the
+    zstd frame. Reads sniff the magic; anything else is treated as raw (which is what
+    pre-v0.3.2 chunks are). If a raw chunk coincidentally starts with `PBZ1`,
+    decompression fails and the reader falls back to raw — the SHA-256 verification after
+    reassembly is the final arbiter either way.
+  - A chunk already present on the target is never re-uploaded, whatever form it is in.
+  - `bytesUploaded` counts bytes actually sent (post-compression), so the run's figure
+    reflects real bandwidth; `bytesProcessed` stays raw. Restore/verify decompress
+    transparently.
+- **Upload rate limit** (`uploadLimitMbps`, 0 = unlimited): a token-bucket shared by all
+  concurrent uploads of the server, so scheduled backups can be kept from saturating the
+  link.
+- Settings gain `uploadConcurrency`, `compression`, `uploadLimitMbps` (validated on PUT);
+  all three are safe to change between runs.
 - **Incremental:** identical pipeline; the dedup check (server-side SQLite chunk index per
   target, with S3 HEAD fallback on cache miss) means unchanged chunks are never re-uploaded.
   A backup whose parent exists records `parentId` in the manifest for the UI chain display.
@@ -247,8 +279,11 @@ Agents
   - `GET  /api/agents/restores/{runId}/stream` → tar stream for restore
 
 Settings
-- `GET/PUT /api/settings` → `{"serverName","concurrency","webhookUrl","notifyOn"}`
+- `GET/PUT /api/settings` → `{"serverName","concurrency","webhookUrl","notifyOn",
+  "uploadConcurrency","compression","uploadLimitMbps"}`
   - `webhookUrl`: empty disables notifications. `notifyOn`: `"off"|"failures"|"all"`.
+  - `uploadConcurrency`: 1–16, default 4. `compression`: `"zstd"|"off"`, default `"zstd"`.
+    `uploadLimitMbps`: 0–10000, 0 = unlimited.
 - `POST /api/settings/test-webhook` → `{"ok":bool,"error"?}` — sends a sample payload to
   the saved webhook URL.
 

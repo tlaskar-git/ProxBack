@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -560,10 +562,41 @@ func (m *Manager) notifyFinished(run *store.JobRun, notifyKind string, payload n
 
 // ---------------------------------------------------------------- helpers
 
+// GCGraceEnv can shorten the orphan-collection grace window. It exists for the
+// end-to-end suite and for operators who knowingly want tighter collection;
+// "0" disables the grace period entirely. Anything unparseable is ignored.
+const GCGraceEnv = "PROXBACK_GC_GRACE"
+
+// gcGrace resolves the grace window that protects recently uploaded chunks from
+// orphan collection.
+func gcGrace() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(GCGraceEnv))
+	if raw == "" {
+		return engine.DefaultGCGrace
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return engine.DefaultGCGrace
+	}
+	if d == 0 {
+		// engine.Options reads a zero grace as "use the default", so ask for the
+		// disabled behaviour explicitly.
+		return -1
+	}
+	return d
+}
+
+// engineFor builds the engine for a target, reading the throughput settings on
+// every call so a change to upload concurrency, compression or the rate limit
+// takes effect on the next run without a restart.
 func (m *Manager) engineFor(ctx context.Context, targetID string) (*engine.Engine, *store.S3Target, error) {
 	target, err := m.st.S3TargetByID(ctx, targetID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load backup target: %w", err)
+	}
+	settings, err := m.st.Settings(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load settings: %w", err)
 	}
 	client, err := s3target.New(ctx, s3target.Config{
 		Endpoint:  target.Endpoint,
@@ -576,7 +609,15 @@ func (m *Manager) engineFor(ctx context.Context, targetID string) (*engine.Engin
 	if err != nil {
 		return nil, nil, err
 	}
-	return engine.New(client, target.ID, m.st, m.log), target, nil
+	// One token bucket for the whole process: the operator's limit is a limit on
+	// what the server does to the uplink, not on what one stream does.
+	engine.SetUploadLimitMbps(float64(settings.UploadLimitMbps))
+	eng := engine.NewWithOptions(client, target.ID, m.st, m.log, engine.Options{
+		UploadConcurrency: settings.UploadConcurrency,
+		Compression:       settings.Compression,
+		GCGrace:           gcGrace(),
+	})
+	return eng, target, nil
 }
 
 // PVEClient builds a client for a stored Proxmox host.

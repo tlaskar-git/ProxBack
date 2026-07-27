@@ -367,12 +367,22 @@ export interface Helper {
 /** When the server POSTs a run summary to `webhookUrl`. */
 export type NotifyOn = 'off' | 'failures' | 'all'
 
+/** Per-chunk compression applied before upload. */
+export type Compression = 'zstd' | 'off'
+
 export interface Settings {
   serverName: string
   concurrency: number
   /** Empty disables notifications entirely. */
   webhookUrl: string
   notifyOn: NotifyOn
+  /** Chunk uploads in flight per stream, 1–16. */
+  uploadConcurrency: number
+  /** Compress each chunk before upload. Chunk boundaries stay on raw data, so
+   * this never harms incremental deduplication. */
+  compression: Compression
+  /** Upload ceiling in Mbps shared by all runs. 0 = unlimited. */
+  uploadLimitMbps: number
 }
 
 export interface WebhookTestResult {
@@ -548,8 +558,15 @@ export function getUpdateStatus(): Promise<UpdateStatus> {
   return request<UpdateStatus>('/api/update/status')
 }
 
-export function applyUpdate(): Promise<UpdateApplyResult> {
-  return request<UpdateApplyResult>('/api/update/apply', { method: 'POST' })
+/**
+ * Installs the latest release. Refused with 409 while any run is in flight,
+ * because the restart would cancel it — pass force to override.
+ */
+export function applyUpdate(force = false): Promise<UpdateApplyResult> {
+  return request<UpdateApplyResult>('/api/update/apply', {
+    method: 'POST',
+    query: force ? { force: 1 } : undefined,
+  })
 }
 
 /* ---------------------------------------------------------------------------

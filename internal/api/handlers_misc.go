@@ -116,10 +116,13 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ServerName  *string `json:"serverName"`
-		Concurrency *int    `json:"concurrency"`
-		WebhookURL  *string `json:"webhookUrl"`
-		NotifyOn    *string `json:"notifyOn"`
+		ServerName        *string `json:"serverName"`
+		Concurrency       *int    `json:"concurrency"`
+		WebhookURL        *string `json:"webhookUrl"`
+		NotifyOn          *string `json:"notifyOn"`
+		UploadConcurrency *int    `json:"uploadConcurrency"`
+		Compression       *string `json:"compression"`
+		UploadLimitMbps   *int    `json:"uploadLimitMbps"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -148,6 +151,29 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		current.NotifyOn = *body.NotifyOn
+	}
+	if body.UploadConcurrency != nil {
+		if *body.UploadConcurrency < store.MinUploadConcurrency || *body.UploadConcurrency > store.MaxUploadConcurrency {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("uploadConcurrency must be between %d and %d",
+				store.MinUploadConcurrency, store.MaxUploadConcurrency))
+			return
+		}
+		current.UploadConcurrency = *body.UploadConcurrency
+	}
+	if body.Compression != nil {
+		if !store.ValidCompression(*body.Compression) {
+			writeError(w, http.StatusBadRequest, `compression must be "zstd" or "off"`)
+			return
+		}
+		current.Compression = *body.Compression
+	}
+	if body.UploadLimitMbps != nil {
+		if *body.UploadLimitMbps < store.MinUploadLimitMbps || *body.UploadLimitMbps > store.MaxUploadLimitMbps {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("uploadLimitMbps must be between %d and %d (0 = unlimited)",
+				store.MinUploadLimitMbps, store.MaxUploadLimitMbps))
+			return
+		}
+		current.UploadLimitMbps = *body.UploadLimitMbps
 	}
 	if err := s.st.SaveSettings(r.Context(), current); err != nil {
 		s.serverError(w, err)

@@ -31,7 +31,7 @@ func statsPtr(sess *engine.Session) *engine.Stats {
 	return &s
 }
 
-func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *store.Job) (*engine.Stats, error) {
+func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *store.Job) (stats *engine.Stats, runErr error) {
 	eng, target, err := m.engineFor(ctx, job.TargetID)
 	if err != nil {
 		return nil, err
@@ -41,11 +41,30 @@ func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *sto
 		if !m.markTargetIdle(target.ID) {
 			return
 		}
+		// Only a run that got all the way to its manifests may collect orphans. A
+		// cancelled or failed run has uploaded chunks that no manifest references
+		// yet; collecting them would throw away exactly the work its retry wants
+		// to deduplicate against. (The engine's grace window is the second line of
+		// defence, for runs whose process died outright.)
+		if runErr != nil || ctx.Err() != nil {
+			m.log.Info("skipping orphan chunk collection after an unsuccessful run",
+				"target", target.ID, "run", run.ID)
+			m.logRun(ctx, run.ID,
+				"skipped garbage collection: the run did not complete, so its uploaded chunks are kept for the next attempt")
+			return
+		}
 		res, err := eng.GC(m.detached())
 		if err != nil {
 			m.log.Error("garbage collection failed", "target", target.ID, "error", err)
 			m.logRun(ctx, run.ID, "warning: garbage collection failed: %v", err)
 			return
+		}
+		if res.ChunksSkippedRecent > 0 {
+			m.log.Info("recent chunks spared by the collection grace window",
+				"target", target.ID, "chunksSkippedRecent", res.ChunksSkippedRecent,
+				"bytesSkippedRecent", res.BytesSkippedRecent)
+			m.logRun(ctx, run.ID, "garbage collection kept %s of recently uploaded chunks (%s)",
+				humanBytes(res.BytesSkippedRecent), countNoun(res.ChunksSkippedRecent, "chunk"))
 		}
 		if res.ChunksDeleted > 0 {
 			m.log.Info("orphan chunks collected", "target", target.ID,

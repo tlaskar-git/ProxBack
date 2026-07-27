@@ -201,6 +201,9 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 type Object struct {
 	Key  string
 	Size int64
+	// LastModified is the object's server-side timestamp. Not every S3
+	// implementation reports it, so treat the zero value as "unknown".
+	LastModified time.Time
 }
 
 // List returns every object under prefix.
@@ -224,7 +227,11 @@ func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
 			if o.Size != nil {
 				size = *o.Size
 			}
-			out = append(out, Object{Key: *o.Key, Size: size})
+			var modified time.Time
+			if o.LastModified != nil {
+				modified = o.LastModified.UTC()
+			}
+			out = append(out, Object{Key: *o.Key, Size: size, LastModified: modified})
 		}
 		if page.IsTruncated == nil || !*page.IsTruncated || page.NextContinuationToken == nil {
 			break

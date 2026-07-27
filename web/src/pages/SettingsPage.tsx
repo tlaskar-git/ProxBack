@@ -5,6 +5,7 @@ import {
   BellRing,
   CheckCircle2,
   ExternalLink,
+  Gauge,
   KeyRound,
   RefreshCw,
   Save,
@@ -18,10 +19,11 @@ import {
   getSettings,
   getSetupStatus,
   getUpdateStatus,
+  isApiError,
   putSettings,
   testWebhook,
 } from '../api'
-import type { NotifyOn, Settings, UpdateStatus } from '../api'
+import type { Compression, NotifyOn, Settings, UpdateStatus } from '../api'
 import { useToast } from '../components/Toast'
 import { useConfirm } from '../components/Confirm'
 import { useSession } from '../session'
@@ -41,12 +43,17 @@ import {
 import { useAsync } from '../lib/useAsync'
 
 const MAX_CONCURRENCY = 32
+const MAX_UPLOAD_CONCURRENCY = 16
+const MAX_UPLOAD_LIMIT = 10000
 
 const DEFAULT_SETTINGS: Settings = {
   serverName: '',
   concurrency: 2,
   webhookUrl: '',
   notifyOn: 'off',
+  uploadConcurrency: 4,
+  compression: 'zstd',
+  uploadLimitMbps: 0,
 }
 
 const NOTIFY_OPTIONS: { value: NotifyOn; label: string }[] = [
@@ -62,20 +69,24 @@ function SoftwareUpdateCard() {
   const { data: status, loading, error, reload } = useAsync<UpdateStatus>(loader)
   const [applying, setApplying] = useState(false)
   const [restarting, setRestarting] = useState(false)
+  const [blockedByRuns, setBlockedByRuns] = useState<string | null>(null)
 
-  const install = async () => {
+  const install = async (force = false) => {
     if (!status) return
     const ok = await confirm({
-      title: `Install ProxBack ${status.latestVersion}?`,
-      message:
-        'The new server binary is downloaded, checksum-verified, and swapped in. The server then restarts itself — expect a few seconds of downtime. Let running backup jobs finish first.',
-      confirmLabel: 'Install update',
-      destructive: false,
+      title: force
+        ? `Install ${status.latestVersion} and cancel running work?`
+        : `Install ProxBack ${status.latestVersion}?`,
+      message: force
+        ? 'The runs in progress will be canceled by the restart. Chunks they already uploaded are kept, so a retry resumes cheaply — but the restore points from those runs are not created.'
+        : 'The new server binary is downloaded, checksum-verified, and swapped in. The server then restarts itself — expect a few seconds of downtime.',
+      confirmLabel: force ? 'Install anyway' : 'Install update',
+      destructive: force,
     })
     if (!ok) return
     setApplying(true)
     try {
-      const result = await applyUpdate()
+      const result = await applyUpdate(force)
       if (result.restarting) {
         setRestarting(true)
         // Poll an unauthenticated endpoint until the new build answers, then reload.
@@ -98,9 +109,13 @@ function SoftwareUpdateCard() {
         await reload()
       }
     } catch (err) {
-      const message = errorMessage(err)
-      toast.error('Update failed', message)
       setApplying(false)
+      // The server refuses to update while runs are in flight; offer the override.
+      if (!force && isApiError(err) && err.isConflict && /in progress/i.test(err.message)) {
+        setBlockedByRuns(err.message)
+        return
+      }
+      toast.error('Update failed', errorMessage(err))
     }
   }
 
@@ -167,6 +182,28 @@ function SoftwareUpdateCard() {
                 here.
               </p>
             )}
+
+            {blockedByRuns ? (
+              <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+                <p className="text-sm text-amber-200">{blockedByRuns}</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button size="sm" onClick={() => setBlockedByRuns(null)}>
+                    Wait
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    loading={applying}
+                    onClick={() => {
+                      setBlockedByRuns(null)
+                      void install(true)
+                    }}
+                  >
+                    Install anyway
+                  </Button>
+                </div>
+              </div>
+            ) : null}
 
             <div className="flex flex-wrap items-center gap-3 border-t border-slate-800 pt-4">
               {status.updateAvailable && status.assetAvailable ? (
@@ -352,6 +389,137 @@ function NotificationsCard({
   )
 }
 
+const COMPRESSION_OPTIONS: { value: Compression; label: string }[] = [
+  { value: 'zstd', label: 'zstd' },
+  { value: 'off', label: 'Off' },
+]
+
+/**
+ * Throughput controls. Defaults are deliberate: 4 parallel chunk uploads and
+ * zstd compression roughly halve the time of a first full backup on a typical
+ * home uplink, and neither affects deduplication.
+ */
+function PerformanceCard({
+  form,
+  patch,
+  dirty,
+  saving,
+  error,
+  onSave,
+  onDiscard,
+}: {
+  form: Settings
+  patch: (next: Partial<Settings>) => void
+  dirty: boolean
+  saving: boolean
+  error: string | null
+  onSave: () => void
+  onDiscard: () => void
+}) {
+  return (
+    <Card className="mt-6 max-w-2xl">
+      <CardHeader
+        title="Performance"
+        subtitle="How hard the engine pushes your uplink and storage target."
+      />
+      <form
+        className="space-y-5 px-5 py-5"
+        onSubmit={(event) => {
+          event.preventDefault()
+          onSave()
+        }}
+        noValidate
+      >
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field
+            label="Parallel chunk uploads"
+            hint="Chunks in flight per stream. 1 – 16; 4 suits most links."
+          >
+            {({ id }) => (
+              <Input
+                id={id}
+                type="number"
+                min={1}
+                max={16}
+                className="w-28"
+                value={String(form.uploadConcurrency)}
+                onChange={(event) => patch({ uploadConcurrency: Number(event.target.value) })}
+              />
+            )}
+          </Field>
+          <Field
+            label="Upload limit (Mbps)"
+            hint="0 leaves uploads unthrottled."
+          >
+            {({ id }) => (
+              <Input
+                id={id}
+                type="number"
+                min={0}
+                max={10000}
+                className="w-28"
+                value={String(form.uploadLimitMbps)}
+                onChange={(event) => patch({ uploadLimitMbps: Number(event.target.value) })}
+              />
+            )}
+          </Field>
+        </div>
+
+        <div className="space-y-1.5">
+          <span className="block text-xs font-medium tracking-wide text-slate-400">Compression</span>
+          <Segmented
+            label="Compress chunks before upload"
+            value={form.compression}
+            options={COMPRESSION_OPTIONS}
+            onChange={(compression) => patch({ compression })}
+          />
+          <p className="text-xs leading-relaxed text-slate-500">
+            {form.compression === 'zstd'
+              ? 'Each chunk is zstd-compressed before upload — less bandwidth and less stored data.'
+              : 'Chunks upload as-is. Choose this only if your sources are already compressed or encrypted.'}
+          </p>
+        </div>
+
+        <SectionNote>
+          Compression happens after chunking, so chunk boundaries stay on raw data and incremental
+          deduplication is unaffected. Chunks already on a target are never re-uploaded when you
+          change these settings, and both settings take effect on the next run — no restart needed.
+        </SectionNote>
+
+        {error ? (
+          <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+            {error}
+          </p>
+        ) : null}
+
+        <div className="flex flex-wrap items-center gap-3 border-t border-slate-800 pt-4">
+          <Button
+            type="submit"
+            variant="primary"
+            loading={saving}
+            disabled={!dirty}
+            icon={<Save className="size-4" aria-hidden />}
+          >
+            Save changes
+          </Button>
+          {dirty ? (
+            <Button onClick={onDiscard} disabled={saving}>
+              Discard
+            </Button>
+          ) : (
+            <span className="flex items-center gap-1.5 text-xs text-slate-500">
+              <Gauge className="size-3.5" aria-hidden />
+              {form.uploadLimitMbps > 0
+                ? `${form.uploadConcurrency} parallel uploads, capped at ${form.uploadLimitMbps} Mbps`
+                : `${form.uploadConcurrency} parallel uploads, unthrottled`}
+            </span>
+          )}
+        </div>
+      </form>
+    </Card>
+  )
+}
+
 function ChangePasswordCard() {
   const toast = useToast()
   const { mustChangePassword, setMustChangePassword } = useSession()
@@ -472,9 +640,12 @@ export function SettingsPage() {
   const { data, loading, error, reload } = useAsync(loader)
 
   const [form, setForm] = useState<Settings>(DEFAULT_SETTINGS)
-  const [submitting, setSubmitting] = useState<'server' | 'notifications' | null>(null)
+  const [submitting, setSubmitting] = useState<
+    'server' | 'notifications' | 'performance' | null
+  >(null)
   const [formError, setFormError] = useState<string | null>(null)
   const [notifyError, setNotifyError] = useState<string | null>(null)
+  const [perfError, setPerfError] = useState<string | null>(null)
 
   useEffect(() => {
     if (data) setForm(data)
@@ -486,16 +657,23 @@ export function SettingsPage() {
     data !== null && (data.serverName !== form.serverName || data.concurrency !== form.concurrency)
   const notifyDirty =
     data !== null && (data.webhookUrl !== form.webhookUrl || data.notifyOn !== form.notifyOn)
+  const perfDirty =
+    data !== null &&
+    (data.uploadConcurrency !== form.uploadConcurrency ||
+      data.compression !== form.compression ||
+      data.uploadLimitMbps !== form.uploadLimitMbps)
 
   /**
    * Both cards write through the single PUT the contract exposes, so every
    * save carries the complete settings object — never a partial that would
    * blank out the other card's values.
    */
-  const persist = async (which: 'server' | 'notifications') => {
+  const persist = async (which: 'server' | 'notifications' | 'performance') => {
     setFormError(null)
     setNotifyError(null)
-    const fail = which === 'server' ? setFormError : setNotifyError
+    setPerfError(null)
+    const fail =
+      which === 'server' ? setFormError : which === 'notifications' ? setNotifyError : setPerfError
 
     const serverName = form.serverName.trim()
     const webhookUrl = form.webhookUrl.trim()
@@ -514,6 +692,20 @@ export function SettingsPage() {
     if (!webhookUrl && form.notifyOn !== 'off') {
       return fail('Add a webhook URL, or set notifications to Off.')
     }
+    if (
+      !Number.isInteger(form.uploadConcurrency) ||
+      form.uploadConcurrency < 1 ||
+      form.uploadConcurrency > MAX_UPLOAD_CONCURRENCY
+    ) {
+      return fail(`Parallel chunk uploads must be a whole number between 1 and ${MAX_UPLOAD_CONCURRENCY}.`)
+    }
+    if (
+      !Number.isInteger(form.uploadLimitMbps) ||
+      form.uploadLimitMbps < 0 ||
+      form.uploadLimitMbps > MAX_UPLOAD_LIMIT
+    ) {
+      return fail(`The upload limit must be a whole number between 0 and ${MAX_UPLOAD_LIMIT} Mbps.`)
+    }
 
     setSubmitting(which)
     try {
@@ -522,10 +714,19 @@ export function SettingsPage() {
         concurrency: form.concurrency,
         webhookUrl,
         notifyOn: form.notifyOn,
+        uploadConcurrency: form.uploadConcurrency,
+        compression: form.compression,
+        uploadLimitMbps: form.uploadLimitMbps,
       })
       setForm(saved)
       setServerName(saved.serverName)
-      toast.success(which === 'server' ? 'Settings saved.' : 'Notification settings saved.')
+      toast.success(
+        which === 'server'
+          ? 'Settings saved.'
+          : which === 'notifications'
+            ? 'Notification settings saved.'
+            : 'Performance settings saved — they apply to the next run.',
+      )
       await reload()
     } catch (err) {
       const message = errorMessage(err)
@@ -545,7 +746,7 @@ export function SettingsPage() {
     <>
       <PageHeader
         title="Settings"
-        description="Server identity, engine concurrency, and where run notifications go."
+        description="Server identity, throughput tuning, notifications, and your password."
         actions={
           <Button
             icon={<RefreshCw className="size-4" aria-hidden />}
@@ -636,6 +837,24 @@ export function SettingsPage() {
       )}
 
       <SoftwareUpdateCard />
+
+      {data ? (
+        <PerformanceCard
+          form={form}
+          patch={patch}
+          dirty={perfDirty}
+          saving={submitting === 'performance'}
+          error={perfError}
+          onSave={() => void persist('performance')}
+          onDiscard={() =>
+            patch({
+              uploadConcurrency: data.uploadConcurrency,
+              compression: data.compression,
+              uploadLimitMbps: data.uploadLimitMbps,
+            })
+          }
+        />
+      ) : null}
 
       {data ? (
         <NotificationsCard

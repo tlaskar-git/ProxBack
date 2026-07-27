@@ -219,6 +219,66 @@ func TestManifestAndRestore(t *testing.T) {
 	}
 }
 
+func TestVerifyBackup(t *testing.T) {
+	ctx := context.Background()
+	eng, client, _ := newEngine(t)
+
+	// Two disks so the verify walks a whole restore point, not just one stream.
+	first := deterministicBytes(9<<20, 21)
+	second := deterministicBytes(4<<20, 22)
+
+	sess := eng.NewSession(int64(len(first)+len(second)), nil)
+	dm1, err := sess.BackupStream(ctx, "scsi0", bytes.NewReader(first))
+	if err != nil {
+		t.Fatalf("backup scsi0: %v", err)
+	}
+	dm2, err := sess.BackupStream(ctx, "scsi1", bytes.NewReader(second))
+	if err != nil {
+		t.Fatalf("backup scsi1: %v", err)
+	}
+	man := &engine.Manifest{
+		BackupID: "b-verify", SourceKind: store.SourceVM, SourceID: "host_100",
+		SourceName: "web-01", TargetID: targetID, Kind: engine.KindFull,
+		SizeBytes: dm1.SizeBytes + dm2.SizeBytes,
+		Disks:     []engine.DiskManifest{dm1, dm2},
+	}
+
+	// A healthy restore point verifies, reporting progress over every byte.
+	var last engine.Stats
+	vsess := eng.NewSession(man.TotalSize(), func(s engine.Stats) { last = s })
+	if err := vsess.VerifyBackup(ctx, man); err != nil {
+		t.Fatalf("verify healthy backup: %v", err)
+	}
+	if got := vsess.Stats().BytesProcessed; got != man.TotalSize() {
+		t.Fatalf("verify processed %d bytes, want %d", got, man.TotalSize())
+	}
+	if vsess.Stats().BytesUploaded != 0 {
+		t.Fatalf("verify uploaded %d bytes, want 0", vsess.Stats().BytesUploaded)
+	}
+	if last.CurrentStep != "Verifying web-01 scsi1" {
+		t.Fatalf("last step = %q, want the second disk's verify step", last.CurrentStep)
+	}
+
+	// Corrupt one chunk object: verification must catch it as a hash mismatch.
+	if err := client.Put(ctx, engine.ChunkKey(dm2.Chunks[0].Sha256),
+		deterministicBytes(int(dm2.Chunks[0].Size), 999)); err != nil {
+		t.Fatalf("corrupt chunk: %v", err)
+	}
+	err = eng.NewSession(man.TotalSize(), nil).VerifyBackup(ctx, man)
+	if !errors.Is(err, engine.ErrHashMismatch) {
+		t.Fatalf("verify of corrupted backup = %v, want ErrHashMismatch", err)
+	}
+
+	// A truncated chunk is caught too, as a size mismatch rather than a hash one.
+	short := []byte("too short")
+	if err := client.Put(ctx, engine.ChunkKey(dm1.Chunks[0].Sha256), short); err != nil {
+		t.Fatalf("truncate chunk: %v", err)
+	}
+	if err := eng.NewSession(man.TotalSize(), nil).VerifyBackup(ctx, man); err == nil {
+		t.Fatal("verify accepted a truncated chunk")
+	}
+}
+
 func TestGarbageCollectOrphanChunks(t *testing.T) {
 	ctx := context.Background()
 	eng, _, st := newEngine(t)

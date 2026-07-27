@@ -1,7 +1,8 @@
 import { useCallback, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Cpu, HardDrive, Laptop, Play, RefreshCw, Search, Server } from 'lucide-react'
+import { Cpu, HardDrive, Laptop, Play, RefreshCw, Search, Server, Tags } from 'lucide-react'
 import {
+  allTagsOf,
   errorMessage,
   getHostVMs,
   listAgents,
@@ -10,6 +11,7 @@ import {
   listTargets,
   listVMs,
   runJob,
+  tagsOf,
   vmSourcesOf,
 } from '../api'
 import type { Agent, CachedVM, Host, Job, Target } from '../api'
@@ -18,9 +20,12 @@ import { useToast } from '../components/Toast'
 import {
   Button,
   Card,
+  Chip,
+  ChipButton,
   EmptyState,
   ErrorBlock,
   Input,
+  Num,
   PageHeader,
   Select,
   SkeletonCards,
@@ -28,7 +33,7 @@ import {
   toneForStatus,
 } from '../components/ui'
 import { useAsync } from '../lib/useAsync'
-import { formatBytes, formatUptime } from '../lib/format'
+import { formatBytes, formatCount, formatUptime } from '../lib/format'
 
 interface VMsData {
   vms: CachedVM[]
@@ -61,6 +66,7 @@ function VMCard({
   onBackup: () => void
   busy: boolean
 }) {
+  const tags = tagsOf(vm)
   return (
     <Card className="flex flex-col p-5">
       <div className="flex items-start justify-between gap-3">
@@ -71,7 +77,7 @@ function VMCard({
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold text-slate-100">{vm.name}</p>
             <p className="truncate text-xs text-slate-500">
-              <span className="font-mono">#{vm.vmid}</span> · {vm.hostName} · {vm.node}
+              <Num>#{vm.vmid}</Num> · {vm.hostName} · {vm.node}
             </p>
           </div>
         </div>
@@ -84,19 +90,29 @@ function VMCard({
             <HardDrive className="size-3" aria-hidden />
             Disk
           </p>
-          <p className="mt-1 text-sm text-slate-200">{formatBytes(vm.maxdisk)}</p>
+          <Num className="mt-1 block text-sm text-slate-200">{formatBytes(vm.maxdisk)}</Num>
         </div>
         <div className="rounded-lg border border-slate-800/80 bg-slate-950/40 px-3 py-2.5">
           <p className="flex items-center gap-1.5 text-[11px] tracking-wide text-slate-500 uppercase">
             <Cpu className="size-3" aria-hidden />
             Memory
           </p>
-          <p className="mt-1 text-sm text-slate-200">{formatBytes(vm.maxmem)}</p>
+          <Num className="mt-1 block text-sm text-slate-200">{formatBytes(vm.maxmem)}</Num>
         </div>
       </div>
 
+      {tags.length > 0 ? (
+        <div className="mt-3 flex flex-wrap items-center gap-1.5">
+          {tags.map((tag) => (
+            <Chip key={tag} title={`Proxmox tag “${tag}”`}>
+              {tag}
+            </Chip>
+          ))}
+        </div>
+      ) : null}
+
       <p className="mt-3 text-xs text-slate-500">
-        {vm.status === 'running' ? `Up ${formatUptime(vm.uptime)}` : 'Not running'}
+        {vm.status === 'running' ? <>Up <Num>{formatUptime(vm.uptime)}</Num></> : 'Not running'}
         {job ? (
           <>
             {' · '}
@@ -143,6 +159,7 @@ export function VirtualMachinesPage() {
 
   const [query, setQuery] = useState('')
   const [hostFilter, setHostFilter] = useState('all')
+  const [tagFilters, setTagFilters] = useState<string[]>([])
   const [refreshing, setRefreshing] = useState(false)
   const [busyVM, setBusyVM] = useState<string | null>(null)
   const [wizardVM, setWizardVM] = useState<CachedVM | null>(null)
@@ -152,19 +169,46 @@ export function VirtualMachinesPage() {
   const hosts = useMemo(() => data?.hosts ?? [], [data])
   const jobs = useMemo(() => data?.jobs ?? [], [data])
 
+  /** Union of every tag in the cached inventory, with how many VMs carry it. */
+  const tagCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const tag of allTagsOf(vms)) counts.set(tag, 0)
+    for (const vm of vms) {
+      for (const tag of tagsOf(vm)) counts.set(tag, (counts.get(tag) ?? 0) + 1)
+    }
+    return [...counts.entries()]
+  }, [vms])
+
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase()
     return vms.filter((vm) => {
       if (hostFilter !== 'all' && String(vm.hostId) !== hostFilter) return false
+      // Tag chips narrow: a VM must carry every selected tag.
+      if (tagFilters.length > 0) {
+        const tags = tagsOf(vm)
+        if (!tagFilters.every((tag) => tags.includes(tag))) return false
+      }
       if (!needle) return true
       return (
         vm.name.toLowerCase().includes(needle) ||
         String(vm.vmid).includes(needle) ||
         vm.node.toLowerCase().includes(needle) ||
-        vm.hostName.toLowerCase().includes(needle)
+        vm.hostName.toLowerCase().includes(needle) ||
+        tagsOf(vm).some((tag) => tag.includes(needle))
       )
     })
-  }, [vms, query, hostFilter])
+  }, [vms, query, hostFilter, tagFilters])
+
+  const toggleTag = (tag: string) =>
+    setTagFilters((current) =>
+      current.includes(tag) ? current.filter((item) => item !== tag) : [...current, tag],
+    )
+
+  const clearFilters = () => {
+    setQuery('')
+    setHostFilter('all')
+    setTagFilters([])
+  }
 
   /** Re-poll every host’s live inventory, then reload the cached list. */
   const onRefreshInventory = async () => {
@@ -302,25 +346,46 @@ export function VirtualMachinesPage() {
               ))}
             </Select>
             <p className="ml-auto text-xs text-slate-500">
-              {filtered.length} of {vms.length} shown
+              <Num>{formatCount(filtered.length)}</Num> of <Num>{formatCount(vms.length)}</Num> shown
             </p>
           </div>
+
+          {tagCounts.length > 0 ? (
+            <div className="mb-4 flex flex-wrap items-center gap-1.5">
+              <span className="mr-1 inline-flex items-center gap-1.5 text-[11px] font-medium tracking-wide text-slate-500 uppercase">
+                <Tags className="size-3.5" aria-hidden />
+                Tags
+              </span>
+              {tagCounts.map(([tag, count]) => (
+                <ChipButton
+                  key={tag}
+                  selected={tagFilters.includes(tag)}
+                  onClick={() => toggleTag(tag)}
+                >
+                  {tag}
+                  <span className="ml-1 text-slate-600">{count}</span>
+                </ChipButton>
+              ))}
+              {tagFilters.length > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => setTagFilters([])}
+                  className="ml-1 text-[11px] text-slate-500 transition-colors duration-150 hover:text-slate-300"
+                >
+                  {tagFilters.length > 1
+                    ? `Clear ${tagFilters.length} tags — showing VMs with all of them`
+                    : 'Clear tag'}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
 
           {filtered.length === 0 ? (
             <EmptyState
               icon={<Search className="size-5" aria-hidden />}
               title="Nothing matches that filter"
-              description="Try a different name, VMID, node, or host."
-              action={
-                <Button
-                  onClick={() => {
-                    setQuery('')
-                    setHostFilter('all')
-                  }}
-                >
-                  Clear filters
-                </Button>
-              }
+              description="Try a different name, VMID, node, host, or tag combination."
+              action={<Button onClick={clearFilters}>Clear filters</Button>}
             />
           ) : (
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">

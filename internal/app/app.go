@@ -13,6 +13,7 @@ import (
 	"proxback/internal/agentmgr"
 	"proxback/internal/api"
 	"proxback/internal/auth"
+	"proxback/internal/helpermgr"
 	"proxback/internal/sched"
 	"proxback/internal/store"
 )
@@ -31,6 +32,7 @@ type App struct {
 	Store   *store.Store
 	Auth    *auth.Service
 	Agents  *agentmgr.Manager
+	Helpers *helpermgr.Manager
 	Sched   *sched.Manager
 	Handler http.Handler
 	DataDir string
@@ -71,6 +73,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 			"username", auth.DefaultAdminUsername, "password", auth.DefaultAdminPassword)
 	}
 	agents := agentmgr.New(st, log)
+	helpers := helpermgr.New(st, log)
 	scheduler := sched.New(st, agents, log)
 	if err := scheduler.Start(ctx); err != nil {
 		st.Close()
@@ -80,6 +83,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		Store:              st,
 		Auth:               authSvc,
 		Agents:             agents,
+		Helpers:            helpers,
 		Sched:              scheduler,
 		DataDir:            dataDir,
 		Logger:             log,
@@ -91,7 +95,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 	return &App{
-		Store: st, Auth: authSvc, Agents: agents, Sched: scheduler,
+		Store: st, Auth: authSvc, Agents: agents, Helpers: helpers, Sched: scheduler,
 		Handler: handler, DataDir: dataDir, log: log,
 	}, nil
 }

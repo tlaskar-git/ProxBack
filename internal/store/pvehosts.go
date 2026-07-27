@@ -119,9 +119,9 @@ func (s *Store) ReplaceVMCache(ctx context.Context, hostID string, vms []VM) err
 	now := fmtTime(Now())
 	for _, v := range vms {
 		_, err := tx.ExecContext(ctx,
-			`INSERT INTO vms_cache (host_id, vmid, name, node, status, maxdisk, maxmem, uptime, updated_at)
-			 VALUES (?,?,?,?,?,?,?,?,?)`,
-			hostID, v.VMID, v.Name, v.Node, v.Status, v.MaxDisk, v.MaxMem, v.Uptime, now)
+			`INSERT INTO vms_cache (host_id, vmid, name, node, status, maxdisk, maxmem, uptime, tags, updated_at)
+			 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			hostID, v.VMID, v.Name, v.Node, v.Status, v.MaxDisk, v.MaxMem, v.Uptime, encodeTags(v.Tags), now)
 		if err != nil {
 			return fmt.Errorf("insert vm cache row: %w", err)
 		}
@@ -135,7 +135,7 @@ func (s *Store) ReplaceVMCache(ctx context.Context, hostID string, vms []VM) err
 // ListCachedVMs returns the cached inventory across all hosts.
 func (s *Store) ListCachedVMs(ctx context.Context) ([]VM, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT c.host_id, h.name, c.vmid, c.name, c.node, c.status, c.maxdisk, c.maxmem, c.uptime
+		`SELECT c.host_id, h.name, c.vmid, c.name, c.node, c.status, c.maxdisk, c.maxmem, c.uptime, c.tags
 		   FROM vms_cache c LEFT JOIN pve_hosts h ON h.id = c.host_id
 		 ORDER BY c.vmid`)
 	if err != nil {
@@ -146,10 +146,13 @@ func (s *Store) ListCachedVMs(ctx context.Context) ([]VM, error) {
 	for rows.Next() {
 		var v VM
 		var hostName sql.NullString
-		if err := rows.Scan(&v.HostID, &hostName, &v.VMID, &v.Name, &v.Node, &v.Status, &v.MaxDisk, &v.MaxMem, &v.Uptime); err != nil {
+		var tags string
+		if err := rows.Scan(&v.HostID, &hostName, &v.VMID, &v.Name, &v.Node, &v.Status,
+			&v.MaxDisk, &v.MaxMem, &v.Uptime, &tags); err != nil {
 			return nil, fmt.Errorf("scan cached vm: %w", err)
 		}
 		v.HostName = nullStr(hostName)
+		v.Tags = decodeTags(tags)
 		out = append(out, v)
 	}
 	return out, rows.Err()
@@ -158,15 +161,17 @@ func (s *Store) ListCachedVMs(ctx context.Context) ([]VM, error) {
 // CachedVM returns one cached VM row.
 func (s *Store) CachedVM(ctx context.Context, hostID string, vmid int) (*VM, error) {
 	var v VM
+	var tags string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT host_id, vmid, name, node, status, maxdisk, maxmem, uptime FROM vms_cache WHERE host_id = ? AND vmid = ?`,
-		hostID, vmid).Scan(&v.HostID, &v.VMID, &v.Name, &v.Node, &v.Status, &v.MaxDisk, &v.MaxMem, &v.Uptime)
+		`SELECT host_id, vmid, name, node, status, maxdisk, maxmem, uptime, tags FROM vms_cache WHERE host_id = ? AND vmid = ?`,
+		hostID, vmid).Scan(&v.HostID, &v.VMID, &v.Name, &v.Node, &v.Status, &v.MaxDisk, &v.MaxMem, &v.Uptime, &tags)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load cached vm: %w", err)
 	}
+	v.Tags = decodeTags(tags)
 	return &v, nil
 }
 

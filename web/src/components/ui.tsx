@@ -13,7 +13,14 @@ import { cn } from '../lib/cn'
  * Button
  * ------------------------------------------------------------------------- */
 
-export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'success'
+export type ButtonVariant =
+  | 'primary'
+  | 'secondary'
+  | 'ghost'
+  | 'danger'
+  /** Quiet destructive: slate until hover, then red. For icon-only actions. */
+  | 'dangerQuiet'
+  | 'success'
 export type ButtonSize = 'sm' | 'md' | 'lg'
 
 const VARIANTS: Record<ButtonVariant, string> = {
@@ -24,6 +31,7 @@ const VARIANTS: Record<ButtonVariant, string> = {
   ghost: 'text-slate-400 hover:bg-slate-800/70 hover:text-slate-100',
   danger:
     'border border-red-500/40 bg-red-500/10 text-red-300 hover:border-red-500/60 hover:bg-red-500/20 hover:text-red-200',
+  dangerQuiet: 'text-slate-500 hover:bg-red-500/10 hover:text-red-300',
   success:
     'border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:border-emerald-500/60 hover:bg-emerald-500/20 hover:text-emerald-200',
 }
@@ -165,6 +173,150 @@ export function PageHeader({
       </div>
       {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
     </header>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Numerals
+ *
+ * Every quantity in the panel — bytes, counts, durations, ratios, percentages
+ * — renders through <Num> so figures line up column-to-column and never
+ * reflow as a polled value ticks over.
+ * ------------------------------------------------------------------------- */
+
+export function Num({ children, className }: { children: ReactNode; className?: string }) {
+  return <span className={cn('font-mono tabular-nums', className)}>{children}</span>
+}
+
+/* ---------------------------------------------------------------------------
+ * Chips
+ *
+ * One 11px chip shape for metadata: Proxmox tags, a job's tag filter, the tag
+ * filter row. Chips stay slate — color is reserved for state (StatusPill), so
+ * a row never carries more than one accent-colored element.
+ * ------------------------------------------------------------------------- */
+
+export type ChipTone = 'slate' | 'accent'
+
+const CHIP_BASE =
+  'inline-flex max-w-full items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] leading-4 font-medium'
+
+const CHIP_TONES: Record<ChipTone, string> = {
+  slate: 'border-slate-700/80 bg-slate-800/60 text-slate-400',
+  accent: 'border-accent-500/30 bg-accent-500/10 text-accent-300',
+}
+
+export function Chip({
+  children,
+  tone = 'slate',
+  icon,
+  mono = true,
+  className,
+  title,
+}: {
+  children: ReactNode
+  tone?: ChipTone
+  icon?: ReactNode
+  /** Tags and identifiers read better in the mono face; prose does not. */
+  mono?: boolean
+  className?: string
+  title?: string
+}) {
+  return (
+    <span className={cn(CHIP_BASE, CHIP_TONES[tone], mono && 'font-mono', className)} title={title}>
+      {icon}
+      <span className="truncate">{children}</span>
+    </span>
+  )
+}
+
+/** Selectable chip — used by the VM tag filter row. */
+export function ChipButton({
+  children,
+  selected = false,
+  onClick,
+  icon,
+  className,
+}: {
+  children: ReactNode
+  selected?: boolean
+  onClick: () => void
+  icon?: ReactNode
+  className?: string
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={selected}
+      className={cn(
+        CHIP_BASE,
+        'font-mono transition-colors duration-150',
+        selected
+          ? 'border-accent-500/50 bg-accent-500/15 text-accent-200'
+          : 'border-slate-700/80 bg-slate-800/40 text-slate-400 hover:border-slate-600 hover:bg-slate-800 hover:text-slate-200',
+        className,
+      )}
+    >
+      {icon}
+      <span className="truncate">{children}</span>
+    </button>
+  )
+}
+
+/* ---------------------------------------------------------------------------
+ * Segmented control
+ * ------------------------------------------------------------------------- */
+
+export interface SegmentedOption<T extends string> {
+  value: T
+  label: string
+}
+
+/** Radio-group-style switch for two to four short, mutually exclusive choices. */
+export function Segmented<T extends string>({
+  value,
+  options,
+  onChange,
+  label,
+  className,
+}: {
+  value: T
+  options: SegmentedOption<T>[]
+  onChange: (value: T) => void
+  label: string
+  className?: string
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label={label}
+      className={cn(
+        'inline-flex rounded-lg border border-slate-800 bg-slate-950/60 p-0.5',
+        className,
+      )}
+    >
+      {options.map((option) => {
+        const active = option.value === value
+        return (
+          <button
+            key={option.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(option.value)}
+            className={cn(
+              'rounded-md px-3 py-1.5 text-xs font-medium whitespace-nowrap transition-colors duration-150',
+              active
+                ? 'bg-accent-500/15 text-accent-200'
+                : 'text-slate-400 hover:bg-slate-800/70 hover:text-slate-200',
+            )}
+          >
+            {option.label}
+          </button>
+        )
+      })}
+    </div>
   )
 }
 
@@ -434,7 +586,7 @@ export function Field({
 }
 
 const CONTROL_CLASS =
-  'w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 transition placeholder:text-slate-600 hover:border-slate-600 focus:border-accent-500 focus:outline-none disabled:opacity-50'
+  'w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 transition-colors duration-150 placeholder:text-slate-600 hover:border-slate-600 focus:border-accent-500 focus:outline-none disabled:opacity-50'
 
 export function Input({ className, ...rest }: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={cn(CONTROL_CLASS, className)} {...rest} />
@@ -468,7 +620,7 @@ export function Checkbox({
   return (
     <label
       className={cn(
-        'flex cursor-pointer items-start gap-3 rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5 transition hover:border-slate-700',
+        'flex cursor-pointer items-start gap-3 rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2.5 transition-colors duration-150 hover:border-slate-700',
         disabled && 'cursor-not-allowed opacity-50',
       )}
     >

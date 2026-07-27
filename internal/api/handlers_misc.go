@@ -2,8 +2,11 @@ package api
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -12,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"proxback/internal/notify"
 	"proxback/internal/store"
 )
 
@@ -114,6 +118,8 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ServerName  *string `json:"serverName"`
 		Concurrency *int    `json:"concurrency"`
+		WebhookURL  *string `json:"webhookUrl"`
+		NotifyOn    *string `json:"notifyOn"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -128,6 +134,21 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		current.Concurrency = *body.Concurrency
 	}
+	if body.WebhookURL != nil {
+		url := strings.TrimSpace(*body.WebhookURL)
+		if err := validateWebhookURL(url); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		current.WebhookURL = url
+	}
+	if body.NotifyOn != nil {
+		if !store.ValidNotifyOn(*body.NotifyOn) {
+			writeError(w, http.StatusBadRequest, `notifyOn must be "off", "failures" or "all"`)
+			return
+		}
+		current.NotifyOn = *body.NotifyOn
+	}
 	if err := s.st.SaveSettings(r.Context(), current); err != nil {
 		s.serverError(w, err)
 		return
@@ -141,18 +162,66 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, saved)
 }
 
+// validateWebhookURL keeps the stored value to something the notifier can
+// actually POST to. An empty URL is valid and disables notifications.
+func validateWebhookURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("webhookUrl is not a valid URL: %w", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("webhookUrl must be an http:// or https:// URL")
+	}
+	return nil
+}
+
+// handleTestWebhook posts a sample payload to the saved webhook URL so the
+// operator can confirm the endpoint before relying on it.
+func (s *Server) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
+	settings, err := s.st.Settings(r.Context())
+	if err != nil {
+		s.serverError(w, err)
+		return
+	}
+	if settings.WebhookURL == "" {
+		writeError(w, http.StatusBadRequest, "no webhookUrl is configured")
+		return
+	}
+	now := store.Now()
+	payload := notify.Payload{
+		Event:      notify.EventRunFinished,
+		Server:     settings.ServerName,
+		Job:        "Webhook test",
+		Kind:       store.SourceVM,
+		Status:     store.RunSuccess,
+		StartedAt:  now,
+		FinishedAt: now,
+	}
+	if err := s.notifier.Send(r.Context(), settings.WebhookURL, payload); err != nil {
+		s.log.Warn("webhook test failed", "url", settings.WebhookURL, "error", err)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // ---------------------------------------------------------------- downloads
 
-// agentDownloads maps the public download names to their file names in
-// <dataDir>/downloads.
-var agentDownloads = map[string]string{
+// allowedDownloads maps the public download names to their file names in
+// <dataDir>/downloads. The map is the whole of the name validation: nothing
+// outside it can be requested, so no path can escape the downloads directory.
+var allowedDownloads = map[string]string{
 	"proxback-agent-linux-amd64":       "proxback-agent-linux-amd64",
 	"proxback-agent-windows-amd64.exe": "proxback-agent-windows-amd64.exe",
+	"proxback-helper-linux-amd64":      "proxback-helper-linux-amd64",
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
-	file, ok := agentDownloads[name]
+	file, ok := allowedDownloads[name]
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown download")
 		return
@@ -161,13 +230,13 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	f, err := os.Open(full)
 	if err != nil {
 		writeError(w, http.StatusNotFound,
-			"agent binary not available on this server; build it and place it in <data>/downloads/")
+			"binary not available on this server; build it and place it in <data>/downloads/")
 		return
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil || st.IsDir() {
-		writeError(w, http.StatusNotFound, "agent binary not available")
+		writeError(w, http.StatusNotFound, "binary not available")
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")

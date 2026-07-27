@@ -163,7 +163,7 @@ func (s *Server) refreshHostVMs(r *http.Request, host *store.PVEHost) ([]store.V
 		out = append(out, store.VM{
 			VMID: v.VMID, Name: v.Name, Node: v.Node, Status: v.Status,
 			MaxDisk: v.MaxDisk, MaxMem: v.MaxMem, Uptime: v.Uptime,
-			HostID: host.ID, HostName: host.Name,
+			Tags: v.Tags, HostID: host.ID, HostName: host.Name,
 		})
 	}
 	if err := s.st.ReplaceVMCache(r.Context(), host.ID, out); err != nil {
@@ -178,21 +178,27 @@ func (s *Server) refreshHostVMs(r *http.Request, host *store.PVEHost) ([]store.V
 
 // vmDTO matches the inventory shape in the API contract.
 type vmDTO struct {
-	VMID     int    `json:"vmid"`
-	Name     string `json:"name"`
-	Node     string `json:"node"`
-	Status   string `json:"status"`
-	MaxDisk  int64  `json:"maxdisk"`
-	MaxMem   int64  `json:"maxmem"`
-	Uptime   int64  `json:"uptime"`
-	HostID   string `json:"hostId,omitempty"`
-	HostName string `json:"hostName,omitempty"`
+	VMID   int    `json:"vmid"`
+	Name   string `json:"name"`
+	Node   string `json:"node"`
+	Status string `json:"status"`
+	// Tags is always an array, never null, so the UI can map over it directly.
+	Tags     []string `json:"tags"`
+	MaxDisk  int64    `json:"maxdisk"`
+	MaxMem   int64    `json:"maxmem"`
+	Uptime   int64    `json:"uptime"`
+	HostID   string   `json:"hostId,omitempty"`
+	HostName string   `json:"hostName,omitempty"`
 }
 
 func toVMDTO(v store.VM, withHost bool) vmDTO {
 	d := vmDTO{
 		VMID: v.VMID, Name: v.Name, Node: v.Node, Status: v.Status,
+		Tags:    v.Tags,
 		MaxDisk: v.MaxDisk, MaxMem: v.MaxMem, Uptime: v.Uptime,
+	}
+	if d.Tags == nil {
+		d.Tags = []string{}
 	}
 	if withHost {
 		d.HostID = v.HostID

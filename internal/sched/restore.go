@@ -41,6 +41,26 @@ func (m *Manager) executeRestore(ctx context.Context, run *store.JobRun, backup 
 	return statsPtr(sess), nil
 }
 
+// executeVerify re-reads every chunk of a restore point and validates it
+// against the manifest. Nothing is written: success means the point restores.
+func (m *Manager) executeVerify(ctx context.Context, run *store.JobRun, backup *store.Backup) (*engine.Stats, error) {
+	eng, _, err := m.engineFor(ctx, backup.TargetID)
+	if err != nil {
+		return nil, err
+	}
+	man, err := eng.ReadManifest(ctx, backup.SourceKind, backup.SourceID, backup.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest: %w", err)
+	}
+	sess := eng.NewSession(man.TotalSize(), m.progressFn(run.ID))
+	if err := sess.VerifyBackup(ctx, man); err != nil {
+		return statsPtr(sess), err
+	}
+	sess.SetStep("Verified")
+	sess.Flush()
+	return statsPtr(sess), nil
+}
+
 func (m *Manager) restoreVM(ctx context.Context, sess *engine.Session, man *engine.Manifest, spec RestoreSpec) error {
 	if spec.VM == nil {
 		return errors.New("sched: vm restore target required")
@@ -53,19 +73,40 @@ func (m *Manager) restoreVM(ctx context.Context, sess *engine.Session, man *engi
 	if err != nil {
 		return err
 	}
+	sourceVMID, sourceErr := vmidFromSourceID(man.SourceID)
 	vmid := spec.VM.VMID
 	if vmid == 0 {
-		vmid, err = vmidFromSourceID(man.SourceID)
-		if err != nil {
-			return err
+		if sourceErr != nil {
+			return sourceErr
 		}
+		vmid = sourceVMID
 	}
+	viaHelper := IsVMAManifest(man.Disks)
 	node := spec.VM.Node
 	if node == "" {
 		node, err = client.FindNodeForVM(ctx, vmid)
 		if err != nil {
+			// Restoring a helper-backed point into a vmid that does not exist yet
+			// is the normal side-by-side case: fall back to the source's node.
+			if !viaHelper || sourceErr != nil {
+				return err
+			}
+			if node, err = client.FindNodeForVM(ctx, sourceVMID); err != nil {
+				return err
+			}
+		}
+	}
+	if viaHelper {
+		// A whole-guest archive can only go back through qmrestore, which only
+		// the node helper can run.
+		h, err := m.requireHelperForNode(ctx, node)
+		if err != nil {
 			return err
 		}
+		// --force overwrites an existing guest, which is only ever what the
+		// operator meant when restoring onto the same vmid it came from.
+		force := sourceErr == nil && vmid == sourceVMID
+		return m.restoreViaHelper(ctx, sess, man, h, vmid, spec.VM.Storage, force)
 	}
 	for _, disk := range man.Disks {
 		if err := ctx.Err(); err != nil {

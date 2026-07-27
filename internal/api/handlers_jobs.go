@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -22,7 +23,11 @@ type jobDTO struct {
 	Retention  int              `json:"retention"`
 	Enabled    bool             `json:"enabled"`
 	Sources    store.JobSources `json:"sources"`
-	LastRun    *store.JobRun    `json:"lastRun"`
+	// TagFilter is null when the job uses its static source list.
+	TagFilter *string `json:"tagFilter"`
+	// NextRun is null for manual schedules and disabled jobs.
+	NextRun *time.Time    `json:"nextRun"`
+	LastRun *store.JobRun `json:"lastRun"`
 }
 
 func (s *Server) jobDTOs(r *http.Request, jobs []*store.Job) ([]jobDTO, error) {
@@ -34,12 +39,18 @@ func (s *Server) jobDTOs(r *http.Request, jobs []*store.Job) ([]jobDTO, error) {
 	for _, t := range targets {
 		names[t.ID] = t.Name
 	}
+	now := store.Now()
 	out := make([]jobDTO, 0, len(jobs))
 	for _, j := range jobs {
 		d := jobDTO{
 			ID: j.ID, Name: j.Name, Kind: j.Kind, TargetID: j.TargetID,
 			TargetName: names[j.TargetID], Schedule: j.Schedule,
 			Retention: j.Retention, Enabled: j.Enabled, Sources: j.Sources,
+			NextRun: sched.NextRun(j.Schedule, j.Enabled, now),
+		}
+		if j.TagFilter != "" {
+			tag := j.TagFilter
+			d.TagFilter = &tag
 		}
 		if d.Sources == nil {
 			d.Sources = store.JobSources{}
@@ -79,10 +90,23 @@ type jobRequest struct {
 	Retention *int              `json:"retention"`
 	Enabled   *bool             `json:"enabled"`
 	Sources   *store.JobSources `json:"sources"`
+	TagFilter *string           `json:"tagFilter"`
 }
 
-func validateSources(kind string, sources store.JobSources) error {
-	if len(sources) == 0 {
+// normalizeTagFilter matches the normalisation applied to guest tags so a
+// filter typed as "Prod" still selects guests tagged "prod".
+func normalizeTagFilter(v string) string {
+	return strings.ToLower(strings.TrimSpace(v))
+}
+
+// validateJob checks a job's membership definition. A vm job may leave sources
+// empty when it carries a tag filter, because membership is then resolved from
+// the cached inventory at run start.
+func validateJob(kind string, sources store.JobSources, tagFilter string) error {
+	if tagFilter != "" && kind != store.SourceVM {
+		return errors.New("tagFilter is only supported for vm jobs")
+	}
+	if len(sources) == 0 && tagFilter == "" {
 		return errors.New("at least one source is required")
 	}
 	switch kind {
@@ -139,6 +163,9 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if body.Sources != nil {
 		job.Sources = *body.Sources
 	}
+	if body.TagFilter != nil {
+		job.TagFilter = normalizeTagFilter(*body.TagFilter)
+	}
 	if job.Name == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
@@ -151,7 +178,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		s.notFoundOr(w, err, "target")
 		return
 	}
-	if err := validateSources(job.Kind, job.Sources); err != nil {
+	if err := validateJob(job.Kind, job.Sources, job.TagFilter); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -209,6 +236,11 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 	if body.Sources != nil {
 		job.Sources = *body.Sources
 	}
+	// An explicit empty tagFilter clears it and returns the job to its static
+	// source list.
+	if body.TagFilter != nil {
+		job.TagFilter = normalizeTagFilter(*body.TagFilter)
+	}
 	if job.Name == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
@@ -217,7 +249,7 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 		s.notFoundOr(w, err, "target")
 		return
 	}
-	if err := validateSources(job.Kind, job.Sources); err != nil {
+	if err := validateJob(job.Kind, job.Sources, job.TagFilter); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -328,6 +360,22 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 		backups = []*store.Backup{}
 	}
 	writeJSON(w, http.StatusOK, backups)
+}
+
+func (s *Server) handleVerifyBackup(w http.ResponseWriter, r *http.Request) {
+	runID, err := s.sched.Verify(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		switch {
+		case errors.Is(err, sched.ErrAlreadyRunning):
+			writeError(w, http.StatusConflict, "a verification of this restore point is already running")
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "backup not found")
+		default:
+			s.serverError(w, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"runId": runID})
 }
 
 func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {

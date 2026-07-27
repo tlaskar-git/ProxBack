@@ -10,8 +10,14 @@ ProxBack is a self-hosted, Veeam-style backup platform for [Proxmox VE](https://
   S3-compatible (custom endpoint and path-style addressing supported).
 - **Web control panel** — a dark, button-first dashboard for hosts, VMs, backup jobs, live
   job monitoring, restore points, storage targets, and one-click agent deployment.
+- **Tag-based grouping** — back up by Proxmox tag instead of a fixed VM list; guests
+  tagged later are picked up automatically at the next run.
+- **Restore-point verification** — one click re-downloads and SHA-256-checks every chunk
+  of a restore point, proving it is restorable without writing anywhere.
+- **Webhook notifications** — POST a JSON summary of every finished (or only failed) run
+  to ntfy, Gotify, or any automation endpoint.
 - **Single static binary** with the web UI embedded, SQLite state, systemd deployment,
-  no Docker required.
+  in-app updates from GitHub releases, no Docker required.
 
 ## Try it in five minutes (no Proxmox needed)
 
@@ -94,10 +100,14 @@ remind you until you do. Changing the password also revokes every other session.
 2. In ProxBack: **Proxmox Hosts → Add Host** — base URL `https://your-host:8006`, the
    token id and secret, and enable **insecure TLS** if the host still uses its default
    self-signed certificate.
-3. The disk export/import path used for agentless image backup is served by the
-   `proxback-export` / `proxback-import` endpoints described in [PLAN.md](PLAN.md); the
-   E2E suite exercises it against `pve-sim`. On real hosts, pair ProxBack with the export
-   helper, or use in-guest agents until the helper is installed.
+3. **Install the node helper on each Proxmox node** (required for agentless VM image
+   backup — real Proxmox has no disk-export API). In ProxBack, open the host's card →
+   "Deploy node helper" → generate a token and paste the one-line install command into a
+   root shell on each PVE node. The helper is a small systemd service that streams
+   backups through Proxmox's own `vzdump` (snapshot-consistent, every storage type,
+   qemu-guest-agent freeze) and restores through `qmrestore`. Without a helper on a VM's
+   node, backup runs for that VM fail with an "install the node helper" error; file-level
+   agent backups work regardless.
 
 ### 5. Add a storage target
 
@@ -113,11 +123,16 @@ loudly before your first backup, not during it.
 
 ### 6. Create jobs, restore, deploy agents
 
-- **Backup Jobs → Create Job** — pick VMs (or an agent + folders), a target, a schedule
-  (manual, hourly, daily, weekly, or any cron expression), and a keep-last-N retention.
+- **Backup Jobs → Create Job** — pick VMs manually or **by Proxmox tag** (dynamic
+  membership), or an agent + folders; then a target, a schedule (manual, hourly, daily,
+  weekly, or any cron expression), and a keep-last-N retention. Job rows show the next
+  scheduled run.
 - **Restore Points** shows each source's full → incremental chain. Restores go to the
   original VMID or side by side into a free VMID; every chunk is hash-verified during the
-  stream.
+  stream. The **Verify** button health-checks a point on demand (full chunk re-download +
+  hash check) — the result appears in Monitor like any other run.
+- **Settings → Notifications** — set a webhook URL and choose failures-only or all runs;
+  every finished backup/restore/verify POSTs a JSON summary there.
 - **Agents** — generate a single-use enrollment token and copy the one-line install
   command for Linux (bash) or Windows (PowerShell), or download the binary and pass
   `--server` and `--token` yourself. Agents heartbeat every 15 s and never hold S3

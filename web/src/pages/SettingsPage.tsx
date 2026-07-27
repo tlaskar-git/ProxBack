@@ -2,11 +2,13 @@ import { useCallback, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import {
   ArrowUpCircle,
+  BellRing,
   CheckCircle2,
   ExternalLink,
   KeyRound,
   RefreshCw,
   Save,
+  Send,
   SlidersHorizontal,
 } from 'lucide-react'
 import {
@@ -17,8 +19,9 @@ import {
   getSetupStatus,
   getUpdateStatus,
   putSettings,
+  testWebhook,
 } from '../api'
-import type { Settings, UpdateStatus } from '../api'
+import type { NotifyOn, Settings, UpdateStatus } from '../api'
 import { useToast } from '../components/Toast'
 import { useConfirm } from '../components/Confirm'
 import { useSession } from '../session'
@@ -32,11 +35,25 @@ import {
   LoadingBlock,
   PageHeader,
   SectionNote,
+  Segmented,
   Spinner,
 } from '../components/ui'
 import { useAsync } from '../lib/useAsync'
 
 const MAX_CONCURRENCY = 32
+
+const DEFAULT_SETTINGS: Settings = {
+  serverName: '',
+  concurrency: 2,
+  webhookUrl: '',
+  notifyOn: 'off',
+}
+
+const NOTIFY_OPTIONS: { value: NotifyOn; label: string }[] = [
+  { value: 'off', label: 'Off' },
+  { value: 'failures', label: 'Failures only' },
+  { value: 'all', label: 'All runs' },
+]
 
 function SoftwareUpdateCard() {
   const toast = useToast()
@@ -174,7 +191,7 @@ function SoftwareUpdateCard() {
                   href={status.releaseUrl}
                   target="_blank"
                   rel="noreferrer"
-                  className="inline-flex items-center gap-1.5 text-xs text-slate-400 transition hover:text-slate-200"
+                  className="inline-flex items-center gap-1.5 text-xs text-slate-400 transition-colors duration-150 hover:text-slate-200"
                 >
                   Release notes on GitHub
                   <ExternalLink className="size-3.5" aria-hidden />
@@ -184,6 +201,153 @@ function SoftwareUpdateCard() {
           </>
         ) : null}
       </div>
+    </Card>
+  )
+}
+
+function NotificationsCard({
+  form,
+  patch,
+  dirty,
+  savedWebhookUrl,
+  saving,
+  error,
+  onSave,
+  onDiscard,
+}: {
+  form: Settings
+  patch: (next: Partial<Settings>) => void
+  dirty: boolean
+  savedWebhookUrl: string
+  saving: boolean
+  error: string | null
+  onSave: () => void
+  onDiscard: () => void
+}) {
+  const toast = useToast()
+  const [testing, setTesting] = useState(false)
+
+  const onTest = async () => {
+    setTesting(true)
+    try {
+      const result = await testWebhook()
+      if (result.ok) {
+        toast.success(
+          'Test notification sent.',
+          'A sample run.finished payload went to the saved URL.',
+        )
+      } else {
+        toast.error(
+          'The endpoint did not accept the test',
+          result.error ?? 'No further detail was reported.',
+        )
+      }
+    } catch (err) {
+      toast.error('Could not send the test', errorMessage(err))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <Card className="mt-6 max-w-2xl">
+      <CardHeader
+        title="Notifications"
+        subtitle="POST a JSON summary to a webhook whenever a run finishes."
+      />
+      <form
+        className="space-y-5 px-5 py-5"
+        onSubmit={(event) => {
+          event.preventDefault()
+          onSave()
+        }}
+        noValidate
+      >
+        <Field
+          label="Webhook URL"
+          hint="Leave empty to disable notifications entirely."
+        >
+          {({ id }) => (
+            <Input
+              id={id}
+              type="url"
+              value={form.webhookUrl}
+              placeholder="https://ntfy.sh/your-topic or any endpoint that accepts JSON"
+              onChange={(event) => patch({ webhookUrl: event.target.value })}
+            />
+          )}
+        </Field>
+
+        <div className="space-y-1.5">
+          <span className="block text-xs font-medium tracking-wide text-slate-400">Notify on</span>
+          <Segmented
+            label="Which runs trigger a notification"
+            value={form.notifyOn}
+            options={NOTIFY_OPTIONS}
+            onChange={(notifyOn) => patch({ notifyOn })}
+          />
+          <p className="text-xs leading-relaxed text-slate-500">
+            {form.notifyOn === 'off'
+              ? 'Nothing is sent, even with a URL saved.'
+              : form.notifyOn === 'failures'
+                ? 'Only failed backup, restore, and verify runs are reported.'
+                : 'Every finished backup, restore, and verify run is reported.'}
+          </p>
+        </div>
+
+        <SectionNote>
+          The payload is plain JSON — event, server, job, kind, status, bytes, dedup ratio, duration,
+          and the error when there is one. It works as-is with ntfy, Gotify, a Discord webhook proxy,
+          or any automation endpoint. Delivery has a 10-second timeout and never blocks a run.
+        </SectionNote>
+
+        {error ? (
+          <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-xs text-red-300">
+            {error}
+          </p>
+        ) : null}
+
+        <div className="flex flex-wrap items-center gap-3 border-t border-slate-800 pt-4">
+          <Button
+            type="submit"
+            variant="primary"
+            loading={saving}
+            disabled={!dirty}
+            icon={<Save className="size-4" aria-hidden />}
+          >
+            Save changes
+          </Button>
+          <Button
+            loading={testing}
+            disabled={!savedWebhookUrl || dirty}
+            onClick={() => void onTest()}
+            icon={<Send className="size-4" aria-hidden />}
+            title={
+              !savedWebhookUrl
+                ? 'Save a webhook URL first.'
+                : dirty
+                  ? 'Save your changes first.'
+                  : undefined
+            }
+          >
+            Send test
+          </Button>
+          {dirty ? (
+            <Button onClick={onDiscard} disabled={saving}>
+              Discard
+            </Button>
+          ) : (
+            <span className="flex items-center gap-1.5 text-xs text-slate-500">
+              <BellRing className="size-3.5" aria-hidden />
+              {savedWebhookUrl
+                ? form.notifyOn === 'off'
+                  ? 'URL saved — notifications are off'
+                  : 'Notifications are active'
+                : 'No webhook configured'}
+            </span>
+          )}
+        </div>
+      </form>
     </Card>
   )
 }
@@ -307,56 +471,81 @@ export function SettingsPage() {
   const loader = useCallback(() => getSettings(), [])
   const { data, loading, error, reload } = useAsync(loader)
 
-  const [form, setForm] = useState<Settings>({ serverName: '', concurrency: 2 })
-  const [submitting, setSubmitting] = useState(false)
+  const [form, setForm] = useState<Settings>(DEFAULT_SETTINGS)
+  const [submitting, setSubmitting] = useState<'server' | 'notifications' | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
+  const [notifyError, setNotifyError] = useState<string | null>(null)
 
   useEffect(() => {
     if (data) setForm(data)
   }, [data])
 
+  const patch = (next: Partial<Settings>) => setForm((current) => ({ ...current, ...next }))
+
   const dirty =
     data !== null && (data.serverName !== form.serverName || data.concurrency !== form.concurrency)
+  const notifyDirty =
+    data !== null && (data.webhookUrl !== form.webhookUrl || data.notifyOn !== form.notifyOn)
 
-  const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
+  /**
+   * Both cards write through the single PUT the contract exposes, so every
+   * save carries the complete settings object — never a partial that would
+   * blank out the other card's values.
+   */
+  const persist = async (which: 'server' | 'notifications') => {
     setFormError(null)
+    setNotifyError(null)
+    const fail = which === 'server' ? setFormError : setNotifyError
 
     const serverName = form.serverName.trim()
-    if (!serverName) {
-      setFormError('Give this server a display name.')
-      return
-    }
+    const webhookUrl = form.webhookUrl.trim()
+
+    if (!serverName) return fail('Give this server a display name.')
     if (
       !Number.isInteger(form.concurrency) ||
       form.concurrency < 1 ||
       form.concurrency > MAX_CONCURRENCY
     ) {
-      setFormError(`Concurrency must be a whole number between 1 and ${MAX_CONCURRENCY}.`)
-      return
+      return fail(`Concurrency must be a whole number between 1 and ${MAX_CONCURRENCY}.`)
+    }
+    if (webhookUrl && !/^https?:\/\//i.test(webhookUrl)) {
+      return fail('The webhook URL must start with http:// or https://.')
+    }
+    if (!webhookUrl && form.notifyOn !== 'off') {
+      return fail('Add a webhook URL, or set notifications to Off.')
     }
 
-    setSubmitting(true)
+    setSubmitting(which)
     try {
-      const saved = await putSettings({ serverName, concurrency: form.concurrency })
+      const saved = await putSettings({
+        serverName,
+        concurrency: form.concurrency,
+        webhookUrl,
+        notifyOn: form.notifyOn,
+      })
       setForm(saved)
       setServerName(saved.serverName)
-      toast.success('Settings saved.')
+      toast.success(which === 'server' ? 'Settings saved.' : 'Notification settings saved.')
       await reload()
     } catch (err) {
       const message = errorMessage(err)
-      setFormError(message)
+      fail(message)
       toast.error('Could not save settings', message)
     } finally {
-      setSubmitting(false)
+      setSubmitting(null)
     }
+  }
+
+  const onSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    void persist('server')
   }
 
   return (
     <>
       <PageHeader
         title="Settings"
-        description="Server identity and how many backup tasks may run at once."
+        description="Server identity, engine concurrency, and where run notifications go."
         actions={
           <Button
             icon={<RefreshCw className="size-4" aria-hidden />}
@@ -377,16 +566,14 @@ export function SettingsPage() {
       ) : (
         <Card className="max-w-2xl">
           <CardHeader title="Server" subtitle="Applies to this ProxBack installation" />
-          <form className="space-y-5 px-5 py-5" onSubmit={(event) => void onSubmit(event)} noValidate>
+          <form className="space-y-5 px-5 py-5" onSubmit={onSubmit} noValidate>
             <Field label="Server name" hint="Shown in the topbar and in notification subjects.">
               {({ id }) => (
                 <Input
                   id={id}
                   value={form.serverName}
                   placeholder="ProxBack"
-                  onChange={(event) =>
-                    setForm((current) => ({ ...current, serverName: event.target.value }))
-                  }
+                  onChange={(event) => patch({ serverName: event.target.value })}
                 />
               )}
             </Field>
@@ -402,13 +589,8 @@ export function SettingsPage() {
                   min={1}
                   max={MAX_CONCURRENCY}
                   value={String(form.concurrency)}
-                  className="w-32"
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      concurrency: Number(event.target.value),
-                    }))
-                  }
+                  className="w-32 font-mono tabular-nums"
+                  onChange={(event) => patch({ concurrency: Number(event.target.value) })}
                 />
               )}
             </Field>
@@ -429,14 +611,17 @@ export function SettingsPage() {
               <Button
                 type="submit"
                 variant="primary"
-                loading={submitting}
+                loading={submitting === 'server'}
                 disabled={!dirty}
                 icon={<Save className="size-4" aria-hidden />}
               >
                 Save changes
               </Button>
               {dirty ? (
-                <Button onClick={() => data && setForm(data)} disabled={submitting}>
+                <Button
+                  onClick={() => data && patch({ serverName: data.serverName, concurrency: data.concurrency })}
+                  disabled={submitting !== null}
+                >
                   Discard
                 </Button>
               ) : (
@@ -451,6 +636,20 @@ export function SettingsPage() {
       )}
 
       <SoftwareUpdateCard />
+
+      {data ? (
+        <NotificationsCard
+          form={form}
+          patch={patch}
+          dirty={notifyDirty}
+          savedWebhookUrl={data.webhookUrl}
+          saving={submitting === 'notifications'}
+          error={notifyError}
+          onSave={() => void persist('notifications')}
+          onDiscard={() => patch({ webhookUrl: data.webhookUrl, notifyOn: data.notifyOn })}
+        />
+      ) : null}
+
       <ChangePasswordCard />
     </>
   )

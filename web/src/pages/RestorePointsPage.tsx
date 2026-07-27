@@ -18,6 +18,7 @@ import {
   listBackups,
   listHosts,
   listVMs,
+  verifyBackup,
 } from '../api'
 import type { Agent, Backup, CachedVM, Host, ID, SourceKind } from '../api'
 import { Modal } from '../components/Modal'
@@ -33,6 +34,7 @@ import {
   IconButton,
   Input,
   LoadingBlock,
+  Num,
   PageHeader,
   SectionNote,
   Select,
@@ -41,7 +43,7 @@ import {
 } from '../components/ui'
 import { cn } from '../lib/cn'
 import { useAsync } from '../lib/useAsync'
-import { formatBytes, formatDateTime, formatRelative } from '../lib/format'
+import { formatBytes, formatCount, formatDateTime, formatRelative } from '../lib/format'
 
 interface RestoreData {
   backups: Backup[]
@@ -134,10 +136,14 @@ function RestoreWizard({
   const [vmid, setVmid] = useState('')
   const [agentId, setAgentId] = useState<string>('')
   const [destPath, setDestPath] = useState('')
+  const [storage, setStorage] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const isVM = backup?.sourceKind === 'vm'
+  // vzdump-based points (one "vma" stream, restored through the node helper)
+  // can be pointed at a specific Proxmox storage.
+  const isVma = isVM && backup !== null && backup.disks.length === 1 && backup.disks[0].name === 'vma'
 
   // Prefill from the cached inventory: the VM this restore point came from.
   useEffect(() => {
@@ -156,6 +162,7 @@ function RestoreWizard({
       setAgentId(String(match?.id ?? agents[0]?.id ?? ''))
       setDestPath('')
     }
+    setStorage('')
   }, [backup, hosts, agents, vms])
 
   const onSubmit = async () => {
@@ -178,7 +185,15 @@ function RestoreWizard({
     try {
       const result = await createRestore(
         isVM
-          ? { backupId: backup.id, vm: { hostId, node: node.trim(), vmid: Number(vmid) } }
+          ? {
+              backupId: backup.id,
+              vm: {
+                hostId,
+                node: node.trim(),
+                vmid: Number(vmid),
+                ...(isVma && storage.trim() ? { storage: storage.trim() } : {}),
+              },
+            }
           : { backupId: backup.id, agent: { agentId, destPath: destPath.trim() } },
       )
       toast.success(
@@ -229,11 +244,15 @@ function RestoreWizard({
           <dl className="grid grid-cols-2 gap-4 rounded-lg border border-slate-800 bg-slate-950/40 px-4 py-3">
             <div>
               <dt className="text-[11px] tracking-wide text-slate-500 uppercase">Size</dt>
-              <dd className="mt-0.5 text-sm text-slate-200">{formatBytes(backup.sizeBytes)}</dd>
+              <dd className="mt-0.5 font-mono text-sm tabular-nums text-slate-200">
+                {formatBytes(backup.sizeBytes)}
+              </dd>
             </div>
             <div>
               <dt className="text-[11px] tracking-wide text-slate-500 uppercase">Created</dt>
-              <dd className="mt-0.5 text-sm text-slate-200">{formatRelative(backup.createdAt)}</dd>
+              <dd className="mt-0.5 font-mono text-sm tabular-nums text-slate-200">
+                {formatRelative(backup.createdAt)}
+              </dd>
             </div>
           </dl>
 
@@ -279,6 +298,22 @@ function RestoreWizard({
                   )}
                 </Field>
               </div>
+
+              {isVma ? (
+                <Field
+                  label="Target storage (optional)"
+                  hint="Proxmox storage for the restored disks, e.g. local-lvm. Empty keeps the storage recorded in the backup."
+                >
+                  {({ id }) => (
+                    <Input
+                      id={id}
+                      value={storage}
+                      placeholder="local-lvm"
+                      onChange={(event) => setStorage(event.target.value)}
+                    />
+                  )}
+                </Field>
+              ) : null}
 
               <SectionNote>
                 Every chunk is verified against its SHA-256 hash while the disk image is streamed
@@ -349,7 +384,27 @@ function BackupRow({
 }) {
   const toast = useToast()
   const confirm = useConfirm()
+  const navigate = useNavigate()
   const [deleting, setDeleting] = useState(false)
+  const [verifying, setVerifying] = useState(false)
+
+  const onVerify = async () => {
+    setVerifying(true)
+    try {
+      await verifyBackup(backup.id)
+      toast.success(
+        'Verification started.',
+        `Every chunk of the ${backup.kind} point from ${formatDateTime(
+          backup.createdAt,
+        )} is re-downloaded and hash-checked.`,
+        { label: 'View in Monitor', onClick: () => navigate('/monitor') },
+      )
+    } catch (err) {
+      toast.error('Could not start verification', errorMessage(err))
+    } finally {
+      setVerifying(false)
+    }
+  }
 
   const onDelete = async () => {
     const ok = await confirm({
@@ -407,12 +462,20 @@ function BackupRow({
             />
           </div>
           <p className="mt-0.5 truncate text-xs text-slate-500">
-            {formatBytes(backup.sizeBytes)} logical · {formatBytes(backup.uploadedBytes)} uploaded
-            {backup.disks.length > 0
-              ? ` · ${backup.disks.length} ${backup.disks.length === 1 ? 'disk' : 'disks'}: ${backup.disks
-                  .map((disk) => `${disk.name} ${formatBytes(disk.sizeBytes)}`)
-                  .join(', ')}`
-              : ''}
+            <Num>{formatBytes(backup.sizeBytes)}</Num> logical ·{' '}
+            <Num>{formatBytes(backup.uploadedBytes)}</Num> uploaded
+            {backup.disks.length > 0 ? (
+              <>
+                {' · '}
+                <Num>{backup.disks.length}</Num> {backup.disks.length === 1 ? 'disk' : 'disks'}:{' '}
+                {backup.disks.map((disk, index) => (
+                  <span key={disk.name}>
+                    {index > 0 ? ', ' : ''}
+                    {disk.name} <Num>{formatBytes(disk.sizeBytes)}</Num>
+                  </span>
+                ))}
+              </>
+            ) : null}
           </p>
         </div>
       </div>
@@ -427,7 +490,15 @@ function BackupRow({
           Restore
         </Button>
         <IconButton
-          variant="danger"
+          aria-label={`Verify the restore point from ${formatDateTime(backup.createdAt)}`}
+          title="Verify — re-download every chunk and re-check its hash"
+          loading={verifying}
+          onClick={() => void onVerify()}
+        >
+          <ShieldCheck className="size-4" aria-hidden />
+        </IconButton>
+        <IconButton
+          variant="dangerQuiet"
           aria-label="Delete restore point"
           title="Delete restore point"
           loading={deleting}
@@ -536,7 +607,7 @@ export function RestorePointsPage() {
                       type="button"
                       onClick={() => onSelect(group)}
                       className={cn(
-                        'flex w-full items-start gap-3 px-4 py-3 text-left transition',
+                        'flex w-full items-start gap-3 px-4 py-3 text-left transition-colors duration-150',
                         active ? 'bg-accent-500/10' : 'hover:bg-slate-800/40',
                       )}
                     >
@@ -564,8 +635,10 @@ export function RestorePointsPage() {
                           {group.sourceName}
                         </span>
                         <span className="mt-0.5 block truncate text-xs text-slate-500">
-                          {group.count} {group.count === 1 ? 'point' : 'points'} ·{' '}
-                          {formatBytes(group.totalBytes)} · {formatRelative(group.latest)}
+                          <Num>{formatCount(group.count)}</Num>{' '}
+                          {group.count === 1 ? 'point' : 'points'} ·{' '}
+                          <Num>{formatBytes(group.totalBytes)}</Num> ·{' '}
+                          <Num>{formatRelative(group.latest)}</Num>
                         </span>
                       </span>
                     </button>
@@ -577,16 +650,19 @@ export function RestorePointsPage() {
 
           <Card>
             {!selected ? (
-              <div className="flex flex-col items-center justify-center px-6 py-20 text-center">
-                <div className="mb-4 flex size-12 items-center justify-center rounded-xl border border-slate-800 bg-slate-900 text-accent-400">
-                  <ArrowLeft className="size-5" aria-hidden />
-                </div>
-                <h3 className="text-base font-semibold text-slate-100">Pick a source</h3>
-                <p className="mt-1.5 max-w-sm text-sm text-slate-400">
-                  Choose a virtual machine or agent on the left to see its restore-point chain,
-                  restore it, or prune old points.
-                </p>
-              </div>
+              <EmptyState
+                className="border-0 bg-transparent"
+                icon={<ArrowLeft className="size-5" aria-hidden />}
+                title="Pick a source"
+                description="Choose a virtual machine or agent on the left to see its restore-point chain, verify a point, restore it, or prune old ones."
+                action={
+                  groups[0] ? (
+                    <Button onClick={() => onSelect(groups[0])}>
+                      Open {groups[0].sourceName}
+                    </Button>
+                  ) : undefined
+                }
+              />
             ) : (
               <>
                 <CardHeader
@@ -599,10 +675,18 @@ export function RestorePointsPage() {
                   actions={
                     <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
                       <Database className="size-3.5" aria-hidden />
-                      {formatBytes(selected.totalBytes)} total
+                      <Num>{formatBytes(selected.totalBytes)}</Num> total
                     </span>
                   }
                 />
+                <p className="flex items-start gap-2 border-b border-slate-800 px-5 py-2.5 text-xs leading-relaxed text-slate-500">
+                  <ShieldCheck className="mt-0.5 size-3.5 shrink-0 text-slate-600" aria-hidden />
+                  <span>
+                    Verified means every chunk was re-downloaded from the target and its SHA-256
+                    re-checked — nothing is written anywhere. Verification runs show up on the
+                    Monitor page as “Verify {selected.sourceName}”.
+                  </span>
+                </p>
                 {detailLoading && !detail ? (
                   <LoadingBlock label="Loading restore points…" />
                 ) : detailError ? (
@@ -613,11 +697,13 @@ export function RestorePointsPage() {
                     />
                   </div>
                 ) : !detail || detail.length === 0 ? (
-                  <div className="px-5 py-16 text-center">
-                    <p className="text-sm text-slate-400">
-                      No restore points remain for this source.
-                    </p>
-                  </div>
+                  <EmptyState
+                    className="border-0 bg-transparent"
+                    icon={<History className="size-5" aria-hidden />}
+                    title="No restore points remain"
+                    description="Every point for this source has been pruned or deleted. The next successful run of its job creates a fresh full backup."
+                    action={<Button onClick={() => void loadDetail(selected)}>Check again</Button>}
+                  />
                 ) : (
                   <div className="divide-y divide-slate-800">
                     {detail.map((backup) => (

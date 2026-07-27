@@ -161,7 +161,7 @@ export function Layout() {
           <button
             type="button"
             onClick={() => setDrawerOpen(true)}
-            className="-ml-1 rounded-lg p-2 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 lg:hidden"
+            className="-ml-1 rounded-lg p-2 text-slate-400 transition-colors duration-150 hover:bg-slate-800 hover:text-slate-100 lg:hidden"
             aria-label="Open navigation"
           >
             {drawerOpen ? <X className="size-[18px]" aria-hidden /> : <Menu className="size-[18px]" aria-hidden />}
@@ -194,7 +194,7 @@ export function Layout() {
                 </span>
                 <NavLink
                   to="/settings"
-                  className="rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-200 transition hover:bg-amber-500/15"
+                  className="rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-200 transition-colors duration-150 hover:bg-amber-500/15"
                 >
                   Change password
                 </NavLink>

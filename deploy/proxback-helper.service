@@ -1,0 +1,15 @@
+[Unit]
+Description=ProxBack node helper (vzdump/qmrestore streaming for agentless VM backup)
+Documentation=https://github.com/tlaskar-git/ProxBack
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Must run as root on the Proxmox node: it invokes vzdump and qmrestore.
+ExecStart=/usr/local/bin/proxback-helper --config /etc/proxback-helper
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

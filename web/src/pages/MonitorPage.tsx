@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Activity, Ban, Clock, RefreshCw, TriangleAlert } from 'lucide-react'
+import { Activity, Ban, RefreshCw } from 'lucide-react'
 import { cancelRun, errorMessage, listJobs, listRuns } from '../api'
 import type { Job, JobRun } from '../api'
 import { useConfirm } from '../components/Confirm'
@@ -10,6 +10,8 @@ import {
   Card,
   EmptyState,
   ErrorBlock,
+  IconButton,
+  Num,
   PageHeader,
   ProgressBar,
   RunStatusPill,
@@ -33,7 +35,12 @@ interface MonitorData {
 
 const RUN_LIMIT = 100
 
-function RunCard({ run, onChanged }: { run: JobRun; onChanged: () => void }) {
+/**
+ * One run per table row. The second line inside the Job cell has a fixed
+ * height so a row never changes size as polling flips it between progress
+ * bar, current step, and error text.
+ */
+function RunRow({ run, onChanged }: { run: JobRun; onChanged: () => void }) {
   const toast = useToast()
   const confirm = useConfirm()
   const [canceling, setCanceling] = useState(false)
@@ -66,83 +73,103 @@ function RunCard({ run, onChanged }: { run: JobRun; onChanged: () => void }) {
   }
 
   return (
-    <div className="px-5 py-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <p className="truncate text-sm font-semibold text-slate-100">{run.jobName}</p>
-            <RunStatusPill status={run.status} />
-          </div>
-          <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-            <span className="inline-flex items-center gap-1.5">
-              <Clock className="size-3.5 text-slate-600" aria-hidden />
-              Started {formatDateTime(run.startedAt)}
+    <tr className="align-top transition-colors duration-150 hover:bg-slate-800/30">
+      <td className="max-w-[20rem] px-5 py-3">
+        <p className="truncate text-sm font-medium text-slate-100">{run.jobName}</p>
+        <div className="mt-1.5 flex h-4 items-center gap-2">
+          {running ? (
+            <>
+              <ProgressBar value={run.progressPct} active className="max-w-36" />
+              <Num className="shrink-0 text-[11px] font-medium text-accent-300">
+                {clampPct(run.progressPct).toFixed(0)}%
+              </Num>
+              <span className="truncate text-[11px] text-slate-500">
+                {run.currentStep || 'Working…'}
+              </span>
+            </>
+          ) : run.status === 'failed' && run.error ? (
+            <span className="truncate text-[11px] text-red-400/90" title={run.error}>
+              {run.error}
             </span>
-            <span>·</span>
-            <span>{formatDuration(run.startedAt, run.finishedAt)}</span>
-            {run.finishedAt ? (
-              <>
-                <span>·</span>
-                <span>Finished {formatRelative(run.finishedAt)}</span>
-              </>
-            ) : null}
-          </p>
+          ) : run.currentStep ? (
+            <span className="truncate text-[11px] text-slate-500">{run.currentStep}</span>
+          ) : null}
         </div>
-
+      </td>
+      <td className="px-5 py-3 whitespace-nowrap">
+        <RunStatusPill status={run.status} />
+      </td>
+      <td className="px-5 py-3 whitespace-nowrap" title={formatDateTime(run.startedAt)}>
+        <Num className="text-sm text-slate-400">{formatRelative(run.startedAt)}</Num>
+      </td>
+      <td className="px-5 py-3 whitespace-nowrap">
+        <Num className="text-sm text-slate-400">
+          {formatDuration(run.startedAt, run.finishedAt)}
+        </Num>
+      </td>
+      <td className="px-5 py-3 text-right whitespace-nowrap">
+        <Num className="text-sm text-slate-300">{formatBytes(run.bytesProcessed)}</Num>
+      </td>
+      <td className="px-5 py-3 text-right whitespace-nowrap">
+        <Num className="text-sm text-slate-300">{formatBytes(run.bytesUploaded)}</Num>
+      </td>
+      <td className="px-5 py-3 text-right whitespace-nowrap">
+        <Num className="text-sm text-emerald-400">{formatRatio(run.dedupRatio)}</Num>
+      </td>
+      <td className="w-14 px-5 py-3 text-right">
         {running ? (
-          <Button
-            size="sm"
-            variant="danger"
+          <IconButton
+            aria-label={`Cancel the run of ${run.jobName}`}
+            title="Cancel this run"
             loading={canceling}
-            icon={<Ban className="size-3.5" aria-hidden />}
             onClick={() => void onCancel()}
           >
-            Cancel
-          </Button>
+            <Ban className="size-4" aria-hidden />
+          </IconButton>
         ) : null}
-      </div>
+      </td>
+    </tr>
+  )
+}
 
-      {running ? (
-        <div className="mt-3.5">
-          <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
-            <span className="truncate text-slate-300">{run.currentStep || 'Working…'}</span>
-            <span className="shrink-0 font-medium text-accent-300">
-              {clampPct(run.progressPct).toFixed(0)}%
-            </span>
-          </div>
-          <ProgressBar value={run.progressPct} active />
-        </div>
-      ) : run.currentStep ? (
-        <p className="mt-3 text-xs text-slate-500">{run.currentStep}</p>
-      ) : null}
-
-      <dl className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <div>
-          <dt className="text-[11px] tracking-wide text-slate-500 uppercase">Processed</dt>
-          <dd className="mt-0.5 text-sm text-slate-200">{formatBytes(run.bytesProcessed)}</dd>
-        </div>
-        <div>
-          <dt className="text-[11px] tracking-wide text-slate-500 uppercase">Uploaded</dt>
-          <dd className="mt-0.5 text-sm text-slate-200">{formatBytes(run.bytesUploaded)}</dd>
-        </div>
-        <div>
-          <dt className="text-[11px] tracking-wide text-slate-500 uppercase">Dedup ratio</dt>
-          <dd className="mt-0.5 text-sm text-emerald-400">{formatRatio(run.dedupRatio)}</dd>
-        </div>
-        <div>
-          <dt className="text-[11px] tracking-wide text-slate-500 uppercase">Saved</dt>
-          <dd className="mt-0.5 text-sm text-slate-200">
-            {formatBytes(Math.max(0, run.bytesProcessed - run.bytesUploaded))}
-          </dd>
-        </div>
-      </dl>
-
-      {run.status === 'failed' && run.error ? (
-        <div className="mt-4 flex gap-2.5 rounded-lg border border-red-500/30 bg-red-500/5 px-3.5 py-2.5">
-          <TriangleAlert className="mt-0.5 size-4 shrink-0 text-red-400" aria-hidden />
-          <p className="min-w-0 text-xs leading-relaxed break-words text-red-300">{run.error}</p>
-        </div>
-      ) : null}
+function RunTable({ runs, onChanged }: { runs: JobRun[]; onChanged: () => void }) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[58rem] text-sm">
+        <thead>
+          <tr className="border-b border-slate-800 text-left text-[11px] tracking-wide text-slate-500 uppercase">
+            <th scope="col" className="px-5 py-2.5 font-medium">
+              Job
+            </th>
+            <th scope="col" className="px-5 py-2.5 font-medium">
+              Status
+            </th>
+            <th scope="col" className="px-5 py-2.5 font-medium">
+              Started
+            </th>
+            <th scope="col" className="px-5 py-2.5 font-medium">
+              Duration
+            </th>
+            <th scope="col" className="px-5 py-2.5 text-right font-medium">
+              Processed
+            </th>
+            <th scope="col" className="px-5 py-2.5 text-right font-medium">
+              Uploaded
+            </th>
+            <th scope="col" className="px-5 py-2.5 text-right font-medium">
+              Dedup
+            </th>
+            <th scope="col" className="w-14 px-5 py-2.5">
+              <span className="sr-only">Actions</span>
+            </th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-800/70">
+          {runs.map((run) => (
+            <RunRow key={String(run.id)} run={run} onChanged={onChanged} />
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
@@ -179,7 +206,7 @@ export function MonitorPage() {
     <>
       <PageHeader
         title="Monitor"
-        description="Every backup and restore run, newest first. Running jobs update live."
+        description="Every backup, restore, and verification run, newest first. Running rows update live."
         actions={
           <>
             <Select
@@ -215,7 +242,7 @@ export function MonitorPage() {
 
       {loading && !data ? (
         <Card>
-          <SkeletonRows count={4} />
+          <SkeletonRows count={5} />
         </Card>
       ) : error && !data ? (
         <ErrorBlock message={error} onRetry={() => void reload()} />
@@ -226,7 +253,7 @@ export function MonitorPage() {
           description={
             activeJob
               ? 'This job has not run. Start it from the Backup Jobs page, or wait for its schedule.'
-              : 'Runs appear here as soon as a backup job starts — manually or on its schedule. Restores show up too, named “Restore …”.'
+              : 'Runs appear here as soon as a backup job starts — manually or on its schedule. Restores and verifications show up too, named “Restore …” and “Verify …”.'
           }
           action={
             jobIdParam === 'all' ? undefined : (
@@ -235,10 +262,8 @@ export function MonitorPage() {
           }
         />
       ) : (
-        <Card className="divide-y divide-slate-800">
-          {runs.map((run) => (
-            <RunCard key={String(run.id)} run={run} onChanged={() => void refresh()} />
-          ))}
+        <Card>
+          <RunTable runs={runs} onChanged={() => void refresh()} />
         </Card>
       )}
     </>

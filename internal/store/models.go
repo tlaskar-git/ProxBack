@@ -5,8 +5,44 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
+
+// TagSeparator joins tags in the persisted `tags` column.
+const TagSeparator = ";"
+
+// encodeTags renders a tag slice for storage.
+func encodeTags(tags []string) string { return strings.Join(NormalizeTags(tags), TagSeparator) }
+
+// decodeTags parses a persisted tag column back into a slice. It accepts both
+// separators Proxmox tolerates so databases written by any version load.
+func decodeTags(raw string) []string {
+	return NormalizeTags(strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ';' || r == ','
+	}))
+}
+
+// NormalizeTags lower-cases, trims, de-duplicates and sorts tags. The result is
+// never nil so it serialises as an empty JSON array rather than null.
+func NormalizeTags(tags []string) []string {
+	out := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, t := range tags {
+		tag := strings.ToLower(strings.TrimSpace(t))
+		if tag == "" {
+			continue
+		}
+		if _, dup := seen[tag]; dup {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // NewID returns a random 32 hex character identifier.
 func NewID() string {
@@ -50,15 +86,31 @@ type PVEHost struct {
 
 // VM is a cached or live Proxmox guest.
 type VM struct {
-	VMID     int    `json:"vmid"`
-	Name     string `json:"name"`
-	Node     string `json:"node"`
-	Status   string `json:"status"`
-	MaxDisk  int64  `json:"maxdisk"`
-	MaxMem   int64  `json:"maxmem"`
-	Uptime   int64  `json:"uptime"`
-	HostID   string `json:"hostId,omitempty"`
-	HostName string `json:"hostName,omitempty"`
+	VMID     int      `json:"vmid"`
+	Name     string   `json:"name"`
+	Node     string   `json:"node"`
+	Status   string   `json:"status"`
+	MaxDisk  int64    `json:"maxdisk"`
+	MaxMem   int64    `json:"maxmem"`
+	Uptime   int64    `json:"uptime"`
+	Tags     []string `json:"tags"`
+	HostID   string   `json:"hostId,omitempty"`
+	HostName string   `json:"hostName,omitempty"`
+}
+
+// HasTag reports whether the guest carries tag. Comparison is case insensitive
+// because both sides are normalised to lower case on the way in.
+func (v VM) HasTag(tag string) bool {
+	want := strings.ToLower(strings.TrimSpace(tag))
+	if want == "" {
+		return false
+	}
+	for _, t := range v.Tags {
+		if t == want {
+			return true
+		}
+	}
+	return false
 }
 
 // S3Target is a backup destination. SecretKey is only populated by accessors that
@@ -88,12 +140,32 @@ type Agent struct {
 	RegisteredAt time.Time  `json:"registeredAt"`
 }
 
-// EnrollToken is a single-use agent enrollment token.
+// EnrollToken is a single-use enrollment token. Purpose is "agent" or "helper".
 type EnrollToken struct {
 	Token     string     `json:"token"`
+	Purpose   string     `json:"-"`
 	CreatedAt time.Time  `json:"-"`
 	ExpiresAt time.Time  `json:"expiresAt"`
 	UsedAt    *time.Time `json:"-"`
+}
+
+// DefaultHelperPort is the port a node helper listens on unless told otherwise.
+const DefaultHelperPort = 8007
+
+// NodeHelper is an enrolled ProxBack node helper: the root daemon on a Proxmox
+// node that wraps vzdump/qmrestore for agentless VM image backup. AccessSecret
+// is the credential the server presents to the helper and is only populated by
+// accessors that decrypt it; it is never serialised.
+type NodeHelper struct {
+	ID           string     `json:"id"`
+	Node         string     `json:"node"`
+	Address      string     `json:"address"`
+	Port         int        `json:"port"`
+	Version      string     `json:"version"`
+	AccessSecret string     `json:"-"`
+	APIKeyHash   string     `json:"-"`
+	LastSeen     *time.Time `json:"lastSeen"`
+	RegisteredAt time.Time  `json:"registeredAt"`
 }
 
 // JobSource describes one backup source. VM jobs use HostID/VMID/Name; agent jobs
@@ -154,7 +226,11 @@ type Job struct {
 	Retention int        `json:"retention"`
 	Enabled   bool       `json:"enabled"`
 	Sources   JobSources `json:"sources"`
-	CreatedAt time.Time  `json:"-"`
+	// TagFilter makes a vm job's membership dynamic: at run start it resolves to
+	// every cached guest carrying the tag, and Sources may then be empty. Empty
+	// means the job uses its static Sources.
+	TagFilter string    `json:"tagFilter"`
+	CreatedAt time.Time `json:"-"`
 }
 
 // Run statuses.
@@ -169,6 +245,7 @@ const (
 const (
 	RunKindBackup  = "backup"
 	RunKindRestore = "restore"
+	RunKindVerify  = "verify"
 )
 
 // JobRun is one execution of a job (or a restore operation).
@@ -223,8 +300,29 @@ type Backup struct {
 	Disks         []Disk    `json:"disks"`
 }
 
+// Notification policies for the run webhook.
+const (
+	NotifyOff      = "off"
+	NotifyFailures = "failures"
+	NotifyAll      = "all"
+)
+
+// ValidNotifyOn reports whether v is one of the accepted notifyOn values.
+func ValidNotifyOn(v string) bool {
+	switch v {
+	case NotifyOff, NotifyFailures, NotifyAll:
+		return true
+	default:
+		return false
+	}
+}
+
 // Settings holds global server settings.
 type Settings struct {
 	ServerName  string `json:"serverName"`
 	Concurrency int    `json:"concurrency"`
+	// WebhookURL receives run notifications; empty disables them.
+	WebhookURL string `json:"webhookUrl"`
+	// NotifyOn is "off", "failures" or "all".
+	NotifyOn string `json:"notifyOn"`
 }

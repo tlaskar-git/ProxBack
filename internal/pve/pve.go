@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -162,13 +163,58 @@ func (c *Client) Nodes(ctx context.Context) ([]Node, error) {
 
 // VM is a QEMU guest as reported by the API.
 type VM struct {
-	VMID    int    `json:"vmid"`
-	Name    string `json:"name"`
-	Status  string `json:"status"`
-	MaxDisk int64  `json:"maxdisk"`
-	MaxMem  int64  `json:"maxmem"`
-	Uptime  int64  `json:"uptime"`
-	Node    string `json:"-"`
+	VMID    int      `json:"vmid"`
+	Name    string   `json:"name"`
+	Status  string   `json:"status"`
+	MaxDisk int64    `json:"maxdisk"`
+	MaxMem  int64    `json:"maxmem"`
+	Uptime  int64    `json:"uptime"`
+	Node    string   `json:"-"`
+	Tags    []string `json:"tags"`
+}
+
+// TagSeparators are the characters Proxmox accepts between guest tags. The API
+// reports them semicolon separated; commas appear in some hand-written configs
+// and in ProxBack's own persisted form.
+const TagSeparators = ";,"
+
+// ParseTags normalises Proxmox's `tags` field into a sorted, lower-cased,
+// duplicate-free slice. The result is never nil so it serialises as an empty
+// JSON array rather than null.
+func ParseTags(raw string) []string {
+	out := []string{}
+	seen := map[string]struct{}{}
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return strings.ContainsRune(TagSeparators, r)
+	}) {
+		tag := strings.ToLower(strings.TrimSpace(part))
+		if tag == "" {
+			continue
+		}
+		if _, dup := seen[tag]; dup {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// UnmarshalJSON decodes a guest listing entry. Proxmox reports tags as a single
+// semicolon separated string, which is expanded into VM.Tags.
+func (v *VM) UnmarshalJSON(b []byte) error {
+	type plain VM
+	var aux struct {
+		plain
+		Tags string `json:"tags"`
+	}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return fmt.Errorf("pve: decode guest: %w", err)
+	}
+	*v = VM(aux.plain)
+	v.Tags = ParseTags(aux.Tags)
+	return nil
 }
 
 // VMs lists QEMU guests on a node.

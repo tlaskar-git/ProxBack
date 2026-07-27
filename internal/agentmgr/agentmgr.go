@@ -93,7 +93,7 @@ func (m *Manager) CreateEnrollToken(ctx context.Context) (*store.EnrollToken, er
 	if err != nil {
 		return nil, err
 	}
-	return m.st.CreateEnrollToken(ctx, tok, auth.EnrollTokenTTL)
+	return m.st.CreateEnrollToken(ctx, tok, store.EnrollPurposeAgent, auth.EnrollTokenTTL)
 }
 
 // RegisterRequest is the body of POST /api/agents/register.
@@ -116,7 +116,7 @@ func (m *Manager) Register(ctx context.Context, req RegisterRequest) (*RegisterR
 	if req.Token == "" {
 		return nil, ErrBadToken
 	}
-	if err := m.st.ConsumeEnrollToken(ctx, req.Token); err != nil {
+	if err := m.st.ConsumeEnrollToken(ctx, req.Token, store.EnrollPurposeAgent); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, ErrBadToken
 		}

@@ -194,6 +194,14 @@ CREATE TABLE IF NOT EXISTS job_runs (
 CREATE INDEX IF NOT EXISTS idx_runs_job ON job_runs(job_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON job_runs(started_at DESC);
 
+CREATE TABLE IF NOT EXISTS run_log (
+	id     INTEGER PRIMARY KEY AUTOINCREMENT,
+	run_id TEXT NOT NULL,
+	ts     TEXT NOT NULL,
+	line   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_log_run ON run_log(run_id, id);
+
 CREATE TABLE IF NOT EXISTS backups (
 	id             TEXT PRIMARY KEY,
 	job_id         TEXT NOT NULL DEFAULT '',

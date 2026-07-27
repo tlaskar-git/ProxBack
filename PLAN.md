@@ -95,6 +95,22 @@ answers 404/501, the run fails with an actionable "install the node helper" erro
   - `GET  /healthz` → `{"node","version"}` (unauthenticated)
   - `GET  /export/{vmid}` → VMA stream (vzdump --stdout)
   - `POST /import/{vmid}?storage=<s>` ← VMA stream (qmrestore from stdin)
+- Automated deployment (v0.3.1): `POST /api/helpers/deploy` (session auth) connects to the
+  node over SSH from the ProxBack server, uploads the staged helper binary, and runs the
+  installer — no shell access needed by the operator. Body:
+  `{"node","address","port":22,"username":"root","password","serverUrl","helperPort":8007,
+  "hostKeyFingerprint":""}`.
+  - Trust-on-first-use: when `hostKeyFingerprint` is empty or does not match, the server
+    does NOT run anything and answers `409 {"error":...,"fingerprint":"SHA256:..."}`; the
+    UI shows the fingerprint for confirmation and retries with it set. A matching
+    fingerprint proceeds.
+  - On success: `{"ok":true,"log":["...step lines..."]}` — the helper registers itself
+    during `--install` (token minted server-side, passed on the remote command line only).
+  - The password is used for this one connection, never persisted, never logged. Binary
+    source is `<data>/downloads/proxback-helper-linux-amd64` (400-class error with a clear
+    message when it is not staged).
+  - `serverUrl` is supplied by the UI (`window.location.origin`) so the helper enrolls
+    against the address the operator actually uses.
 - Server REST additions (session auth unless noted):
   - `POST /api/helpers/enroll-token` → `{"token","expiresAt"}`
   - `GET  /api/helpers` → `[{"id","node","address","port","version","status":"online"|
@@ -196,6 +212,15 @@ Jobs
   "progressPct","currentStep"}`
 - `GET  /api/runs/{id}` → JobRun
 - `POST /api/runs/{id}/cancel`
+- Run history detail & cleanup (v0.3.1):
+  - `GET /api/runs/{id}/log` → `{"lines":[{"ts":RFC3339,"line":string}]}` — persisted
+    per-run activity log (run started, each step transition, per-source completions with
+    byte counts, warnings, the final error/summary), capped at 500 lines per run, deleted
+    with the run.
+  - `DELETE /api/runs/{id}` — remove a finished run from history (409 while running).
+    Deleting a run never touches restore points.
+  - `POST /api/runs/clear` `{"scope":"finished"|"failed","jobId"?}` → `{"deleted":N}` —
+    bulk-remove terminal runs (finished = success+failed+canceled), optionally for one job.
 
 Restore points & restore
 - `GET  /api/backups?sourceKind=&sourceId=&targetId=` → `[{"id","jobId","sourceKind",

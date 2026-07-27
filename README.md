@@ -100,14 +100,18 @@ remind you until you do. Changing the password also revokes every other session.
 2. In ProxBack: **Proxmox Hosts → Add Host** — base URL `https://your-host:8006`, the
    token id and secret, and enable **insecure TLS** if the host still uses its default
    self-signed certificate.
-3. **Install the node helper on each Proxmox node** (required for agentless VM image
-   backup — real Proxmox has no disk-export API). In ProxBack, open the host's card →
-   "Deploy node helper" → generate a token and paste the one-line install command into a
-   root shell on each PVE node. The helper is a small systemd service that streams
-   backups through Proxmox's own `vzdump` (snapshot-consistent, every storage type,
-   qemu-guest-agent freeze) and restores through `qmrestore`. Without a helper on a VM's
-   node, backup runs for that VM fail with an "install the node helper" error; file-level
-   agent backups work regardless.
+3. **Deploy the node helper to each Proxmox node** (required for agentless VM image
+   backup — real Proxmox has no disk-export API). In ProxBack: **Proxmox Hosts → Node
+   helpers → Deploy helper** — pick the node, enter its SSH address and root password, and
+   ProxBack installs and enrols the helper itself. The first attempt shows the node's SSH
+   host-key fingerprint for confirmation before anything runs; the password is used for
+   that one connection and never stored. (A manual one-line install is still available
+   behind "prefer to install manually" for nodes the server cannot SSH to.)
+
+   The helper is a small systemd service that streams backups through Proxmox's own
+   `vzdump` (snapshot-consistent, every storage type, qemu-guest-agent freeze) and restores
+   through `qmrestore`. Without a helper on a VM's node, backup runs for that VM fail with
+   an actionable error; file-level agent backups work regardless.
 
 ### 5. Add a storage target
 
@@ -131,6 +135,10 @@ loudly before your first backup, not during it.
   original VMID or side by side into a free VMID; every chunk is hash-verified during the
   stream. The **Verify** button health-checks a point on demand (full chunk re-download +
   hash check) — the result appears in Monitor like any other run.
+- **Monitor** lists every run; click one to open its detail view — live metrics, the full
+  error text, and a timestamped activity log of exactly what happened (which VM, which
+  path, bytes, dedup, retention pruning). Finished runs can be deleted individually or
+  cleared in bulk; restore points are never affected.
 - **Settings → Notifications** — set a webhook URL and choose failures-only or all runs;
   every finished backup/restore/verify POSTs a JSON summary there.
 - **Agents** — generate a single-use enrollment token and copy the one-line install

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -267,6 +268,64 @@ func (s *Store) RunCountsSince(ctx context.Context, since time.Time) (map[string
 		out[status] = n
 	}
 	return out, rows.Err()
+}
+
+// DeleteJobRun removes one run from the history together with its activity log.
+// Restore points and chunk data are untouched: a run row is history, not data.
+func (s *Store) DeleteJobRun(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM job_runs WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete job run: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return s.DeleteRunLog(ctx, id)
+}
+
+// DeleteJobRunsByStatus bulk-removes terminal runs (and their activity logs) in
+// the given statuses, optionally restricted to one job. An empty jobID clears
+// runs of every job. Runs still in progress are never deleted, whatever the
+// caller asks for. It returns the number of runs removed.
+func (s *Store) DeleteJobRunsByStatus(ctx context.Context, statuses []string, jobID string) (int, error) {
+	wanted := make([]any, 0, len(statuses))
+	for _, st := range statuses {
+		if st == "" || st == RunRunning {
+			continue
+		}
+		wanted = append(wanted, st)
+	}
+	if len(wanted) == 0 {
+		return 0, nil
+	}
+	where := ` WHERE status IN (` + placeholders(len(wanted)) + `) AND status <> ?`
+	args := append(append([]any{}, wanted...), RunRunning)
+	if jobID != "" {
+		where += ` AND job_id = ?`
+		args = append(args, jobID)
+	}
+	// The log rows go first: once the runs are gone their ids are unrecoverable.
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM run_log WHERE run_id IN (SELECT id FROM job_runs`+where+`)`, args...); err != nil {
+		return 0, fmt.Errorf("delete run logs by status: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM job_runs`+where, args...)
+	if err != nil {
+		return 0, fmt.Errorf("delete job runs by status: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete job runs by status: %w", err)
+	}
+	return int(n), nil
+}
+
+// placeholders renders n comma separated SQL bind markers.
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
 // MarkOrphanRunsFailed flags runs left running by an unclean shutdown.

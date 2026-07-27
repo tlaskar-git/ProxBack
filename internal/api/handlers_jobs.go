@@ -329,6 +329,79 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, run)
 }
 
+// handleRunLog serves a run's persisted activity log. The lines array is always
+// present, even for a run that produced none.
+func (s *Server) handleRunLog(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, err := s.st.RunByID(r.Context(), id); err != nil {
+		s.notFoundOr(w, err, "run")
+		return
+	}
+	lines, err := s.st.RunLog(r.Context(), id)
+	if err != nil {
+		s.serverError(w, err)
+		return
+	}
+	if lines == nil {
+		lines = []store.RunLogLine{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lines": lines})
+}
+
+// handleDeleteRun removes one run from the history. Only the run row and its
+// activity log go: restore points and chunk data are never touched.
+func (s *Server) handleDeleteRun(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	run, err := s.st.RunByID(r.Context(), id)
+	if err != nil {
+		s.notFoundOr(w, err, "run")
+		return
+	}
+	if run.Status == store.RunRunning {
+		writeError(w, http.StatusConflict, "cannot delete a running run — cancel it first")
+		return
+	}
+	if err := s.st.DeleteJobRun(r.Context(), id); err != nil {
+		s.notFoundOr(w, err, "run")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// Scopes accepted by POST /api/runs/clear.
+const (
+	clearScopeFinished = "finished"
+	clearScopeFailed   = "failed"
+)
+
+type clearRunsRequest struct {
+	Scope string `json:"scope"`
+	JobID string `json:"jobId"`
+}
+
+func (s *Server) handleClearRuns(w http.ResponseWriter, r *http.Request) {
+	var body clearRunsRequest
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	var statuses []string
+	switch body.Scope {
+	case clearScopeFinished:
+		statuses = []string{store.RunSuccess, store.RunFailed, store.RunCanceled}
+	case clearScopeFailed:
+		statuses = []string{store.RunFailed}
+	default:
+		writeError(w, http.StatusBadRequest, `scope must be "finished" or "failed"`)
+		return
+	}
+	n, err := s.st.DeleteJobRunsByStatus(r.Context(), statuses, body.JobID)
+	if err != nil {
+		s.serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"deleted": n})
+}
+
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if _, err := s.st.RunByID(r.Context(), id); err != nil {

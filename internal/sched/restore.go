@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"proxback/internal/agentmgr"
 	"proxback/internal/engine"
@@ -26,7 +27,7 @@ func (m *Manager) executeRestore(ctx context.Context, run *store.JobRun, backup 
 
 	switch backup.SourceKind {
 	case store.SourceVM:
-		if err := m.restoreVM(ctx, sess, man, spec); err != nil {
+		if err := m.restoreVM(ctx, run.ID, sess, man, spec); err != nil {
 			return statsPtr(sess), err
 		}
 	case store.SourceAgent:
@@ -53,6 +54,9 @@ func (m *Manager) executeVerify(ctx context.Context, run *store.JobRun, backup *
 		return nil, fmt.Errorf("read manifest: %w", err)
 	}
 	sess := eng.NewSession(man.TotalSize(), m.progressFn(run.ID))
+	m.logRun(ctx, run.ID, "verifying %s restore point of %s taken %s (%s)",
+		backup.Kind, backup.SourceName, backup.CreatedAt.Format(time.RFC3339),
+		humanBytes(man.TotalSize()))
 	if err := sess.VerifyBackup(ctx, man); err != nil {
 		return statsPtr(sess), err
 	}
@@ -61,7 +65,7 @@ func (m *Manager) executeVerify(ctx context.Context, run *store.JobRun, backup *
 	return statsPtr(sess), nil
 }
 
-func (m *Manager) restoreVM(ctx context.Context, sess *engine.Session, man *engine.Manifest, spec RestoreSpec) error {
+func (m *Manager) restoreVM(ctx context.Context, runID string, sess *engine.Session, man *engine.Manifest, spec RestoreSpec) error {
 	if spec.VM == nil {
 		return errors.New("sched: vm restore target required")
 	}
@@ -103,11 +107,15 @@ func (m *Manager) restoreVM(ctx context.Context, sess *engine.Session, man *engi
 		if err != nil {
 			return err
 		}
+		m.logRun(ctx, runID, "restoring %s into vm %d on node %s via qmrestore on the node helper",
+			man.SourceName, vmid, node)
 		// --force overwrites an existing guest, which is only ever what the
 		// operator meant when restoring onto the same vmid it came from.
 		force := sourceErr == nil && vmid == sourceVMID
 		return m.restoreViaHelper(ctx, sess, man, h, vmid, spec.VM.Storage, force)
 	}
+	m.logRun(ctx, runID, "restoring %s into vm %d on node %s via per-disk import (%s)",
+		man.SourceName, vmid, node, countNoun(len(man.Disks), "disk"))
 	for _, disk := range man.Disks {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -152,6 +160,8 @@ func (m *Manager) restoreAgent(ctx context.Context, sess *engine.Session, eng *e
 	if !agentmgr.Online(agent) {
 		return fmt.Errorf("sched: agent %s is offline", agent.Hostname)
 	}
+	m.logRun(ctx, run.ID, "restoring %s to agent %s into %s",
+		man.SourceName, agent.Hostname, spec.Agent.DestPath)
 	sess.SetStep("Dispatching restore to agent " + agent.Hostname)
 	dctx, cancel := context.WithTimeout(ctx, AgentDispatchTimeout)
 	defer cancel()

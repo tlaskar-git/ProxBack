@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -224,6 +225,230 @@ func TestRunLifecycle(t *testing.T) {
 	counts, err := st.RunCountsSince(ctx, time.Now().Add(-time.Hour))
 	if err != nil || counts[store.RunSuccess] != 1 {
 		t.Fatalf("RunCountsSince = %v, %v", counts, err)
+	}
+}
+
+// TestRunLogAppendReadAndCap covers the activity log a user reads when they open
+// a run: lines come back in the order they happened, and a run that logs
+// forever cannot grow the database without bound.
+func TestRunLogAppendReadAndCap(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+
+	run, err := st.CreateRun(ctx, &store.JobRun{JobID: "j1", JobName: "nightly"})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	// A run with no lines yet still reads as an empty slice, never nil.
+	empty, err := st.RunLog(ctx, run.ID)
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Fatalf("RunLog of a fresh run = %#v (%v)", empty, err)
+	}
+
+	for _, line := range []string{
+		"vm run queued for \"nightly\"",
+		"run started",
+		"web-01: finished — 32.0 MiB processed",
+	} {
+		if err := st.AppendRunLog(ctx, run.ID, line); err != nil {
+			t.Fatalf("append %q: %v", line, err)
+		}
+	}
+	lines, err := st.RunLog(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("log has %d lines, want 3: %+v", len(lines), lines)
+	}
+	// Oldest first, and every line carries a timestamp.
+	if lines[0].Line != "vm run queued for \"nightly\"" || lines[2].Line != "web-01: finished — 32.0 MiB processed" {
+		t.Fatalf("log order = %+v", lines)
+	}
+	for i, l := range lines {
+		if l.TS.IsZero() {
+			t.Fatalf("line %d has no timestamp: %+v", i, l)
+		}
+	}
+	if lines[2].TS.Before(lines[0].TS) {
+		t.Fatalf("timestamps go backwards: %v then %v", lines[0].TS, lines[2].TS)
+	}
+
+	// A second run's lines must not leak into the first one's log.
+	other, err := st.CreateRun(ctx, &store.JobRun{JobID: "j2", JobName: "other"})
+	if err != nil {
+		t.Fatalf("create second run: %v", err)
+	}
+	if err := st.AppendRunLog(ctx, other.ID, "not mine"); err != nil {
+		t.Fatalf("append to the second run: %v", err)
+	}
+	if lines, err = st.RunLog(ctx, run.ID); err != nil || len(lines) != 3 {
+		t.Fatalf("log leaked across runs: %+v (%v)", lines, err)
+	}
+
+	// Overflowing the cap keeps the newest RunLogCap lines and drops the oldest.
+	for i := 0; i < store.RunLogCap+20; i++ {
+		if err := st.AppendRunLog(ctx, run.ID, fmt.Sprintf("chatter %d", i)); err != nil {
+			t.Fatalf("append chatter %d: %v", i, err)
+		}
+	}
+	lines, err = st.RunLog(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("read capped log: %v", err)
+	}
+	if len(lines) != store.RunLogCap {
+		t.Fatalf("capped log has %d lines, want %d", len(lines), store.RunLogCap)
+	}
+	// 3 real lines + 520 chatter lines = 523, so the oldest 23 were dropped:
+	// the three real ones and chatter 0..19.
+	if lines[0].Line != "chatter 20" {
+		t.Fatalf("oldest surviving line = %q, want %q", lines[0].Line, "chatter 20")
+	}
+	if last := lines[len(lines)-1].Line; last != fmt.Sprintf("chatter %d", store.RunLogCap+19) {
+		t.Fatalf("newest line = %q", last)
+	}
+	// Trimming one run must not touch another.
+	if n, err := st.CountRunLog(ctx, other.ID); err != nil || n != 1 {
+		t.Fatalf("the other run's log = %d lines (%v), want 1", n, err)
+	}
+
+	// An explicit delete empties the log without removing the run.
+	if err := st.DeleteRunLog(ctx, run.ID); err != nil {
+		t.Fatalf("delete run log: %v", err)
+	}
+	if n, err := st.CountRunLog(ctx, run.ID); err != nil || n != 0 {
+		t.Fatalf("log after delete = %d lines (%v)", n, err)
+	}
+	if _, err := st.RunByID(ctx, run.ID); err != nil {
+		t.Fatalf("deleting the log removed the run: %v", err)
+	}
+}
+
+// TestDeleteJobRunDropsItsLogNotItsBackups pins down the contract that makes
+// history cleanup safe: a deleted run takes its activity log with it and leaves
+// every restore point and chunk exactly where it was.
+func TestDeleteJobRunDropsItsLogNotItsBackups(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+
+	run, err := st.CreateRun(ctx, &store.JobRun{JobID: "j1", JobName: "nightly"})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := st.AppendRunLog(ctx, run.ID, "run started"); err != nil {
+		t.Fatalf("append log: %v", err)
+	}
+	backup, err := st.CreateBackup(ctx, &store.Backup{
+		JobID: "j1", RunID: run.ID, SourceKind: store.SourceVM, SourceID: "h1_100",
+		SourceName: "web-01", TargetID: "t1", SizeBytes: 32 << 20, UploadedBytes: 4 << 20,
+	})
+	if err != nil {
+		t.Fatalf("create backup: %v", err)
+	}
+	if err := st.AddChunk(ctx, "t1", "abc", 4<<20); err != nil {
+		t.Fatalf("add chunk: %v", err)
+	}
+	if err := st.FinishRun(ctx, run.ID, store.RunSuccess, 32<<20, 4<<20, 0.875, ""); err != nil {
+		t.Fatalf("finish run: %v", err)
+	}
+
+	if err := st.DeleteJobRun(ctx, run.ID); err != nil {
+		t.Fatalf("delete run: %v", err)
+	}
+	if _, err := st.RunByID(ctx, run.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("run survived deletion: %v", err)
+	}
+	if n, err := st.CountRunLog(ctx, run.ID); err != nil || n != 0 {
+		t.Fatalf("log lines survived the run: %d (%v)", n, err)
+	}
+	// The data the run produced is untouched.
+	if _, err := st.BackupByID(ctx, backup.ID); err != nil {
+		t.Fatalf("deleting a run removed its restore point: %v", err)
+	}
+	if has, err := st.HasChunk(ctx, "t1", "abc"); err != nil || !has {
+		t.Fatalf("deleting a run removed chunk data: %v (%v)", has, err)
+	}
+	// Deleting twice is a not-found, not a silent success.
+	if err := st.DeleteJobRun(ctx, run.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleting a run twice = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeleteJobRunsByStatus(t *testing.T) {
+	ctx := context.Background()
+	st, _ := open(t)
+
+	// Two jobs, one run per terminal status plus a run still in progress.
+	type spec struct {
+		jobID  string
+		status string
+	}
+	ids := map[spec]string{}
+	for _, sp := range []spec{
+		{"j1", store.RunSuccess}, {"j1", store.RunFailed}, {"j1", store.RunCanceled}, {"j1", store.RunRunning},
+		{"j2", store.RunSuccess}, {"j2", store.RunFailed},
+	} {
+		run, err := st.CreateRun(ctx, &store.JobRun{JobID: sp.jobID, JobName: sp.jobID})
+		if err != nil {
+			t.Fatalf("create %+v: %v", sp, err)
+		}
+		if err := st.AppendRunLog(ctx, run.ID, "run started"); err != nil {
+			t.Fatalf("append log: %v", err)
+		}
+		if sp.status != store.RunRunning {
+			if err := st.FinishRun(ctx, run.ID, sp.status, 1, 1, 0, ""); err != nil {
+				t.Fatalf("finish %+v: %v", sp, err)
+			}
+		}
+		ids[sp] = run.ID
+	}
+
+	// "failed", scoped to one job: only that job's failure goes.
+	n, err := st.DeleteJobRunsByStatus(ctx, []string{store.RunFailed}, "j1")
+	if err != nil || n != 1 {
+		t.Fatalf("clear failed of j1 = %d (%v), want 1", n, err)
+	}
+	if _, err := st.RunByID(ctx, ids[spec{"j1", store.RunFailed}]); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("j1's failed run survived: %v", err)
+	}
+	if _, err := st.RunByID(ctx, ids[spec{"j2", store.RunFailed}]); err != nil {
+		t.Fatalf("clearing j1 also cleared j2's failed run: %v", err)
+	}
+	// The deleted run's log went with it; the survivors kept theirs.
+	if c, err := st.CountRunLog(ctx, ids[spec{"j1", store.RunFailed}]); err != nil || c != 0 {
+		t.Fatalf("cleared run kept %d log lines (%v)", c, err)
+	}
+	if c, err := st.CountRunLog(ctx, ids[spec{"j2", store.RunFailed}]); err != nil || c != 1 {
+		t.Fatalf("surviving run's log = %d lines (%v), want 1", c, err)
+	}
+
+	// "finished" across every job: success + failed + canceled, never running.
+	n, err = st.DeleteJobRunsByStatus(ctx,
+		[]string{store.RunSuccess, store.RunFailed, store.RunCanceled}, "")
+	if err != nil || n != 4 {
+		t.Fatalf("clear finished = %d (%v), want 4", n, err)
+	}
+	if _, err := st.RunByID(ctx, ids[spec{"j1", store.RunRunning}]); err != nil {
+		t.Fatalf("a running run was deleted: %v", err)
+	}
+	runs, err := st.ListRuns(ctx, "", 100)
+	if err != nil || len(runs) != 1 || runs[0].Status != store.RunRunning {
+		t.Fatalf("remaining runs = %+v (%v), want just the running one", runs, err)
+	}
+
+	// Asking for 'running' explicitly is refused, not obeyed.
+	if n, err = st.DeleteJobRunsByStatus(ctx, []string{store.RunRunning}, ""); err != nil || n != 0 {
+		t.Fatalf("clear running = %d (%v), want 0", n, err)
+	}
+	if _, err := st.RunByID(ctx, ids[spec{"j1", store.RunRunning}]); err != nil {
+		t.Fatalf("an explicit running scope deleted the run: %v", err)
+	}
+	// An empty status list is a no-op rather than a full table wipe.
+	if n, err = st.DeleteJobRunsByStatus(ctx, nil, ""); err != nil || n != 0 {
+		t.Fatalf("clear with no statuses = %d (%v), want 0", n, err)
+	}
+	if runs, err = st.ListRuns(ctx, "", 100); err != nil || len(runs) != 1 {
+		t.Fatalf("runs after the no-op clear = %+v (%v)", runs, err)
 	}
 }
 
@@ -481,6 +706,13 @@ func TestMigrationUpgradesOldDatabase(t *testing.T) {
 	if !hasColumn(t, st, "helpers", "access_secret_enc") {
 		t.Fatal("migration did not create the helpers table")
 	}
+	// run_log arrived in v0.3.1: a database written before it must gain the
+	// table (and its index) on open, not on some later upgrade step.
+	for _, column := range []string{"run_id", "ts", "line"} {
+		if !hasColumn(t, st, "run_log", column) {
+			t.Fatalf("migration did not create run_log.%s", column)
+		}
+	}
 
 	// 3. Legacy data survived and reads back through the new accessors.
 	vm, err := st.CachedVM(ctx, "h1", 100)
@@ -554,6 +786,17 @@ func TestMigrationUpgradesOldDatabase(t *testing.T) {
 	}
 	if upgraded, err := st.HelperByNode(ctx, "pve1"); err != nil || upgraded.Port != store.DefaultHelperPort {
 		t.Fatalf("helper on the upgraded database = %+v (%v)", upgraded, err)
+	}
+	// A run on the upgraded database can log, and its log is readable back.
+	legacyRun, err := st.CreateRun(ctx, &store.JobRun{JobID: "j1", JobName: "legacy-nightly"})
+	if err != nil {
+		t.Fatalf("create run on the upgraded database: %v", err)
+	}
+	if err := st.AppendRunLog(ctx, legacyRun.ID, "run started"); err != nil {
+		t.Fatalf("append run log on the upgraded database: %v", err)
+	}
+	if lines, err := st.RunLog(ctx, legacyRun.ID); err != nil || len(lines) != 1 || lines[0].Line != "run started" {
+		t.Fatalf("run log on the upgraded database = %+v (%v)", lines, err)
 	}
 
 	// 5. Re-opening is idempotent (the ALTER TABLE must not error twice).

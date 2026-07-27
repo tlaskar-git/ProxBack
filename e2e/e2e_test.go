@@ -98,6 +98,17 @@ type apiRun struct {
 	CurrentStep    string  `json:"currentStep"`
 }
 
+// apiRunLogLine mirrors one line of GET /api/runs/{id}/log. The timestamp stays
+// a string so the test can assert it really is RFC3339 on the wire.
+type apiRunLogLine struct {
+	TS   string `json:"ts"`
+	Line string `json:"line"`
+}
+
+type apiRunLog struct {
+	Lines []apiRunLogLine `json:"lines"`
+}
+
 type apiJob struct {
 	ID         string         `json:"id"`
 	Name       string         `json:"name"`
@@ -2006,6 +2017,161 @@ func TestEndToEnd(t *testing.T) {
 		}
 		if len(mailPoints[0].Disks) != 1 || mailPoints[0].Disks[0].Name != "scsi0" {
 			t.Fatalf("newest mail-01 point = %+v, want the per-disk scsi0 stream", mailPoints[0].Disks)
+		}
+	})
+
+	// ---- Run activity log and history cleanup ------------------------------
+	//
+	// mail-01's job is the youngest history in the install, so its run is the
+	// one whose log and deletion are inspected here.
+	t.Run("22-run-activity-log", func(t *testing.T) {
+		run := h.runJob(helperJob.ID)
+
+		var got apiRunLog
+		h.ok(http.MethodGet, "/api/runs/"+run.ID+"/log", nil, &got)
+		if len(got.Lines) == 0 {
+			t.Fatal("a successful run produced no activity log")
+		}
+		var joined []string
+		for _, l := range got.Lines {
+			if l.Line == "" {
+				t.Fatalf("empty log line in %+v", got.Lines)
+			}
+			if _, err := time.Parse(time.RFC3339, l.TS); err != nil {
+				t.Fatalf("log line timestamp %q is not RFC3339: %v", l.TS, err)
+			}
+			joined = append(joined, l.Line)
+		}
+		all := strings.Join(joined, "\n")
+		// The log names the guest that was backed up …
+		if !strings.Contains(all, "mail-01") {
+			t.Fatalf("run log never mentions the VM it backed up:\n%s", all)
+		}
+		// … and ends with the terminal summary.
+		if !strings.Contains(joined[len(joined)-1], "run succeeded") {
+			t.Fatalf("last log line = %q, want the success summary", joined[len(joined)-1])
+		}
+		// One line per event, never per chunk.
+		if len(joined) > 20 {
+			t.Fatalf("a single-VM run logged %d lines:\n%s", len(joined), all)
+		}
+
+		// Unknown runs 404 rather than answering with an empty log.
+		if code, body := h.do(http.MethodGet, "/api/runs/does-not-exist/log", nil); code != http.StatusNotFound {
+			t.Fatalf("log of an unknown run = %d (%s), want 404", code, body)
+		}
+	})
+
+	t.Run("23-delete-run-keeps-restore-points", func(t *testing.T) {
+		run := h.runJob(helperJob.ID)
+
+		var before []apiBackup
+		h.ok(http.MethodGet, "/api/backups?sourceKind=vm&sourceId="+mailSource, nil, &before)
+		if len(before) == 0 {
+			t.Fatal("mail-01 has no restore points to protect")
+		}
+
+		h.ok(http.MethodDelete, "/api/runs/"+run.ID, nil, nil)
+
+		// The run is gone from the history and from the run listing.
+		if code, body := h.do(http.MethodGet, "/api/runs/"+run.ID, nil); code != http.StatusNotFound {
+			t.Fatalf("GET a deleted run = %d (%s), want 404", code, body)
+		}
+		var runs []apiRun
+		h.ok(http.MethodGet, "/api/runs?limit=200", nil, &runs)
+		for _, r := range runs {
+			if r.ID == run.ID {
+				t.Fatalf("deleted run %s still listed in /api/runs", run.ID)
+			}
+		}
+		// Its log went with it.
+		if code, body := h.do(http.MethodGet, "/api/runs/"+run.ID+"/log", nil); code != http.StatusNotFound {
+			t.Fatalf("log of a deleted run = %d (%s), want 404", code, body)
+		}
+		// Deleting it twice is a 404, not a silent success.
+		if code, _ := h.do(http.MethodDelete, "/api/runs/"+run.ID, nil); code != http.StatusNotFound {
+			t.Fatalf("deleting a deleted run = %d, want 404", code)
+		}
+
+		// The restore points the run produced are untouched, and still restore.
+		var after []apiBackup
+		h.ok(http.MethodGet, "/api/backups?sourceKind=vm&sourceId="+mailSource, nil, &after)
+		if len(after) != len(before) {
+			t.Fatalf("restore points went from %d to %d when a run was deleted", len(before), len(after))
+		}
+		if after[0].ID != before[0].ID || after[0].SizeBytes != before[0].SizeBytes {
+			t.Fatalf("newest restore point changed: %+v vs %+v", after[0], before[0])
+		}
+		var started struct {
+			RunID string `json:"runId"`
+		}
+		h.ok(http.MethodPost, "/api/restores", map[string]any{
+			"backupId": after[0].ID,
+			"vm":       map[string]any{"hostId": host.ID, "node": "pve1", "vmid": 9995},
+		}, &started)
+		restore := h.waitRun(started.RunID, 90*time.Second)
+		if restore.Status != "success" {
+			t.Fatalf("restore from an orphaned point %q: %s", restore.Status, restore.Error)
+		}
+		want := h.fetchRaw(fmt.Sprintf("%s/sim/disk/103/scsi0", h.simURL))
+		gotBytes := h.fetchRaw(fmt.Sprintf("%s/sim/imported/9995/scsi0", h.simURL))
+		if !bytes.Equal(gotBytes, want) {
+			t.Fatal("a restore point whose run was deleted no longer restores byte-identically")
+		}
+	})
+
+	t.Run("24-clear-run-history", func(t *testing.T) {
+		var before []apiRun
+		h.ok(http.MethodGet, "/api/runs?limit=500", nil, &before)
+		if len(before) == 0 {
+			t.Fatal("no run history to clear")
+		}
+		for _, r := range before {
+			if r.Status == "running" {
+				t.Fatalf("run %s is still running; the clear assertion would be racy", r.ID)
+			}
+		}
+
+		// A bad scope changes nothing.
+		if code, body := h.do(http.MethodPost, "/api/runs/clear", map[string]any{"scope": "everything"}); code != http.StatusBadRequest {
+			t.Fatalf("clear with a bogus scope = %d (%s), want 400", code, body)
+		}
+		var unchanged []apiRun
+		h.ok(http.MethodGet, "/api/runs?limit=500", nil, &unchanged)
+		if len(unchanged) != len(before) {
+			t.Fatalf("a rejected clear removed runs: %d -> %d", len(before), len(unchanged))
+		}
+
+		var cleared struct {
+			Deleted int `json:"deleted"`
+		}
+		h.ok(http.MethodPost, "/api/runs/clear", map[string]any{"scope": "finished"}, &cleared)
+		if cleared.Deleted != len(before) {
+			t.Fatalf("clear reported %d deleted, want %d", cleared.Deleted, len(before))
+		}
+		var remaining []apiRun
+		h.ok(http.MethodGet, "/api/runs?limit=500", nil, &remaining)
+		if len(remaining) != 0 {
+			t.Fatalf("run history still holds %d runs after a finished clear: %+v", len(remaining), remaining)
+		}
+		// Clearing history is not data loss: the restore points survive.
+		var backups []apiBackup
+		h.ok(http.MethodGet, "/api/backups", nil, &backups)
+		if len(backups) == 0 {
+			t.Fatal("clearing run history destroyed every restore point")
+		}
+		// And jobs still report no lastRun rather than a dangling one.
+		var jobs []apiJob
+		h.ok(http.MethodGet, "/api/jobs", nil, &jobs)
+		for _, j := range jobs {
+			if j.LastRun != nil {
+				t.Fatalf("job %q reports lastRun %+v after the history was cleared", j.Name, j.LastRun)
+			}
+		}
+		// A second clear finds nothing left.
+		h.ok(http.MethodPost, "/api/runs/clear", map[string]any{"scope": "failed"}, &cleared)
+		if cleared.Deleted != 0 {
+			t.Fatalf("clearing an empty history deleted %d runs", cleared.Deleted)
 		}
 	})
 }

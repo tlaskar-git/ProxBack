@@ -44,11 +44,14 @@ func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *sto
 		res, err := eng.GC(m.detached())
 		if err != nil {
 			m.log.Error("garbage collection failed", "target", target.ID, "error", err)
+			m.logRun(ctx, run.ID, "warning: garbage collection failed: %v", err)
 			return
 		}
 		if res.ChunksDeleted > 0 {
 			m.log.Info("orphan chunks collected", "target", target.ID,
 				"chunks", res.ChunksDeleted, "bytes", res.BytesFreed)
+			m.logRun(ctx, run.ID, "garbage collection freed %s (%s)",
+				humanBytes(res.BytesFreed), countNoun(res.ChunksDeleted, "orphan chunk"))
 		}
 	}()
 
@@ -180,6 +183,17 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 	if err != nil {
 		return nil, err
 	}
+	names := make([]string, 0, len(plans))
+	for _, p := range plans {
+		names = append(names, p.name)
+	}
+	if job.TagFilter != "" {
+		m.logRun(ctx, run.ID, "resolved tag %q to %s: %s",
+			job.TagFilter, countNoun(len(plans), "VM"), strings.Join(names, ", "))
+	} else {
+		m.logRun(ctx, run.ID, "backing up %s: %s",
+			countNoun(len(plans), "VM"), strings.Join(names, ", "))
+	}
 	sess := eng.NewSession(total, m.progressFn(run.ID))
 	snapname := "proxback-" + run.ID[:8]
 
@@ -192,11 +206,14 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 		var disks []engine.DiskManifest
 		if p.helper != nil {
 			// vzdump owns snapshot consistency, so ProxBack must not create one.
+			m.logRun(ctx, run.ID, "%s: starting vzdump stream via helper on node %s", p.name, p.node)
 			var err error
-			if disks, err = m.backupViaHelper(ctx, sess, p); err != nil {
+			if disks, err = m.backupViaHelper(ctx, run.ID, sess, p); err != nil {
 				return statsPtr(sess), err
 			}
 		} else {
+			m.logRun(ctx, run.ID, "%s: starting %s via Proxmox disk export on node %s",
+				p.name, countNoun(len(p.disks), "disk"), p.node)
 			sess.SetStep("Snapshotting " + p.name)
 			upid, err := p.client.CreateSnapshot(ctx, p.node, p.vmid, snapname)
 			if err != nil {
@@ -205,7 +222,7 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 			if err := p.client.WaitTask(ctx, p.node, upid, SnapshotTaskTimeout); err != nil {
 				return statsPtr(sess), fmt.Errorf("snapshot %s: %w", p.name, err)
 			}
-			if disks, err = m.exportDisks(ctx, sess, p, snapname); err != nil {
+			if disks, err = m.exportDisks(ctx, run.ID, sess, p, snapname); err != nil {
 				return statsPtr(sess), err
 			}
 		}
@@ -263,7 +280,8 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 		}); err != nil {
 			return statsPtr(sess), err
 		}
-		if err := m.applyRetention(ctx, eng, job, store.SourceVM, p.sourceID); err != nil {
+		m.logSourceDone(ctx, run.ID, p.name, after.BytesProcessed-before.BytesProcessed, uploaded, man.Kind)
+		if err := m.applyRetention(ctx, run.ID, eng, job, store.SourceVM, p.sourceID); err != nil {
 			return statsPtr(sess), err
 		}
 	}
@@ -275,16 +293,18 @@ func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store
 
 // exportDisks streams every disk of the snapshot through the engine, always
 // removing the snapshot afterwards.
-func (m *Manager) exportDisks(ctx context.Context, sess *engine.Session, p vmPlan, snapname string) (out []engine.DiskManifest, err error) {
+func (m *Manager) exportDisks(ctx context.Context, runID string, sess *engine.Session, p vmPlan, snapname string) (out []engine.DiskManifest, err error) {
 	defer func() {
 		cleanup := m.detached()
 		upid, derr := p.client.DeleteSnapshot(cleanup, p.node, p.vmid, snapname)
 		if derr != nil {
 			m.log.Warn("could not remove snapshot", "vm", p.vmid, "snapshot", snapname, "error", derr)
+			m.logRun(ctx, runID, "warning: %s: could not remove snapshot %s: %v", p.name, snapname, derr)
 			return
 		}
 		if werr := p.client.WaitTask(cleanup, p.node, upid, time.Minute); werr != nil {
 			m.log.Warn("snapshot removal task failed", "vm", p.vmid, "snapshot", snapname, "error", werr)
+			m.logRun(ctx, runID, "warning: %s: removing snapshot %s failed: %v", p.name, snapname, werr)
 		}
 	}()
 	for _, d := range p.disks {
@@ -332,6 +352,8 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 	}
 
 	sess := eng.NewSession(0, m.progressFn(run.ID))
+	m.logRun(ctx, run.ID, "%s: starting file backup via agent (%s: %s)",
+		agent.Hostname, countNoun(len(src.Paths), "path"), strings.Join(src.Paths, ", "))
 	sess.SetStep("Dispatching to agent " + agent.Hostname)
 
 	dctx, cancel := context.WithTimeout(ctx, AgentDispatchTimeout)
@@ -401,7 +423,8 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 	}); err != nil {
 		return statsPtr(sess), err
 	}
-	if err := m.applyRetention(ctx, eng, job, store.SourceAgent, agent.ID); err != nil {
+	m.logSourceDone(ctx, run.ID, agent.Hostname, stats.BytesProcessed, stats.BytesUploaded, man.Kind)
+	if err := m.applyRetention(ctx, run.ID, eng, job, store.SourceAgent, agent.ID); err != nil {
 		return statsPtr(sess), err
 	}
 	sess.SetStep("Completed")
@@ -410,6 +433,20 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 }
 
 // ---------------------------------------------------------------- shared
+
+// logSourceDone records the one line an operator reads to know what a source
+// actually cost: bytes seen, bytes that had to travel, and how much of it the
+// chunk index already knew.
+func (m *Manager) logSourceDone(ctx context.Context, runID, name string, processed, uploaded int64, kind string) {
+	dedup := 0.0
+	if processed > 0 {
+		if dedup = (1 - float64(uploaded)/float64(processed)) * 100; dedup < 0 {
+			dedup = 0
+		}
+	}
+	m.logRun(ctx, runID, "%s: finished — %s processed, %s uploaded, %.0f%% deduplicated (%s restore point)",
+		name, humanBytes(processed), humanBytes(uploaded), dedup, kind)
+}
 
 // parentFor returns the id of the previous restore point for a source on a
 // target, which is what makes the next backup incremental.
@@ -426,7 +463,7 @@ func (m *Manager) parentFor(ctx context.Context, sourceKind, sourceID, targetID 
 }
 
 // applyRetention prunes restore points beyond the job's keep-last-N window.
-func (m *Manager) applyRetention(ctx context.Context, eng *engine.Engine, job *store.Job, sourceKind, sourceID string) error {
+func (m *Manager) applyRetention(ctx context.Context, runID string, eng *engine.Engine, job *store.Job, sourceKind, sourceID string) error {
 	keep := job.Retention
 	if keep <= 0 {
 		return nil
@@ -442,6 +479,7 @@ func (m *Manager) applyRetention(ctx context.Context, eng *engine.Engine, job *s
 	if len(list) <= keep {
 		return nil
 	}
+	pruned := 0
 	for _, b := range list[keep:] {
 		if err := eng.DeleteManifest(ctx, b.SourceKind, b.SourceID, b.ID); err != nil {
 			return err
@@ -452,8 +490,13 @@ func (m *Manager) applyRetention(ctx context.Context, eng *engine.Engine, job *s
 		if err := m.st.DeleteBackup(ctx, b.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 			return err
 		}
+		pruned++
 		m.log.Info("retention pruned restore point", "backup", b.ID,
 			"source", b.SourceName, "job", job.Name, "keep", keep)
+	}
+	if pruned > 0 {
+		m.logRun(ctx, runID, "%s: retention pruned %s (keeping the last %d)",
+			list[0].SourceName, countNoun(pruned, "restore point"), keep)
 	}
 	return nil
 }

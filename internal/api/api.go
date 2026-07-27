@@ -21,6 +21,7 @@ import (
 	"proxback/internal/agentmgr"
 	"proxback/internal/auth"
 	"proxback/internal/helpermgr"
+	"proxback/internal/nodedeploy"
 	"proxback/internal/notify"
 	"proxback/internal/sched"
 	"proxback/internal/store"
@@ -59,6 +60,10 @@ type Server struct {
 	log      *slog.Logger
 	restart  func()
 
+	// deployHelper installs a node helper over SSH. It is a field so tests can
+	// exercise the endpoint without a real SSH server.
+	deployHelper func(context.Context, nodedeploy.Params) (nodedeploy.Result, error)
+
 	spa    fs.FS
 	router chi.Router
 }
@@ -87,6 +92,8 @@ func New(cfg Config) (*Server, error) {
 		log:      log,
 		restart:  cfg.OnRestartRequested,
 		spa:      spa,
+
+		deployHelper: nodedeploy.Deploy,
 	}
 	s.router = s.routes()
 	return s, nil
@@ -173,7 +180,10 @@ func (s *Server) apiRoutes() chi.Router {
 		r.Post("/jobs/{id}/run", s.handleRunJob)
 
 		r.Get("/runs", s.handleListRuns)
+		r.Post("/runs/clear", s.handleClearRuns)
 		r.Get("/runs/{id}", s.handleGetRun)
+		r.Get("/runs/{id}/log", s.handleRunLog)
+		r.Delete("/runs/{id}", s.handleDeleteRun)
 		r.Post("/runs/{id}/cancel", s.handleCancelRun)
 
 		r.Get("/backups", s.handleListBackups)
@@ -187,6 +197,7 @@ func (s *Server) apiRoutes() chi.Router {
 
 		r.Get("/helpers", s.handleListHelpers)
 		r.Post("/helpers/enroll-token", s.handleCreateHelperEnrollToken)
+		r.Post("/helpers/deploy", s.handleDeployHelper)
 		r.Delete("/helpers/{id}", s.handleDeleteHelper)
 
 		r.Get("/settings", s.handleGetSettings)

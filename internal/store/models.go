@@ -265,6 +265,12 @@ type JobRun struct {
 	CurrentStep    string     `json:"currentStep"`
 }
 
+// RunLogLine is one line of a run's persisted activity log.
+type RunLogLine struct {
+	TS   time.Time `json:"ts"`
+	Line string    `json:"line"`
+}
+
 // Disk is one disk (VM) or stream (agent) inside a restore point.
 type Disk struct {
 	Name      string `json:"name"`

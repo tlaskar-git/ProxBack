@@ -362,6 +362,8 @@ func (m *Manager) launch(run *store.JobRun, notifyKind string, fn func(context.C
 	m.cancels[run.ID] = cancel
 	m.mu.Unlock()
 
+	m.logRun(runCtx, run.ID, "%s run queued for %q", notifyKind, run.JobName)
+
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -384,6 +386,7 @@ func (m *Manager) launch(run *store.JobRun, notifyKind string, fn func(context.C
 		if err := m.st.SetRunStep(m.detached(), run.ID, "Starting"); err != nil {
 			m.log.Warn("could not update run step", "run", run.ID, "error", err)
 		}
+		m.logRun(runCtx, run.ID, "run started")
 		stats, err := func() (st *engine.Stats, err error) {
 			defer func() {
 				if p := recover(); p != nil {
@@ -438,6 +441,7 @@ func (m *Manager) finish(runID, notifyKind string, stats *engine.Stats, runErr e
 	if err := m.st.FinishRun(ctx, runID, status, processed, uploaded, ratio, msg); err != nil {
 		m.log.Error("could not finish run", "run", runID, "error", err)
 	}
+	m.logTerminal(ctx, cur, status, processed, uploaded, ratio, msg)
 	if runErr != nil {
 		m.log.Error("run finished", "run", runID, "status", status, "error", runErr)
 	} else {
@@ -455,6 +459,64 @@ func (m *Manager) finish(runID, notifyKind string, stats *engine.Stats, runErr e
 		Error:          msg,
 		StartedAt:      cur.StartedAt,
 	})
+}
+
+// ---------------------------------------------------------------- run log
+
+// logRun appends one line to a run's persisted activity log, which is what the
+// UI shows when an operator opens a run. Logging must never be able to fail a
+// run, so every error is logged and swallowed; the context is detached from
+// cancellation so the cancellation and failure lines still get written.
+func (m *Manager) logRun(ctx context.Context, runID, format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	if err := m.st.AppendRunLog(context.WithoutCancel(ctx), runID, line); err != nil {
+		m.log.Warn("could not append run log line", "run", runID, "error", err)
+	}
+}
+
+// logTerminal writes the last line of a run: the success summary, the
+// cancellation note or the full error.
+func (m *Manager) logTerminal(ctx context.Context, run *store.JobRun, status string,
+	processed, uploaded int64, ratio float64, msg string) {
+	dur := store.Now().Sub(run.StartedAt).Round(time.Millisecond)
+	switch status {
+	case store.RunSuccess:
+		// Deduplication is a backup-side concept, so restores and verifies only
+		// report what they read.
+		if run.Kind == store.RunKindRestore || run.Kind == store.RunKindVerify {
+			m.logRun(ctx, run.ID, "run succeeded in %s — %s processed", dur, humanBytes(processed))
+			return
+		}
+		m.logRun(ctx, run.ID, "run succeeded in %s — %s processed, %s uploaded, %.0f%% deduplicated",
+			dur, humanBytes(processed), humanBytes(uploaded), ratio*100)
+	case store.RunCanceled:
+		m.logRun(ctx, run.ID, "run canceled after %s", dur)
+	default:
+		m.logRun(ctx, run.ID, "run failed after %s: %s", dur, msg)
+	}
+}
+
+// countNoun renders a count with its noun pluralised, e.g. "1 VM" / "2 VMs".
+func countNoun(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// humanBytes formats a size the way the run log shows it, e.g. 4.0 MiB.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := [...]string{"KiB", "MiB", "GiB", "TiB"}
+	v, i := float64(n), -1
+	for v >= unit && i < len(units)-1 {
+		v /= unit
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
 // notifyFinished fires the run webhook when the configured policy matches.

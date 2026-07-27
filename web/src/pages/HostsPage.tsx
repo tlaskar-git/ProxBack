@@ -82,7 +82,9 @@ function AddHostModal({
       // Immediately probe the new host so the card shows a real status.
       try {
         const test = await testHost(host.id)
-        if (test.ok) {
+        if (test.ok && test.warning) {
+          toast.error(`${host.name}: connected, but no guests are visible`, test.warning)
+        } else if (test.ok) {
           toast.success(
             `${host.name} is reachable.`,
             `${test.nodes} ${test.nodes === 1 ? 'node' : 'nodes'} visible through the API.`,
@@ -221,7 +223,9 @@ function HostCard({
     setTesting(true)
     try {
       const result = await testHost(host.id)
-      if (result.ok) {
+      if (result.ok && result.warning) {
+        toast.error(`${host.name}: connected, but no guests are visible`, result.warning)
+      } else if (result.ok) {
         toast.success(
           `${host.name} is reachable.`,
           `${result.nodes} ${result.nodes === 1 ? 'node' : 'nodes'} visible through the API.`,
@@ -282,6 +286,16 @@ function HostCard({
         <Metric label="Last seen" value={formatRelative(host.lastSeen)} />
         <Metric label="TLS" value={host.insecureTLS ? 'Self-signed allowed' : 'Verified'} />
       </dl>
+
+      {host.status === 'limited' ? (
+        <p className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs leading-relaxed text-amber-300">
+          The token connects but sees no guests — it likely has “Privilege Separation” enabled with
+          no permissions granted. On the Proxmox host, grant the token a role with VM.Audit,
+          VM.Snapshot, VM.Backup and Datastore.Audit on path <span className="font-mono">/</span>{' '}
+          (Datacenter → Permissions), or recreate it with privilege separation off, then press Test
+          Connection.
+        </p>
+      ) : null}
 
       <div className="mt-5 flex items-center gap-2 border-t border-slate-800 pt-4">
         <Button

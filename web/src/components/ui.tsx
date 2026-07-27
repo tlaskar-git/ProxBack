@@ -243,6 +243,7 @@ export function toneForStatus(status: string | null | undefined): PillTone {
     case 'warning':
     case 'degraded':
     case 'pending':
+    case 'limited':
       return 'amber'
     default:
       return 'slate'

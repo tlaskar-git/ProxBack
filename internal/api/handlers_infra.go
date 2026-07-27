@@ -90,8 +90,14 @@ func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("proxmox host added", "host", host.Name, "nodes", len(nodes))
-	if _, err := s.refreshHostVMs(r, host); err != nil {
+	if vms, err := s.refreshHostVMs(r, host); err != nil {
 		s.log.Warn("could not refresh vm inventory", "host", host.Name, "error", err)
+	} else if len(vms) == 0 {
+		if warning := client.DiagnoseEmptyInventory(r.Context()); warning != "" {
+			_ = s.st.UpdatePVEHostStatus(r.Context(), host.ID, "limited", &now)
+			host.Status = "limited"
+			s.log.Warn("proxmox token has no privileges", "host", host.Name, "hint", warning)
+		}
 	}
 	writeJSON(w, http.StatusOK, toHostDTO(host))
 }
@@ -113,12 +119,26 @@ func (s *Server) handleTestHost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "nodes": 0, "error": err.Error()})
 		return
 	}
+	// Connectivity is fine — but a token with no privileges sees an empty
+	// cluster, which reads as "connected" while every listing is silently
+	// empty. Surface that here, where the operator is looking.
+	warning := ""
+	status := "online"
+	if vms, verr := client.AllVMs(r.Context()); verr == nil && len(vms) == 0 {
+		if warning = client.DiagnoseEmptyInventory(r.Context()); warning != "" {
+			status = "limited"
+		}
+	}
 	now := store.Now()
-	if err := s.st.UpdatePVEHostStatus(r.Context(), host.ID, "online", &now); err != nil {
+	if err := s.st.UpdatePVEHostStatus(r.Context(), host.ID, status, &now); err != nil {
 		s.serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "nodes": len(nodes)})
+	out := map[string]any{"ok": true, "nodes": len(nodes)}
+	if warning != "" {
+		out["warning"] = warning
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleDeleteHost(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +211,16 @@ func (s *Server) handleHostVMs(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "could not query Proxmox host: "+err.Error())
 		return
+	}
+	if len(vms) == 0 {
+		if client, cerr := sched.PVEClient(host); cerr == nil {
+			if warning := client.DiagnoseEmptyInventory(r.Context()); warning != "" {
+				now := store.Now()
+				_ = s.st.UpdatePVEHostStatus(r.Context(), host.ID, "limited", &now)
+				writeError(w, http.StatusConflict, "host "+host.Name+": "+warning)
+				return
+			}
+		}
 	}
 	out := make([]vmDTO, 0, len(vms))
 	for _, v := range vms {
@@ -269,7 +299,7 @@ func (s *Server) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 		body.Region = "us-east-1"
 	}
 	target, err := s.st.CreateS3Target(r.Context(), &store.S3Target{
-		Name: body.Name, Endpoint: strings.TrimRight(strings.TrimSpace(body.Endpoint), "/"),
+		Name: body.Name, Endpoint: s3target.NormalizeEndpoint(body.Endpoint),
 		Region: body.Region, Bucket: body.Bucket,
 		AccessKey: body.AccessKey, SecretKey: body.SecretKey, PathStyle: body.PathStyle,
 		Status: "unknown",

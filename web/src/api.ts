@@ -253,6 +253,23 @@ export interface RunRef {
   runId: ID
 }
 
+/** One line of a run's persisted activity log. */
+export interface RunLogLine {
+  ts: string
+  line: string
+}
+
+export interface RunLogResponse {
+  lines: RunLogLine[]
+}
+
+/** Which terminal runs `POST /api/runs/clear` removes. */
+export type ClearRunsScope = 'finished' | 'failed'
+
+export interface ClearRunsResult {
+  deleted: number
+}
+
 /* Restore points ---------------------------------------------------------- */
 
 export type SourceKind = 'vm' | 'agent'
@@ -376,12 +393,16 @@ export interface ApiErrorBody {
 export class ApiError extends Error {
   readonly status: number
   readonly url: string
+  /** Parsed JSON error body when the server sent one — some endpoints attach
+   * structured fields beyond `error` (e.g. the SSH host-key `fingerprint`). */
+  readonly body?: unknown
 
-  constructor(status: number, message: string, url: string) {
+  constructor(status: number, message: string, url: string, body?: unknown) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.url = url
+    this.body = body
   }
 
   /** True when the session cookie is missing or expired. */
@@ -431,11 +452,13 @@ function buildUrl(path: string, query?: Record<string, QueryValue>): string {
 
 async function parseError(res: Response, url: string): Promise<ApiError> {
   let message = ''
+  let body: unknown
   try {
     const text = await res.text()
     if (text) {
       try {
         const parsed = JSON.parse(text) as Partial<ApiErrorBody>
+        body = parsed
         if (typeof parsed.error === 'string' && parsed.error) message = parsed.error
         else message = text
       } catch {
@@ -448,7 +471,7 @@ async function parseError(res: Response, url: string): Promise<ApiError> {
   if (!message) {
     message = res.status === 401 ? 'Not signed in.' : `Request failed with status ${res.status}.`
   }
-  return new ApiError(res.status, message, url)
+  return new ApiError(res.status, message, url, body)
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -643,6 +666,21 @@ export function cancelRun(id: ID): Promise<void> {
   return request<void>(`/api/runs/${encodeURIComponent(String(id))}/cancel`, { method: 'POST' })
 }
 
+export function getRunLog(id: ID, signal?: AbortSignal): Promise<RunLogResponse> {
+  return request<RunLogResponse>(`/api/runs/${encodeURIComponent(String(id))}/log`, { signal })
+}
+
+export function deleteRun(id: ID): Promise<void> {
+  return request<void>(`/api/runs/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
+}
+
+export function clearRuns(scope: ClearRunsScope, jobId?: ID): Promise<ClearRunsResult> {
+  return request<ClearRunsResult>('/api/runs/clear', {
+    method: 'POST',
+    body: { scope, ...(jobId === undefined ? {} : { jobId }) },
+  })
+}
+
 /* ---------------------------------------------------------------------------
  * Restore points & restore
  * ------------------------------------------------------------------------- */
@@ -691,6 +729,43 @@ export function createEnrollToken(): Promise<EnrollToken> {
 /* ---------------------------------------------------------------------------
  * Node helpers
  * ------------------------------------------------------------------------- */
+
+export interface HelperDeployRequest {
+  node: string
+  address: string
+  /** SSH port. Defaults to 22 on the server. */
+  port?: number
+  username: string
+  password: string
+  /** The origin the helper should enroll against — pass window.location.origin. */
+  serverUrl: string
+  /** Port the helper will listen on. Defaults to 8007 on the server. */
+  helperPort?: number
+  /**
+   * SHA256 host-key fingerprint the operator confirmed. Empty on the first
+   * attempt: the server refuses with 409 + the observed fingerprint, the UI
+   * shows it for confirmation, and the retry carries it.
+   */
+  hostKeyFingerprint?: string
+}
+
+export interface HelperDeployResult {
+  ok: boolean
+  /** Human-readable step lines from the deployment. */
+  log: string[]
+  helperOnline?: boolean
+}
+
+/** Fingerprint carried by the 409 "confirm the host key" deploy response. */
+export function deployFingerprintOf(err: unknown): string | null {
+  if (!isApiError(err) || err.status !== 409) return null
+  const body = err.body as { fingerprint?: unknown } | undefined
+  return typeof body?.fingerprint === 'string' && body.fingerprint ? body.fingerprint : null
+}
+
+export function deployHelper(req: HelperDeployRequest): Promise<HelperDeployResult> {
+  return request<HelperDeployResult>('/api/helpers/deploy', { method: 'POST', body: { ...req } })
+}
 
 export function listHelpers(): Promise<Helper[]> {
   return request<Helper[]>('/api/helpers')

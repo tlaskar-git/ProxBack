@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react'
 import type { FormEvent } from 'react'
-import { KeyRound, Plug, Plus, RefreshCw, Server, Trash2 } from 'lucide-react'
+import { KeyRound, Plug, Plus, RefreshCw, Server, ServerCog, Trash2 } from 'lucide-react'
 import {
   createHelperEnrollToken,
   createHost,
@@ -10,10 +10,12 @@ import {
   HELPER_DOWNLOAD,
   listHelpers,
   listHosts,
+  listVMs,
   testHost,
 } from '../api'
 import type { EnrollToken, Helper, Host, HostCreate, ID } from '../api'
 import { CopyField } from '../components/CopyField'
+import { DeployHelperModal } from '../components/DeployHelperModal'
 import { Modal } from '../components/Modal'
 import { useConfirm } from '../components/Confirm'
 import { useToast } from '../components/Toast'
@@ -404,7 +406,7 @@ export function HostsPage() {
         </div>
       )}
 
-      <HelpersSection />
+      <HelpersSection hosts={unique} />
 
       <AddHostModal
         open={addOpen}
@@ -431,17 +433,38 @@ function helperInstallCommand(origin: string, token: string): string {
   ].join(' && ')
 }
 
-function HelpersSection() {
+function HelpersSection({ hosts }: { hosts: Host[] }) {
   const toast = useToast()
   const confirm = useConfirm()
   const loader = useCallback(() => listHelpers(), [])
   const { data, loading, error, reload, refresh } = useAsync(loader)
   const helpers = data ?? []
 
+  const vmLoader = useCallback(() => listVMs(), [])
+  const { data: vmData } = useAsync(vmLoader)
+
   const [token, setToken] = useState<EnrollToken | null>(null)
   const [generating, setGenerating] = useState(false)
   const [deleting, setDeleting] = useState<string | null>(null)
+  const [deployOpen, setDeployOpen] = useState(false)
+  const [showManual, setShowManual] = useState(false)
   const origin = typeof window === 'undefined' ? '' : window.location.origin
+
+  // Nodes that still need a helper come first in the picker.
+  const covered = new Set(helpers.map((h) => h.node))
+  const allNodes = Array.from(new Set((vmData ?? []).map((vm) => vm.node))).sort()
+  const nodes = [...allNodes.filter((n) => !covered.has(n)), ...allNodes.filter((n) => covered.has(n))]
+  const missing = allNodes.filter((n) => !covered.has(n))
+
+  // Prefill the SSH address from the configured host URL when it is an IP/host.
+  const defaultAddress = (() => {
+    const raw = hosts[0]?.baseUrl ?? ''
+    try {
+      return raw ? new URL(raw).hostname : ''
+    } catch {
+      return ''
+    }
+  })()
 
   const onGenerate = async () => {
     setGenerating(true)
@@ -499,11 +522,10 @@ function HelpersSection() {
             <Button
               size="sm"
               variant="primary"
-              loading={generating}
-              icon={<KeyRound className="size-3.5" aria-hidden />}
-              onClick={() => void onGenerate()}
+              icon={<ServerCog className="size-3.5" aria-hidden />}
+              onClick={() => setDeployOpen(true)}
             >
-              {token ? 'Generate new token' : 'Deploy helper'}
+              Deploy helper
             </Button>
           </>
         }
@@ -561,32 +583,80 @@ function HelpersSection() {
             </tbody>
           </table>
         </div>
-      ) : !token ? (
+      ) : (
         <div className="px-5 py-5">
           <SectionNote>
-            No node helpers yet — agentless VM backups will fail with an “install the node helper”
-            error until each node runs one. Press Deploy helper, then paste the command into a root
-            shell on every Proxmox node.
+            No node helpers yet — agentless VM backups fail until each node has one. Press{' '}
+            <span className="font-medium text-slate-300">Deploy helper</span>: ProxBack installs it
+            over SSH for you.
           </SectionNote>
+        </div>
+      )}
+
+      {missing.length > 0 && helpers.length > 0 ? (
+        <div className="border-t border-slate-800 px-5 py-4">
+          <p className="text-xs text-amber-300">
+            {missing.length === 1
+              ? `Node ${missing[0]} has no helper — VMs on it cannot be image-backed-up yet.`
+              : `Nodes ${missing.join(', ')} have no helper — VMs on them cannot be image-backed-up yet.`}
+          </p>
         </div>
       ) : null}
 
-      {token ? (
-        <div className="space-y-4 border-t border-slate-800 px-5 py-5">
-          <CopyField
-            label="Enrollment token"
-            value={token.token}
-            copyLabel="Token"
-            caption={`Single use — expires ${formatRelative(token.expiresAt)}. Generate one token per node.`}
-          />
-          <CopyField
-            label="Proxmox node — root shell"
-            value={helperInstallCommand(origin, token.token)}
-            copyLabel="Helper install command"
-            caption="Downloads the helper, installs the systemd unit, and registers this node. Run on the node itself (needs vzdump and qmrestore)."
-          />
-        </div>
-      ) : null}
+      <div className="border-t border-slate-800 px-5 py-4">
+        {showManual ? (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs text-slate-500">
+                Manual install — for nodes where SSH from this server is not possible.
+              </p>
+              <Button size="sm" onClick={() => setShowManual(false)}>
+                Hide
+              </Button>
+            </div>
+            {token ? (
+              <>
+                <CopyField
+                  label="Enrollment token"
+                  value={token.token}
+                  copyLabel="Token"
+                  caption={`Single use — expires ${formatRelative(token.expiresAt)}. Generate one token per node.`}
+                />
+                <CopyField
+                  label="Proxmox node — root shell"
+                  value={helperInstallCommand(origin, token.token)}
+                  copyLabel="Helper install command"
+                  caption="Downloads the helper, installs the systemd unit, and registers this node."
+                />
+              </>
+            ) : null}
+            <Button
+              size="sm"
+              loading={generating}
+              icon={<KeyRound className="size-3.5" aria-hidden />}
+              onClick={() => void onGenerate()}
+            >
+              {token ? 'Generate another token' : 'Generate enrollment token'}
+            </Button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setShowManual(true)}
+            className="text-xs text-slate-500 transition-colors duration-150 hover:text-slate-300"
+          >
+            Prefer to install manually? Show the command and a token.
+          </button>
+        )}
+      </div>
+
+      <DeployHelperModal
+        open={deployOpen}
+        onClose={() => setDeployOpen(false)}
+        onDeployed={() => void refresh()}
+        nodes={nodes}
+        defaultAddress={defaultAddress}
+      />
     </Card>
   )
 }

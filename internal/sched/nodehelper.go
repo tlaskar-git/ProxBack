@@ -84,7 +84,7 @@ func (m *Manager) requireHelperForNode(ctx context.Context, node string) (*store
 // backupViaHelper streams a whole guest through the helper's vzdump export as a
 // single manifest stream. No PVE snapshot is created or deleted: vzdump owns
 // consistency (and, with --mode snapshot, its own snapshot lifecycle).
-func (m *Manager) backupViaHelper(ctx context.Context, sess *engine.Session, p vmPlan) ([]engine.DiskManifest, error) {
+func (m *Manager) backupViaHelper(ctx context.Context, runID string, sess *engine.Session, p vmPlan) ([]engine.DiskManifest, error) {
 	sess.SetStep(fmt.Sprintf("Backing up %s (vzdump stream)", p.name))
 	body, err := m.helperClient.Export(ctx, p.helper.Address, p.helper.Port, p.helper.AccessSecret, p.vmid)
 	if err != nil {
@@ -105,6 +105,7 @@ func (m *Manager) backupViaHelper(ctx context.Context, sess *engine.Session, p v
 	}
 	if closeErr != nil {
 		m.log.Warn("closing node helper export stream", "vm", p.vmid, "node", p.node, "error", closeErr)
+		m.logRun(ctx, runID, "warning: %s: closing the helper export stream failed: %v", p.name, closeErr)
 	}
 	if dm.SizeBytes == 0 {
 		return nil, fmt.Errorf("export %s via node helper on %s: vzdump produced no data", p.name, p.node)

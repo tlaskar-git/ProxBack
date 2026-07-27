@@ -57,6 +57,17 @@ export function formatDateTime(value: string | null | undefined): string {
   })
 }
 
+/** Local wall-clock time only, e.g. `14:05:07` — for log line stamps. */
+export function formatTime(value: string | null | undefined): string {
+  const date = toDate(value)
+  if (!date) return '—'
+  return date.toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
 /** Absolute local date only, e.g. `26 Jul 2026`. */
 export function formatDate(value: string | null | undefined): string {
   const date = toDate(value)

@@ -1,9 +1,10 @@
 import { useCallback, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Activity, Ban, RefreshCw } from 'lucide-react'
-import { cancelRun, errorMessage, listJobs, listRuns } from '../api'
-import type { Job, JobRun } from '../api'
+import { Activity, Ban, ChevronRight, Eraser, RefreshCw } from 'lucide-react'
+import { cancelRun, clearRuns, errorMessage, listJobs, listRuns } from '../api'
+import type { ClearRunsScope, ID, Job, JobRun } from '../api'
 import { useConfirm } from '../components/Confirm'
+import { RunDetailModal } from '../components/RunDetailModal'
 import { useToast } from '../components/Toast'
 import {
   Button,
@@ -40,7 +41,15 @@ const RUN_LIMIT = 100
  * height so a row never changes size as polling flips it between progress
  * bar, current step, and error text.
  */
-function RunRow({ run, onChanged }: { run: JobRun; onChanged: () => void }) {
+function RunRow({
+  run,
+  onChanged,
+  onOpen,
+}: {
+  run: JobRun
+  onChanged: () => void
+  onOpen: (id: ID) => void
+}) {
   const toast = useToast()
   const confirm = useConfirm()
   const [canceling, setCanceling] = useState(false)
@@ -73,7 +82,19 @@ function RunRow({ run, onChanged }: { run: JobRun; onChanged: () => void }) {
   }
 
   return (
-    <tr className="align-top transition-colors duration-150 hover:bg-slate-800/30">
+    <tr
+      className="cursor-pointer align-top transition-colors duration-150 hover:bg-slate-800/30"
+      onClick={() => onOpen(run.id)}
+      // Keyboard users get the same affordance as the pointer.
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onOpen(run.id)
+        }
+      }}
+      aria-label={`Open details for the ${run.jobName} run`}
+    >
       <td className="max-w-[20rem] px-5 py-3">
         <p className="truncate text-sm font-medium text-slate-100">{run.jobName}</p>
         <div className="mt-1.5 flex h-4 items-center gap-2">
@@ -116,7 +137,7 @@ function RunRow({ run, onChanged }: { run: JobRun; onChanged: () => void }) {
       <td className="px-5 py-3 text-right whitespace-nowrap">
         <Num className="text-sm text-emerald-400">{formatRatio(run.dedupRatio)}</Num>
       </td>
-      <td className="w-14 px-5 py-3 text-right">
+      <td className="w-14 px-5 py-3 text-right" onClick={(event) => event.stopPropagation()}>
         {running ? (
           <IconButton
             aria-label={`Cancel the run of ${run.jobName}`}
@@ -126,13 +147,23 @@ function RunRow({ run, onChanged }: { run: JobRun; onChanged: () => void }) {
           >
             <Ban className="size-4" aria-hidden />
           </IconButton>
-        ) : null}
+        ) : (
+          <ChevronRight className="ml-auto size-4 text-slate-600" aria-hidden />
+        )}
       </td>
     </tr>
   )
 }
 
-function RunTable({ runs, onChanged }: { runs: JobRun[]; onChanged: () => void }) {
+function RunTable({
+  runs,
+  onChanged,
+  onOpen,
+}: {
+  runs: JobRun[]
+  onChanged: () => void
+  onOpen: (id: ID) => void
+}) {
   return (
     <div className="overflow-x-auto">
       <table className="w-full min-w-[58rem] text-sm">
@@ -166,7 +197,7 @@ function RunTable({ runs, onChanged }: { runs: JobRun[]; onChanged: () => void }
         </thead>
         <tbody className="divide-y divide-slate-800/70">
           {runs.map((run) => (
-            <RunRow key={String(run.id)} run={run} onChanged={onChanged} />
+            <RunRow key={String(run.id)} run={run} onChanged={onChanged} onOpen={onOpen} />
           ))}
         </tbody>
       </table>
@@ -187,10 +218,43 @@ export function MonitorPage() {
   }, [jobIdParam])
 
   const { data, loading, error, reload, refresh } = useAsync(loader)
+  const toast = useToast()
+  const confirm = useConfirm()
+  const [openRun, setOpenRun] = useState<ID | null>(null)
+  const [clearing, setClearing] = useState(false)
 
   const runs = data?.runs ?? []
   const jobs = data?.jobs ?? []
   const anyRunning = runs.some((run) => run.status === 'running')
+  const finishedCount = runs.filter((run) => run.status !== 'running').length
+
+  const onClear = async (scope: ClearRunsScope) => {
+    const failedOnly = scope === 'failed'
+    const ok = await confirm({
+      title: failedOnly ? 'Clear failed runs' : 'Clear finished runs',
+      message: (
+        <>
+          Remove {failedOnly ? 'every failed run' : 'every finished run'}
+          {jobIdParam === 'all' ? '' : ' of this job'} from the history, along with their activity
+          logs? Restore points and backup data are not affected — running runs are left alone.
+        </>
+      ),
+      confirmLabel: failedOnly ? 'Clear failed' : 'Clear finished',
+    })
+    if (!ok) return
+    setClearing(true)
+    try {
+      const result = await clearRuns(scope, jobIdParam === 'all' ? undefined : jobIdParam)
+      toast.success(
+        result.deleted === 1 ? '1 run removed from history.' : `${result.deleted} runs removed from history.`,
+      )
+      await reload()
+    } catch (err) {
+      toast.error('Could not clear run history', errorMessage(err))
+    } finally {
+      setClearing(false)
+    }
+  }
 
   // Live progress: poll every 2 s while at least one run is in flight.
   usePolling(() => void refresh(), 2000, anyRunning)
@@ -229,6 +293,17 @@ export function MonitorPage() {
             >
               Refresh
             </Button>
+            {finishedCount > 0 ? (
+              <Button
+                variant="dangerQuiet"
+                icon={<Eraser className="size-4" aria-hidden />}
+                loading={clearing}
+                onClick={() => void onClear('finished')}
+                title="Remove finished runs from the history"
+              >
+                Clear history
+              </Button>
+            ) : null}
           </>
         }
       />
@@ -263,9 +338,15 @@ export function MonitorPage() {
         />
       ) : (
         <Card>
-          <RunTable runs={runs} onChanged={() => void refresh()} />
+          <RunTable runs={runs} onChanged={() => void refresh()} onOpen={setOpenRun} />
         </Card>
       )}
+
+      <RunDetailModal
+        runId={openRun}
+        onClose={() => setOpenRun(null)}
+        onChanged={() => void refresh()}
+      />
     </>
   )
 }

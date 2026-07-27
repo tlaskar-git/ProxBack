@@ -28,7 +28,29 @@ type ChunkIndex interface {
 	HasChunk(ctx context.Context, targetID, sha string) (bool, error)
 	AddChunk(ctx context.Context, targetID, sha string, size int64) error
 	DeleteChunk(ctx context.Context, targetID, sha string) error
-	ChunkShas(ctx context.Context, targetID string) ([]string, error)
+	// ChunkAddedAt returns every indexed chunk of a target with the time it was
+	// recorded, which is what lets garbage collection spare recent uploads.
+	ChunkAddedAt(ctx context.Context, targetID string) (map[string]time.Time, error)
+}
+
+// DefaultGCGrace is how long a chunk is protected from orphan collection after
+// it was uploaded. An interrupted backup uploads chunks but never writes the
+// manifest that references them, so without the grace window the next GC pass
+// would delete exactly the work the retry wants to deduplicate against.
+const DefaultGCGrace = 24 * time.Hour
+
+// Options tunes the engine. The zero value is the shipped default: 4 concurrent
+// chunk uploads, zstd chunk compression and a 24 h orphan-collection grace.
+type Options struct {
+	// UploadConcurrency is the number of chunk uploads kept in flight per stream
+	// (1–16, 0 selects DefaultUploadConcurrency).
+	UploadConcurrency int
+	// Compression is CompressionZstd (also the zero value's meaning) or
+	// CompressionOff.
+	Compression string
+	// GCGrace overrides DefaultGCGrace. A negative value disables the grace
+	// window, which is only sensible in tests.
+	GCGrace time.Duration
 }
 
 // Engine is bound to exactly one backup target.
@@ -37,15 +59,70 @@ type Engine struct {
 	targetID string
 	idx      ChunkIndex
 	log      *slog.Logger
+
+	workers  int
+	compress bool
+	gcGrace  time.Duration
+
+	// inflight coalesces concurrent stores of the same chunk. Without it two
+	// workers holding identical chunks would both miss the index and both upload,
+	// so a zero-filled disk would report different byte counts depending on the
+	// worker count.
+	inflightMu sync.Mutex
+	inflight   map[string]*chunkStore
 }
 
-// New builds an engine for one target.
+// chunkStore is one in-progress upload other workers can wait on.
+type chunkStore struct {
+	done chan struct{}
+	err  error
+}
+
+// New builds an engine for one target with the default options.
 func New(s3c *s3target.Client, targetID string, idx ChunkIndex, log *slog.Logger) *Engine {
+	return NewWithOptions(s3c, targetID, idx, log, Options{})
+}
+
+// NewWithOptions builds an engine for one target, normalising out-of-range
+// options to their defaults so a bad setting can never break a backup.
+func NewWithOptions(s3c *s3target.Client, targetID string, idx ChunkIndex, log *slog.Logger, opts Options) *Engine {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Engine{s3: s3c, targetID: targetID, idx: idx, log: log}
+	workers := opts.UploadConcurrency
+	if workers < MinUploadConcurrency {
+		workers = DefaultUploadConcurrency
+	}
+	if workers > MaxUploadConcurrency {
+		workers = MaxUploadConcurrency
+	}
+	grace := opts.GCGrace
+	switch {
+	case grace == 0:
+		grace = DefaultGCGrace
+	case grace < 0:
+		grace = 0
+	}
+	return &Engine{
+		s3:       s3c,
+		targetID: targetID,
+		idx:      idx,
+		log:      log,
+		workers:  workers,
+		compress: opts.Compression != CompressionOff,
+		gcGrace:  grace,
+		inflight: map[string]*chunkStore{},
+	}
 }
+
+// UploadConcurrency reports the engine's worker count.
+func (e *Engine) UploadConcurrency() int { return e.workers }
+
+// CompressionEnabled reports whether chunks are stored zstd compressed.
+func (e *Engine) CompressionEnabled() bool { return e.compress }
+
+// GCGrace reports how long a chunk is protected from orphan collection.
+func (e *Engine) GCGrace() time.Duration { return e.gcGrace }
 
 // TargetID returns the target this engine writes to.
 func (e *Engine) TargetID() string { return e.targetID }
@@ -173,36 +250,6 @@ func (s *Session) record(size, uploaded int64) {
 // RecordChunk accounts for a chunk that was pushed in by an agent.
 func (s *Session) RecordChunk(size, uploaded int64) { s.record(size, uploaded) }
 
-// BackupStream chunks r, uploading only chunks not already present on the target,
-// and returns the resulting disk manifest.
-func (s *Session) BackupStream(ctx context.Context, name string, r io.Reader) (DiskManifest, error) {
-	dm := DiskManifest{Name: name, Chunks: []Chunk{}}
-	buf := make([]byte, ChunkSize)
-	for {
-		if err := ctx.Err(); err != nil {
-			return dm, err
-		}
-		n, readErr := io.ReadFull(r, buf)
-		if n > 0 {
-			sha, uploaded, err := s.e.StoreChunk(ctx, buf[:n])
-			if err != nil {
-				return dm, err
-			}
-			dm.Chunks = append(dm.Chunks, Chunk{Sha256: sha, Size: int64(n)})
-			dm.SizeBytes += int64(n)
-			s.record(int64(n), uploaded)
-		}
-		switch {
-		case readErr == nil:
-			continue
-		case errors.Is(readErr, io.EOF), errors.Is(readErr, io.ErrUnexpectedEOF):
-			return dm, nil
-		default:
-			return dm, fmt.Errorf("engine: read %q: %w", name, readErr)
-		}
-	}
-}
-
 // StoreChunk hashes data, uploads it if the target does not have it yet, and
 // returns the chunk hash plus the number of bytes actually uploaded.
 func (e *Engine) StoreChunk(ctx context.Context, data []byte) (sha string, uploaded int64, err error) {
@@ -223,7 +270,47 @@ func (e *Engine) StoreChunkVerified(ctx context.Context, sha string, data []byte
 	return e.storeChunkWithHash(ctx, got, data)
 }
 
+// storeChunkWithHash stores one chunk, coalescing concurrent attempts at the
+// same content so the byte accounting does not depend on the worker count: the
+// first caller uploads, the others wait for it and are credited as deduplicated,
+// exactly as they would have been by a serial pipeline.
 func (e *Engine) storeChunkWithHash(ctx context.Context, sha string, data []byte) (int64, error) {
+	for {
+		e.inflightMu.Lock()
+		if pending, ok := e.inflight[sha]; ok {
+			e.inflightMu.Unlock()
+			select {
+			case <-pending.done:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			if pending.err != nil {
+				// The upload we were waiting on failed; do the work ourselves
+				// rather than reporting a chunk that is not there.
+				continue
+			}
+			return 0, nil
+		}
+		pending := &chunkStore{done: make(chan struct{})}
+		e.inflight[sha] = pending
+		e.inflightMu.Unlock()
+
+		uploaded, err := e.putChunk(ctx, sha, data)
+
+		e.inflightMu.Lock()
+		delete(e.inflight, sha)
+		e.inflightMu.Unlock()
+		pending.err = err
+		close(pending.done)
+		return uploaded, err
+	}
+}
+
+// putChunk performs the actual dedup check and upload of one chunk. The chunk's
+// key and index row stay keyed on the hash of the RAW bytes; only the object's
+// payload is compressed, so existing chunks, existing manifests and the dedup
+// index keep working whatever the compression setting is.
+func (e *Engine) putChunk(ctx context.Context, sha string, data []byte) (int64, error) {
 	has, err := e.idx.HasChunk(ctx, e.targetID, sha)
 	if err != nil {
 		return 0, fmt.Errorf("engine: chunk index: %w", err)
@@ -241,13 +328,24 @@ func (e *Engine) storeChunkWithHash(ctx context.Context, sha string, data []byte
 		}
 		return 0, nil
 	}
-	if err := e.s3.Put(ctx, ChunkKey(sha), data); err != nil {
+	body := data
+	if e.compress {
+		body = compressChunk(data)
+	}
+	if err := waitUpload(ctx, len(body)); err != nil {
 		return 0, err
 	}
+	if err := e.s3.Put(ctx, ChunkKey(sha), body); err != nil {
+		return 0, err
+	}
+	// The index records the raw chunk size: it is the dedup index of the stream's
+	// content, not a bucket inventory.
 	if err := e.idx.AddChunk(ctx, e.targetID, sha, int64(len(data))); err != nil {
 		return 0, fmt.Errorf("engine: chunk index: %w", err)
 	}
-	return int64(len(data)), nil
+	// Uploaded bytes are the bytes actually PUT, so a run's figure reflects real
+	// bandwidth; processed bytes stay raw.
+	return int64(len(body)), nil
 }
 
 // HasChunk reports whether a chunk is present on the target, consulting the
@@ -265,6 +363,10 @@ func (e *Engine) HasChunk(ctx context.Context, sha string) (bool, error) {
 		return false, err
 	}
 	if exists {
+		// Recovering an index row from the object alone: the raw size is not
+		// knowable without downloading the chunk, so a compressed chunk is
+		// indexed with its stored size. Dedup only cares about the hash; the size
+		// is a reporting figure.
 		if err := e.idx.AddChunk(ctx, e.targetID, sha, size); err != nil {
 			return false, fmt.Errorf("engine: chunk index: %w", err)
 		}
@@ -322,10 +424,14 @@ func (s *Session) RestoreDisk(ctx context.Context, dm DiskManifest, w io.Writer)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		data, err := s.e.s3.GetBytes(ctx, ChunkKey(ch.Sha256))
+		stored, err := s.e.s3.GetBytes(ctx, ChunkKey(ch.Sha256))
 		if err != nil {
 			return fmt.Errorf("engine: restore %s: %w", dm.Name, err)
 		}
+		// Chunks may be stored compressed or raw, in any mix within one manifest
+		// (the setting can change between runs). decodeChunk sniffs which; the
+		// SHA-256 check below is the arbiter either way.
+		data := decodeChunk(stored)
 		sum := sha256.Sum256(data)
 		if got := hex.EncodeToString(sum[:]); got != ch.Sha256 {
 			return fmt.Errorf("%w: %s expected %s got %s", ErrHashMismatch, dm.Name, ch.Sha256, got)
@@ -372,6 +478,11 @@ type GCResult struct {
 	ChunksDeleted    int
 	BytesFreed       int64
 	IndexRowsDropped int
+	// ChunksSkippedRecent counts unreferenced chunks left in place because they
+	// are younger than the grace window — most likely the uploads of a backup
+	// that was interrupted before it could write its manifest.
+	ChunksSkippedRecent int
+	BytesSkippedRecent  int64
 }
 
 // GC deletes chunks on the target that no manifest references any more and
@@ -409,12 +520,27 @@ func (e *Engine) GC(ctx context.Context) (GCResult, error) {
 	if err != nil {
 		return res, err
 	}
+	indexed, err := e.idx.ChunkAddedAt(ctx, e.targetID)
+	if err != nil {
+		return res, fmt.Errorf("engine: gc chunk index: %w", err)
+	}
+	now := time.Now()
 	present := make(map[string]struct{}, len(chunks))
 	for _, o := range chunks {
 		res.ChunksScanned++
 		sha := strings.TrimPrefix(o.Key, ChunkPrefix)
 		present[sha] = struct{}{}
 		if _, ok := referenced[sha]; ok {
+			continue
+		}
+		// A run that was interrupted (cancelled, crashed, server restarted for an
+		// update) has uploaded chunks that no manifest references yet. Deleting
+		// them would make the retry re-upload everything from scratch, so any
+		// chunk younger than the grace window is left alone; it is still indexed,
+		// so the retry deduplicates against it.
+		if age, ok := e.chunkAge(now, sha, indexed, o); ok && age < e.gcGrace {
+			res.ChunksSkippedRecent++
+			res.BytesSkippedRecent += o.Size
 			continue
 		}
 		if err := e.s3.Delete(ctx, o.Key); err != nil {
@@ -429,12 +555,9 @@ func (e *Engine) GC(ctx context.Context) (GCResult, error) {
 	// Reconcile the other direction: index rows whose chunk is gone from the
 	// bucket (lifecycle rules, out-of-band deletion) would make dedup skip
 	// uploads forever and produce unrestorable backups. Drop them so the next
-	// run re-uploads.
-	indexed, err := e.idx.ChunkShas(ctx, e.targetID)
-	if err != nil {
-		return res, fmt.Errorf("engine: gc chunk index: %w", err)
-	}
-	for _, sha := range indexed {
+	// run re-uploads. Chunks spared by the grace window are present, so they keep
+	// their rows.
+	for sha := range indexed {
 		if _, ok := present[sha]; ok {
 			continue
 		}
@@ -446,12 +569,35 @@ func (e *Engine) GC(ctx context.Context) (GCResult, error) {
 	e.log.Info("garbage collection finished", "target", e.targetID,
 		"manifests", res.ManifestsScanned, "chunksScanned", res.ChunksScanned,
 		"chunksDeleted", res.ChunksDeleted, "bytesFreed", res.BytesFreed,
-		"indexRowsDropped", res.IndexRowsDropped)
+		"indexRowsDropped", res.IndexRowsDropped,
+		"chunksSkippedRecent", res.ChunksSkippedRecent,
+		"bytesSkippedRecent", res.BytesSkippedRecent)
 	return res, nil
 }
 
+// chunkAge reports how long ago a chunk was stored, and whether that could be
+// established at all. The chunk index is the source of truth — it is written the
+// moment a PUT succeeds — and the object's LastModified is only a fallback for
+// chunks with no index row, because S3 implementations vary in how (and whether)
+// they report it.
+func (e *Engine) chunkAge(now time.Time, sha string, indexed map[string]time.Time, o s3target.Object) (time.Duration, bool) {
+	if e.gcGrace <= 0 {
+		return 0, false
+	}
+	if ts, ok := indexed[sha]; ok && !ts.IsZero() {
+		return now.Sub(ts), true
+	}
+	if !o.LastModified.IsZero() {
+		return now.Sub(o.LastModified), true
+	}
+	return 0, false
+}
+
 // SyncChunkIndex rebuilds the per-target chunk index from the objects present on
-// the target. It is used after an index loss.
+// the target. It is used after an index loss. As with the HEAD fallback, rebuilt
+// rows carry the stored object size rather than the raw chunk size, and are
+// stamped with the time of the rebuild — which also gives them one grace window
+// of protection from collection.
 func (e *Engine) SyncChunkIndex(ctx context.Context) (int, error) {
 	objs, err := e.s3.List(ctx, ChunkPrefix)
 	if err != nil {

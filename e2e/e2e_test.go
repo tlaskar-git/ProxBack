@@ -30,6 +30,7 @@ import (
 	"proxback/internal/pvesim"
 	"proxback/internal/s3sim"
 	"proxback/internal/s3target"
+	"proxback/internal/sched"
 )
 
 // ---------------------------------------------------------------- API shapes
@@ -183,10 +184,13 @@ type apiDashboard struct {
 }
 
 type apiSettings struct {
-	ServerName  string `json:"serverName"`
-	Concurrency int    `json:"concurrency"`
-	WebhookURL  string `json:"webhookUrl"`
-	NotifyOn    string `json:"notifyOn"`
+	ServerName        string `json:"serverName"`
+	Concurrency       int    `json:"concurrency"`
+	WebhookURL        string `json:"webhookUrl"`
+	NotifyOn          string `json:"notifyOn"`
+	UploadConcurrency int    `json:"uploadConcurrency"`
+	Compression       string `json:"compression"`
+	UploadLimitMbps   int    `json:"uploadLimitMbps"`
 }
 
 // webhookPayload mirrors the notification body in the contract.
@@ -717,6 +721,11 @@ const (
 )
 
 func TestEndToEnd(t *testing.T) {
+	// Orphan chunk collection spares chunks younger than a day so an interrupted
+	// backup stays resumable. Every chunk in a test run is seconds old, so the
+	// window is switched off here and the suite keeps asserting on collection;
+	// the window itself is covered in internal/engine and internal/sched.
+	t.Setenv(sched.GCGraceEnv, "0")
 	h := newHarness(t)
 
 	// ---- Step 9a: unauthenticated access is rejected -----------------------
@@ -1276,8 +1285,17 @@ func TestEndToEnd(t *testing.T) {
 		if full.BytesProcessed < 12*mib {
 			t.Fatalf("agent backup processed %d bytes, want >= %d", full.BytesProcessed, 12*mib)
 		}
-		if full.BytesUploaded != full.BytesProcessed {
-			t.Fatalf("first agent backup uploaded %d of %d bytes", full.BytesUploaded, full.BytesProcessed)
+		// Nothing can deduplicate on a first backup, so the uploaded figure is the
+		// processed one minus whatever zstd saved. The payload is pseudo-random and
+		// therefore incompressible apart from the tar's zero padding, so the two
+		// stay within a percent of each other.
+		if full.BytesUploaded > full.BytesProcessed {
+			t.Fatalf("first agent backup uploaded %d bytes for %d processed",
+				full.BytesUploaded, full.BytesProcessed)
+		}
+		if full.BytesUploaded < full.BytesProcessed/100*99 {
+			t.Fatalf("first agent backup uploaded only %d of %d bytes; nothing should have deduplicated",
+				full.BytesUploaded, full.BytesProcessed)
 		}
 
 		var backups []apiBackup
@@ -1367,6 +1385,38 @@ func TestEndToEnd(t *testing.T) {
 		if settings.Concurrency != 3 {
 			t.Fatalf("settings did not persist: %+v", settings)
 		}
+
+		// v0.3.2 throughput settings: present with their defaults on a database
+		// that has never stored them, validated on PUT, and safe to change
+		// between runs.
+		if settings.UploadConcurrency != 4 || settings.Compression != "zstd" || settings.UploadLimitMbps != 0 {
+			t.Fatalf("throughput defaults = %+v, want 4 / zstd / 0", settings)
+		}
+		h.ok(http.MethodPut, "/api/settings", map[string]any{
+			"uploadConcurrency": 8, "compression": "off", "uploadLimitMbps": 500,
+		}, &settings)
+		if settings.UploadConcurrency != 8 || settings.Compression != "off" || settings.UploadLimitMbps != 500 {
+			t.Fatalf("updated throughput settings = %+v", settings)
+		}
+		for _, bad := range []map[string]any{
+			{"uploadConcurrency": 0},
+			{"uploadConcurrency": 17},
+			{"uploadLimitMbps": -1},
+			{"uploadLimitMbps": 10001},
+			{"compression": "gzip"},
+		} {
+			if code, body := h.do(http.MethodPut, "/api/settings", bad); code != http.StatusBadRequest {
+				t.Fatalf("PUT settings %v = %d (%s), want 400", bad, code, body)
+			}
+		}
+		h.ok(http.MethodGet, "/api/settings", nil, &settings)
+		if settings.UploadConcurrency != 8 || settings.Compression != "off" || settings.UploadLimitMbps != 500 {
+			t.Fatalf("a rejected PUT changed the stored settings: %+v", settings)
+		}
+		// Back to the shipped defaults for the runs that follow.
+		h.ok(http.MethodPut, "/api/settings", map[string]any{
+			"uploadConcurrency": 4, "compression": "zstd", "uploadLimitMbps": 0,
+		}, &settings)
 	})
 
 	// ---- Tag filtered jobs: dynamic membership from the cached inventory -----
@@ -2174,6 +2224,99 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("clearing an empty history deleted %d runs", cleared.Deleted)
 		}
 	})
+
+	// ---- v0.3.2: compressed, concurrent uploads still restore byte for byte --
+	t.Run("25-compressed-parallel-backup-and-restore", func(t *testing.T) {
+		// The simulator's disks are pseudo-random and therefore incompressible, so
+		// the compressible source is a real agent payload: log-like text files, the
+		// kind of content a file backup is mostly made of.
+		compSrc := filepath.Join(t.TempDir(), "compressible")
+		compDest := filepath.Join(t.TempDir(), "compressible-restored")
+		writeCompressibleTree(t, compSrc)
+
+		var settings apiSettings
+		h.ok(http.MethodPut, "/api/settings", map[string]any{
+			"compression": "zstd", "uploadConcurrency": 4, "uploadLimitMbps": 0,
+		}, &settings)
+		if settings.Compression != "zstd" || settings.UploadConcurrency != 4 {
+			t.Fatalf("settings for the compressed run = %+v", settings)
+		}
+
+		var job apiJob
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name":      "compressible-files",
+			"kind":      "agent",
+			"targetId":  agtTarget.ID,
+			"schedule":  "manual",
+			"retention": 2,
+			"enabled":   true,
+			"sources":   []map[string]any{{"agentId": agentInfo.ID, "paths": []string{compSrc}}},
+		}, &job)
+
+		run := h.runJob(job.ID)
+		if run.Status != "success" {
+			t.Fatalf("compressed backup %q: %s", run.Status, run.Error)
+		}
+		if run.BytesProcessed < 16*mib {
+			t.Fatalf("compressed backup processed %d bytes, want the whole tree", run.BytesProcessed)
+		}
+		// The whole point of compression: fewer bytes on the wire than off the
+		// disk. Nothing deduplicates here — this content has never been backed up.
+		if run.BytesUploaded >= run.BytesProcessed {
+			t.Fatalf("compressed backup uploaded %d bytes for %d processed; compression did nothing",
+				run.BytesUploaded, run.BytesProcessed)
+		}
+		if run.BytesUploaded > run.BytesProcessed/2 {
+			t.Fatalf("compressed backup uploaded %d of %d bytes; expected compressible content to shrink far more",
+				run.BytesUploaded, run.BytesProcessed)
+		}
+		t.Logf("compressed run: %d bytes processed, %d uploaded (%.1f%% of the wire saved)",
+			run.BytesProcessed, run.BytesUploaded,
+			100*(1-float64(run.BytesUploaded)/float64(run.BytesProcessed)))
+
+		// The restore point is a normal one, and it restores byte-identically.
+		var backups []apiBackup
+		h.ok(http.MethodGet, "/api/backups?sourceKind=agent&sourceId="+agentInfo.ID, nil, &backups)
+		if len(backups) == 0 {
+			t.Fatal("the compressed run produced no restore point")
+		}
+		point := backups[0]
+		if point.SizeBytes != run.BytesProcessed {
+			t.Fatalf("restore point holds %d bytes, the run processed %d", point.SizeBytes, run.BytesProcessed)
+		}
+
+		var started struct {
+			RunID string `json:"runId"`
+		}
+		h.ok(http.MethodPost, "/api/restores", map[string]any{
+			"backupId": point.ID,
+			"agent":    map[string]any{"agentId": agentInfo.ID, "destPath": compDest},
+		}, &started)
+		restore := h.waitRun(started.RunID, 90*time.Second)
+		if restore.Status != "success" {
+			t.Fatalf("restore of a compressed backup %q: %s", restore.Status, restore.Error)
+		}
+		diffTrees(t, compSrc, filepath.Join(compDest, filepath.Base(compSrc)))
+
+		// Verification decompresses through the same path.
+		verifyRun := h.verify(point.ID)
+		if v := h.waitRun(verifyRun, 90*time.Second); v.Status != "success" {
+			t.Fatalf("verify of a compressed backup %q: %s", v.Status, v.Error)
+		}
+
+		// Re-running with compression switched off must still deduplicate against
+		// the compressed chunks: identity is the raw chunk, not its stored form.
+		h.ok(http.MethodPut, "/api/settings", map[string]any{"compression": "off"}, &settings)
+		again := h.runJob(job.ID)
+		if again.Status != "success" {
+			t.Fatalf("re-run with compression off %q: %s", again.Status, again.Error)
+		}
+		if again.BytesUploaded != 0 {
+			t.Fatalf("turning compression off re-uploaded %d bytes; dedup must not depend on it",
+				again.BytesUploaded)
+		}
+		h.ok(http.MethodPut, "/api/settings", map[string]any{"compression": "zstd"}, &settings)
+	})
 }
 
 // ---------------------------------------------------------------- test data
@@ -2226,6 +2369,35 @@ func writeTestTree(t *testing.T, dir string) {
 	write("aaa-big.bin", pseudoBytes(12*mib, 1234))
 	write("sub/notes.txt", []byte("ProxBack agent backup test tree\n"))
 	write("zzz-tail.txt", pseudoBytes(4096, 99))
+}
+
+// writeCompressibleTree writes a payload that behaves like real files rather
+// than like the simulator's pseudo-random disks: structured, repetitive text
+// that zstd can genuinely shrink, so the compression assertions are about
+// compression and not about luck.
+func writeCompressibleTree(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "logs"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Every line is distinct and carries a pseudo-random field, so the content is
+	// compressible the way real logs are rather than degenerately repetitive.
+	write := func(rel string, size int, seed uint64) {
+		var b strings.Builder
+		b.Grow(size + 128)
+		x := seed
+		for i := 0; b.Len() < size; i++ {
+			x = x*6364136223846793005 + 1442695040888963407
+			fmt.Fprintf(&b, "2026-07-27T%02d:%02d:%02d.%03dZ level=info component=proxback run=%s msg=\"chunk stored\" seq=%d sha=%016x size=4194304\n",
+				i%24, i%60, (i*7)%60, i%1000, rel, i, x>>3)
+		}
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(b.String())[:size], 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	write("logs/server.log", 9*mib, 11)
+	write("logs/agent.log", 7*mib, 22)
+	write("logs/tail.log", 613*1024, 33)
 }
 
 // mutateTestTree rewrites the last file in tar order, keeping its size identical

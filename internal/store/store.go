@@ -223,6 +223,7 @@ CREATE TABLE IF NOT EXISTS chunk_index (
 	target_id TEXT NOT NULL,
 	sha256    TEXT NOT NULL,
 	size      INTEGER NOT NULL,
+	added_at  TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (target_id, sha256)
 );
 
@@ -243,6 +244,9 @@ var addedColumns = []struct{ table, column, definition string }{
 	// Enrollment tokens are shared by agents and node helpers; tokens written
 	// before helpers existed are agent tokens.
 	{"enroll_tokens", "purpose", "TEXT NOT NULL DEFAULT 'agent'"},
+	// When a chunk was uploaded. Orphan collection uses it to spare recent
+	// uploads, which is what makes an interrupted backup resumable.
+	{"chunk_index", "added_at", "TEXT NOT NULL DEFAULT ''"},
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -253,6 +257,80 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err := s.addColumn(ctx, c.table, c.column, c.definition); err != nil {
 			return err
 		}
+	}
+	if err := s.backfillChunkAddedAt(ctx); err != nil {
+		return err
+	}
+	return s.normalizeTimestamps(ctx)
+}
+
+// sortedTimeColumns are the TEXT timestamp columns SQLite orders or compares as
+// strings. Rows written by earlier releases used a variable width fraction, so
+// they are rewritten in the canonical layout on open; without that, two rows
+// written in the same second can still compare in the wrong order.
+var sortedTimeColumns = []struct{ table, column string }{
+	{"backups", "created_at"},
+	{"job_runs", "started_at"},
+	{"job_runs", "finished_at"},
+	{"helpers", "registered_at"},
+	{"enroll_tokens", "expires_at"},
+	{"sessions", "expires_at"},
+}
+
+func (s *Store) normalizeTimestamps(ctx context.Context) error {
+	for _, c := range sortedTimeColumns {
+		type fix struct {
+			rowid int64
+			value string
+		}
+		// The whole set is collected before anything is written: the pool is
+		// limited to a single connection, so updating while a query is still open
+		// would deadlock.
+		var fixes []fix
+		rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
+			`SELECT rowid, %s FROM %s WHERE %s IS NOT NULL AND %s <> ''`, c.column, c.table, c.column, c.column))
+		if err != nil {
+			return fmt.Errorf("normalize %s.%s: %w", c.table, c.column, err)
+		}
+		for rows.Next() {
+			var id int64
+			var raw string
+			if err := rows.Scan(&id, &raw); err != nil {
+				rows.Close()
+				return fmt.Errorf("normalize %s.%s: %w", c.table, c.column, err)
+			}
+			t := parseTime(raw)
+			if t.IsZero() {
+				continue // not a timestamp we wrote; leave it alone
+			}
+			if canonical := fmtTime(t); canonical != raw {
+				fixes = append(fixes, fix{rowid: id, value: canonical})
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return fmt.Errorf("normalize %s.%s: %w", c.table, c.column, err)
+		}
+		for _, f := range fixes {
+			if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
+				`UPDATE %s SET %s = ? WHERE rowid = ?`, c.table, c.column), f.value, f.rowid); err != nil {
+				return fmt.Errorf("normalize %s.%s: %w", c.table, c.column, err)
+			}
+		}
+	}
+	return nil
+}
+
+// backfillChunkAddedAt stamps chunk rows written before the column existed with
+// the time of this migration. That is deliberately conservative: those chunks are
+// treated as freshly uploaded, so they enjoy one grace window of protection from
+// orphan collection — far cheaper than deleting a chunk that is still wanted.
+func (s *Store) backfillChunkAddedAt(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE chunk_index SET added_at = ? WHERE added_at = '' OR added_at IS NULL`,
+		fmtTime(Now())); err != nil {
+		return fmt.Errorf("backfill chunk_index.added_at: %w", err)
 	}
 	return nil
 }
@@ -347,7 +425,16 @@ func (s *Store) Decrypt(sealed []byte) (string, error) {
 // Now returns the current time normalised the way the store persists it.
 func Now() time.Time { return time.Now().UTC().Truncate(time.Millisecond) }
 
-func fmtTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+// timeLayout is RFC3339 with a fixed nine digit fraction. The fixed width is the
+// whole point: these columns are TEXT and SQLite orders and compares them as
+// strings, while time.RFC3339Nano drops trailing zeros. With that layout
+// "…:00.9Z" sorts after "…:00.85Z", and a restore point created exactly on a
+// second ("…:00Z") sorts as the newest one there is — which silently breaks the
+// backup chain's parent, "latest restore point" lookups and retention's idea of
+// which points to prune.
+const timeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+func fmtTime(t time.Time) string { return t.UTC().Format(timeLayout) }
 
 func fmtTimePtr(t *time.Time) any {
 	if t == nil {

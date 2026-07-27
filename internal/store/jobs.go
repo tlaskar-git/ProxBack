@@ -250,6 +250,17 @@ func (s *Store) HasRunningRun(ctx context.Context, jobID string) (bool, error) {
 	return n > 0, nil
 }
 
+// CountRunningRuns returns how many runs are in flight across all jobs.
+func (s *Store) CountRunningRuns(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM job_runs WHERE status = ?`, RunRunning).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count running runs: %w", err)
+	}
+	return n, nil
+}
+
 // RunCountsSince returns per-status run counts for runs started at or after since.
 func (s *Store) RunCountsSince(ctx context.Context, since time.Time) (map[string]int, error) {
 	rows, err := s.db.QueryContext(ctx,

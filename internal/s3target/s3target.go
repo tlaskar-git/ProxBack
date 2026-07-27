@@ -38,12 +38,56 @@ type Client struct {
 	bucket string
 }
 
+// NormalizeEndpoint makes a pasted endpoint usable: trims whitespace and a
+// trailing slash, and defaults the scheme to https:// when it is missing
+// (users routinely paste "s3.eu-central-003.backblazeb2.com").
+func NormalizeEndpoint(endpoint string) string {
+	e := strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if e == "" {
+		return ""
+	}
+	if !strings.Contains(e, "://") {
+		e = "https://" + e
+	}
+	return e
+}
+
+// regionFromEndpoint extracts the signing region embedded in well-known
+// endpoint hostnames (Backblaze B2 "s3.<region>.backblazeb2.com", AWS
+// "s3.<region>.amazonaws.com"). Empty when the host encodes no region.
+func regionFromEndpoint(endpoint string) string {
+	host := endpoint
+	if i := strings.Index(host, "://"); i >= 0 {
+		host = host[i+3:]
+	}
+	if i := strings.IndexAny(host, "/:"); i >= 0 {
+		host = host[:i]
+	}
+	for _, suffix := range []string{".backblazeb2.com", ".amazonaws.com"} {
+		if !strings.HasSuffix(host, suffix) {
+			continue
+		}
+		core := strings.TrimSuffix(host, suffix)
+		if rest, ok := strings.CutPrefix(core, "s3."); ok && rest != "" && !strings.Contains(rest, ".") {
+			return rest
+		}
+	}
+	return ""
+}
+
 // New builds an S3 client for the given configuration.
 func New(_ context.Context, cfg Config) (*Client, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("s3: bucket required")
 	}
+	cfg.Endpoint = NormalizeEndpoint(cfg.Endpoint)
 	region := cfg.Region
+	// Providers like Backblaze B2 reject signatures whose scope region does
+	// not match the endpoint, so the region embedded in the endpoint hostname
+	// is authoritative when present.
+	if derived := regionFromEndpoint(cfg.Endpoint); derived != "" {
+		region = derived
+	}
 	if region == "" {
 		region = "us-east-1"
 	}
@@ -190,11 +234,11 @@ func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
 	return out, nil
 }
 
-// Test performs a put/get/delete round trip on a probe object.
+// Test performs a put/get/delete round trip on a probe object. It never
+// creates the bucket: restricted credentials (e.g. a Backblaze application key
+// scoped to one bucket) are not allowed to, and the bucket is expected to
+// already exist.
 func (c *Client) Test(ctx context.Context) error {
-	if err := c.EnsureBucket(ctx); err != nil {
-		return err
-	}
 	key := fmt.Sprintf(".proxback-probe/%d", time.Now().UnixNano())
 	want := []byte("proxback connectivity probe")
 	if err := c.Put(ctx, key, want); err != nil {

@@ -201,6 +201,39 @@ func (c *Client) AllVMs(ctx context.Context) ([]VM, error) {
 	return out, nil
 }
 
+// Permissions returns the ACL paths visible to this credential, as reported by
+// /access/permissions. An empty map means the token can authenticate but has
+// no privileges anywhere — with privilege separation on and no ACLs granted,
+// PVE silently filters every guest listing to an empty result.
+func (c *Client) Permissions(ctx context.Context) (map[string]any, error) {
+	out := map[string]any{}
+	if err := c.do(ctx, http.MethodGet, "/api2/json/access/permissions", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// NoAccessHint is the operator guidance shown when a token sees no guests.
+const NoAccessHint = "the API token authenticates but has no privileges, so Proxmox " +
+	"hides every guest from it. On the Proxmox host, either disable “Privilege " +
+	"Separation” on the token, or grant it a role with VM.Audit, VM.Snapshot, " +
+	"VM.Backup and Datastore.Audit on path / (Datacenter → Permissions)."
+
+// DiagnoseEmptyInventory reports a human-readable warning when a guest listing
+// came back empty because of missing permissions, or "" when the emptiness
+// looks genuine.
+func (c *Client) DiagnoseEmptyInventory(ctx context.Context) string {
+	perms, err := c.Permissions(ctx)
+	if err != nil {
+		c.log.Warn("could not read /access/permissions", "error", err)
+		return ""
+	}
+	if len(perms) == 0 {
+		return NoAccessHint
+	}
+	return ""
+}
+
 // Config returns the raw guest configuration map.
 func (c *Client) Config(ctx context.Context, node string, vmid int) (map[string]any, error) {
 	out := map[string]any{}

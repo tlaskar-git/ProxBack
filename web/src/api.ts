@@ -106,6 +106,8 @@ export interface HostTestResult {
   ok: boolean
   nodes: number
   error?: string
+  /** Set when the host is reachable but the token cannot see any guests. */
+  warning?: string
 }
 
 /* Virtual machines -------------------------------------------------------- */

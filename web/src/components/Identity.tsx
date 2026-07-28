@@ -70,13 +70,17 @@ export function WorkloadIdentity({
         ) : null}
         <span
           className={cn(
-            'truncate text-[13px]',
+            'min-w-0 flex-1 truncate text-[13px]',
             emphasis === 'strong' ? 'font-medium text-slate-100' : 'text-slate-200',
           )}
         >
           {workload.name}
         </span>
-        {vmid ? <span className="shrink-0 font-mono text-meta text-slate-500">({vmid})</span> : null}
+        {vmid ? (
+          <span className="max-w-[45%] shrink-0 truncate font-mono text-meta text-slate-500">
+            ({vmid})
+          </span>
+        ) : null}
         {workload.node ? (
           <>
             <span className="shrink-0 text-slate-600" aria-hidden>
@@ -91,16 +95,25 @@ export function WorkloadIdentity({
 
   return (
     <span className={cn('block min-w-0', className)} title={identityText(workload)}>
+      {/* The name takes the leftover width (`flex-1`, basis 0) and the
+          identifier keeps its natural width — but capped, because a
+          content-addressed agent id is long enough to squeeze the name down to
+          a single letter otherwise. Whichever one truncates, the full identity
+          is still on the `title`. */}
       <span className="flex items-baseline gap-1.5">
         <span
           className={cn(
-            'truncate text-[13px]',
+            'min-w-0 flex-1 truncate text-[13px]',
             emphasis === 'strong' ? 'font-medium text-slate-100' : 'text-slate-200',
           )}
         >
           {workload.name}
         </span>
-        {vmid ? <span className="shrink-0 font-mono text-meta text-slate-500">({vmid})</span> : null}
+        {vmid ? (
+          <span className="max-w-[45%] shrink-0 truncate font-mono text-meta text-slate-500">
+            ({vmid})
+          </span>
+        ) : null}
       </span>
       {scope.length > 0 ? (
         <span className="mt-0.5 block truncate font-mono text-meta text-slate-500">

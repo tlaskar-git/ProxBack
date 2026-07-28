@@ -1112,6 +1112,28 @@ export interface BackupDisk {
 /** Outcome of the last integrity verification of a restore point. */
 export type VerifyResult = 'passed' | 'failed'
 
+/**
+ * The VMID inside a guest's `sourceId`.
+ *
+ * The server writes a guest source id as `<hostId>_<vmid>` so that two clusters
+ * holding the same VMID stay distinguishable. Anything that wants the VMID —
+ * to display it, or to match a restore point against a cached VM — has to take
+ * it back out; passing the whole composite where a VMID is expected silently
+ * matches nothing and fails every numeric check.
+ *
+ * This deliberately mirrors `vmidFromSourceID` in internal/sched/restore.go,
+ * separator requirement included: a source id the server could not restore must
+ * not be shown here as though it named a VMID.
+ */
+export function sourceVMID(sourceId: ID | null | undefined): number | null {
+  if (sourceId === null || sourceId === undefined) return null
+  const text = String(sourceId)
+  const cut = text.lastIndexOf('_')
+  if (cut < 0) return null
+  const tail = text.slice(cut + 1)
+  return /^\d+$/.test(tail) ? Number(tail) : null
+}
+
 export interface Backup {
   id: ID
   jobId: ID

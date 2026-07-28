@@ -28,7 +28,14 @@ import {
   RotateCcw,
   ShieldAlert,
 } from 'lucide-react'
-import { createRestore, errorMessage, getFreeVMID, isOffsite, targetLocation } from '../api'
+import {
+  createRestore,
+  errorMessage,
+  getFreeVMID,
+  isOffsite,
+  sourceVMID,
+  targetLocation,
+} from '../api'
 import type { Agent, Backup, CachedVM, Host, RestoreMode, RestoreRequest, Target } from '../api'
 import { cn } from '../lib/cn'
 import { formatBytes, formatDateTime, formatRelative } from '../lib/format'
@@ -183,13 +190,15 @@ export function RestoreWizard({
   /** The workload this restore point came from, resolved through the cache. */
   const source = useMemo(() => {
     if (!backup || backup.sourceKind !== 'vm') return null
+    const vmid = sourceVMID(backup.sourceId)
+    if (vmid === null) return null
     return (
       vms.find(
         (vm) =>
-          String(vm.vmid) === String(backup.sourceId) &&
+          vm.vmid === vmid &&
           (backup.hostId === undefined || String(vm.hostId) === String(backup.hostId)),
       ) ??
-      vms.find((vm) => String(vm.vmid) === String(backup.sourceId)) ??
+      vms.find((vm) => vm.vmid === vmid) ??
       null
     )
   }, [backup, vms])
@@ -252,7 +261,7 @@ export function RestoreWizard({
   useEffect(() => {
     if (!backup || !isVM) return
     if (mode === 'overwrite') {
-      setVmid(String(source?.vmid ?? backup.sourceId ?? ''))
+      setVmid(String(source?.vmid ?? sourceVMID(backup.sourceId) ?? ''))
       setNode(backup.node ?? source?.node ?? '')
       return
     }
@@ -349,7 +358,7 @@ export function RestoreWizard({
           ? `${identityText({
               hostName: backup.hostName,
               name: backup.sourceName,
-              vmid: backup.sourceKind === 'vm' ? backup.sourceId : null,
+              vmid: backup.sourceKind === 'vm' ? sourceVMID(backup.sourceId) : null,
               node: backup.node,
             })} — ${backup.kind} point from ${formatDateTime(backup.createdAt)}`
           : undefined
@@ -604,7 +613,7 @@ export function RestoreWizard({
                     workload={{
                       hostName: backup.hostName,
                       name: backup.sourceName,
-                      vmid: backup.sourceKind === 'vm' ? backup.sourceId : null,
+                      vmid: backup.sourceKind === 'vm' ? sourceVMID(backup.sourceId) : null,
                       node: backup.node,
                     }}
                   />

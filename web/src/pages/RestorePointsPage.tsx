@@ -1,7 +1,6 @@
 import { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  ArrowLeft,
   Database,
   History,
   Laptop,
@@ -18,6 +17,7 @@ import {
   listHosts,
   listTargets,
   listVMs,
+  sourceVMID,
   targetLocation,
   verifyBackup,
 } from '../api'
@@ -344,8 +344,11 @@ export function RestorePointsPage() {
   const [restoring, setRestoring] = useState<Backup | null>(null)
 
   const groups = useMemo(() => groupSources(data?.backups ?? []), [data?.backups])
+  /* Falling back to the first group means the page opens on the most recently
+     protected workload instead of a placeholder, and a workload that is pruned
+     away while selected hands over to a real chain rather than a blank panel. */
   const selected = useMemo(
-    () => groups.find((group) => group.key === selectedKey) ?? null,
+    () => groups.find((group) => group.key === selectedKey) ?? groups[0] ?? null,
     [groups, selectedKey],
   )
 
@@ -403,9 +406,12 @@ export function RestorePointsPage() {
         />
       ) : (
         <div className="grid gap-4 lg:grid-cols-[22rem_1fr]">
-          <Card className="h-fit">
+          <Card className="h-fit lg:sticky lg:top-4">
             <CardHeader title="Workloads" subtitle={`${groups.length} with restore points`} />
-            <ul className="divide-y divide-slate-800">
+            {/* A long estate scrolls inside the card rather than setting the
+                height of the whole row, which would leave the chain panel
+                beside it padded out with empty space. */}
+            <ul className="divide-y divide-slate-800 lg:max-h-[calc(100vh-14rem)] lg:overflow-y-auto">
               {groups.map((group) => {
                 const active = selected?.key === group.key
                 return (
@@ -439,7 +445,7 @@ export function RestorePointsPage() {
                           workload={{
                             hostName: group.hostName,
                             name: group.sourceName,
-                            vmid: group.sourceKind === 'vm' ? group.sourceId : null,
+                            vmid: group.sourceKind === 'vm' ? sourceVMID(group.sourceId) : null,
                             node: group.node,
                           }}
                         />
@@ -467,28 +473,17 @@ export function RestorePointsPage() {
             </ul>
           </Card>
 
-          <Card>
-            {!selected ? (
-              <EmptyState
-                className="border-0 bg-transparent"
-                icon={<ArrowLeft className="size-5" aria-hidden />}
-                title="Pick a workload"
-                description="Choose one on the left to see its chain, verify a point, restore it, or prune old ones."
-                action={
-                  groups[0] ? (
-                    <Button onClick={() => setSelectedKey(groups[0].key)}>
-                      Open {groups[0].sourceName}
-                    </Button>
-                  ) : undefined
-                }
-              />
-            ) : (
+          {/* `min-w-0` is load-bearing: a `1fr` track defaults to min-width
+              auto, so without it the widest chain row sets the column width and
+              the page scrolls sideways instead of the row truncating. */}
+          <Card className="h-fit min-w-0">
+            {!selected ? null : (
               <>
                 <CardHeader
                   title={identityText({
                     hostName: selected.hostName,
                     name: selected.sourceName,
-                    vmid: selected.sourceKind === 'vm' ? selected.sourceId : null,
+                    vmid: selected.sourceKind === 'vm' ? sourceVMID(selected.sourceId) : null,
                     node: selected.node,
                   })}
                   subtitle={

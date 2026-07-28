@@ -32,16 +32,15 @@ export function BrandMark({
       aria-label={title}
       aria-hidden={title ? undefined : true}
     >
-      {/* Top platter — the solid one, so the stack reads as full. */}
-      <ellipse cx="12" cy="6.2" rx="7.4" ry="3.1" fill="currentColor" stroke="none" />
-      {/* Stack walls. */}
-      <path d="M4.6 6.2v5.1c0 1.71 3.31 3.1 7.4 3.1s7.4-1.39 7.4-3.1V6.2" />
-      {/* Lower platter edge — a third layer of depth without extra clutter. */}
-      <path d="M4.6 11.3v5.1c0 1.44 2.35 2.66 5.56 3" />
-      <path d="M19.4 11.3v3" />
-      {/* Restore arrow: sweeps up the right side and points back into the stack. */}
-      <path d="M19.4 20.4a5.2 5.2 0 1 0-4.1-8.4" />
-      <path d="M15.1 15.4v-3.6h3.6" />
+      {/* Storage: a stack of platters, drawn in the upper-left so the restore
+          arrow has room. Every coordinate stays inside 2…22 of the 24 grid, so
+          nothing clips at any render size. */}
+      <ellipse cx="10" cy="5.6" rx="6.2" ry="2.6" fill="currentColor" stroke="none" />
+      <path d="M3.8 5.6v8.2c0 1.44 2.78 2.6 6.2 2.6s6.2-1.16 6.2-2.6V5.6" />
+      <path d="M3.8 9.7c0 1.44 2.78 2.6 6.2 2.6s6.2-1.16 6.2-2.6" />
+      {/* Restore: a circular arrow, closed on itself and fully bounded. */}
+      <path d="M20.2 17.4a4 4 0 1 1-1.5-3.12" />
+      <path d="M19.1 10.9v3.5h-3.5" />
     </svg>
   )
 }
@@ -68,8 +67,8 @@ export function BrandLockup({
     return (
       <div className={className}>
         <div className="flex flex-col items-center gap-2.5">
-          <BrandMark className="size-[78px] text-accent-400" title="ProxBack" />
-          <span className="text-[45px] leading-none font-semibold tracking-[-0.03em] text-slate-50">
+          <BrandMark className="size-[39px] text-accent-400" title="ProxBack" />
+          <span className="text-[23px] leading-none font-semibold tracking-[-0.02em] text-slate-50">
             Prox<span className="text-slate-400">Back</span>
           </span>
         </div>

@@ -38,8 +38,10 @@ var (
 	ErrNoJob = errors.New("sched: run has no job to re-run")
 )
 
-// AgentDispatchTimeout bounds how long a run waits for an agent to pick up work.
-const AgentDispatchTimeout = 5 * time.Minute
+// Bounding an agent run lives in agentmgr, which can tell waiting-to-be-picked-up
+// apart from picked-up-and-working: see agentmgr.DefaultPickupTimeout and
+// DefaultStallTimeout. A single deadline here could only ever cap total run
+// length, which is what policy.maxDurationMinutes is for.
 
 // maxConcurrency caps the size of the run token pool.
 const maxConcurrency = 64

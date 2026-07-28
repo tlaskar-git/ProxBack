@@ -614,9 +614,12 @@ func (m *Manager) backupAgentJob(ctx context.Context, run *store.JobRun, job *st
 	}
 	sess.SetStep("Dispatching to agent " + agent.Hostname)
 
-	dctx, cancel := context.WithTimeout(ctx, AgentDispatchTimeout)
-	defer cancel()
-	res, err := m.agents.RunBackup(dctx, agentmgr.BackupRequest{
+	/* No deadline of our own here. agentmgr bounds the wait for the agent to
+	   collect the work and the silence afterwards; ctx already carries
+	   policy.maxDurationMinutes, which is the operator's cap on run length. A
+	   flat timeout across the whole call used to kill healthy backups the
+	   moment they ran longer than it, however much data they were moving. */
+	res, err := m.agents.RunBackup(ctx, agentmgr.BackupRequest{
 		RunID:                run.ID,
 		AgentID:              agent.ID,
 		JobID:                job.ID,

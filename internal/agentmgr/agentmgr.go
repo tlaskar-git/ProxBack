@@ -22,6 +22,29 @@ import (
 // OnlineWindow is how recently an agent must have been seen to count as online.
 const OnlineWindow = 45 * time.Second
 
+// Bounds on an agent-driven run.
+//
+// These are two different questions and they get two different answers. Waiting
+// for an agent to collect a dispatch is bounded tightly, because an agent that
+// has not taken the work within a few heartbeats is not going to. Once it has
+// the work, how long the backup legitimately takes is a property of the data,
+// not of the protocol — a first full backup of a large volume runs for hours —
+// so the only failure worth detecting is the agent going quiet.
+//
+// A single deadline over the whole run cannot express that. One did, and it
+// failed healthy backups at five minutes with "context deadline exceeded"
+// however much progress they were making. The operator-facing cap on run length
+// is policy.maxDurationMinutes, which is configurable and says so when it fires.
+const (
+	// DefaultPickupTimeout bounds the wait for an agent to collect a dispatch.
+	// The agent polls every 15s, so this is many chances to be seen.
+	DefaultPickupTimeout = 5 * time.Minute
+	// DefaultStallTimeout bounds how long a collected run may report nothing.
+	// It has to clear the quiet stretch before the first chunk, when the agent
+	// is still walking the filesystem, which on a large volume is minutes.
+	DefaultStallTimeout = 30 * time.Minute
+)
+
 // Errors returned by the manager.
 var (
 	ErrUnauthorized = errors.New("agentmgr: unauthorized")
@@ -31,6 +54,11 @@ var (
 	// Applying an update restarts the agent, and a restart in the middle of a
 	// backup throws away everything the guest has uploaded so far.
 	ErrAgentBusy = errors.New("agentmgr: the agent has a run in flight")
+	// ErrPickupTimeout and ErrStalled replace a bare deadline error with the
+	// distinction that matters when reading a failed run: the agent never took
+	// the work, or it took it and went quiet.
+	ErrPickupTimeout = errors.New("agentmgr: the agent did not collect this run")
+	ErrStalled       = errors.New("agentmgr: the agent stopped reporting progress")
 )
 
 // Dispatch is a work item handed to an agent on heartbeat.
@@ -98,12 +126,32 @@ type runState struct {
 	manifest *engine.Manifest // restore only
 	done     chan Result
 	closed   bool
+	// picked is closed when the agent collects this dispatch on a heartbeat,
+	// which is the moment waiting-to-be-taken becomes work-in-progress.
+	picked     chan struct{}
+	pickedOnce sync.Once
+	// progress is the last time this run showed a sign of life. Chunk uploads
+	// are the only such sign during a backup: the agent runs the job inside its
+	// poll loop, so it deliberately stops heartbeating until the job is done.
+	progress time.Time
+}
+
+// markPicked records that the agent has taken the work. Safe to call more than
+// once — a dispatch can be handed out again if a heartbeat is retried.
+func (rs *runState) markPicked() {
+	rs.pickedOnce.Do(func() { close(rs.picked) })
 }
 
 // Manager owns agent state and in-flight agent-driven runs.
 type Manager struct {
 	st  *store.Store
 	log *slog.Logger
+
+	// PickupTimeout and StallTimeout bound the two phases of a run. They are
+	// fields rather than constants so tests can drive both without waiting out
+	// the production values.
+	PickupTimeout time.Duration
+	StallTimeout  time.Duration
 
 	mu      sync.Mutex
 	pending map[string][]Dispatch // agentID -> queued dispatches
@@ -116,10 +164,12 @@ func New(st *store.Store, log *slog.Logger) *Manager {
 		log = slog.Default()
 	}
 	return &Manager{
-		st:      st,
-		log:     log,
-		pending: map[string][]Dispatch{},
-		active:  map[string]*runState{},
+		st:            st,
+		log:           log,
+		PickupTimeout: DefaultPickupTimeout,
+		StallTimeout:  DefaultStallTimeout,
+		pending:       map[string][]Dispatch{},
+		active:        map[string]*runState{},
 	}
 }
 
@@ -245,6 +295,17 @@ func (m *Manager) Heartbeat(ctx context.Context, agentID string, req HeartbeatRe
 		return []Dispatch{}, nil
 	}
 	delete(m.pending, agentID)
+	/* Handing the dispatch over is the only moment the server can observe the
+	   agent taking the work: from here until the run completes the agent is
+	   busy in its poll loop and stops heartbeating, so this is also the last
+	   liveness signal before the chunks start arriving. */
+	now := time.Now()
+	for _, d := range q {
+		if rs, ok := m.active[d.RunID]; ok {
+			rs.progress = now
+			rs.markPicked()
+		}
+	}
 	return q, nil
 }
 
@@ -302,8 +363,32 @@ func (m *Manager) QueueUpdate(agentID string, d Dispatch) error {
 func (m *Manager) enqueue(agentID string, d Dispatch, rs *runState) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	rs.picked = make(chan struct{})
+	rs.progress = time.Now()
 	m.active[d.RunID] = rs
 	m.pending[agentID] = append(m.pending[agentID], d)
+}
+
+// noteProgress records a sign of life from a run. Called on every accepted
+// chunk, which during a backup is the only thing the agent sends.
+func (m *Manager) noteProgress(runID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rs, ok := m.active[runID]; ok {
+		rs.progress = time.Now()
+	}
+}
+
+// sinceProgress reports how long a run has been silent, and whether it is still
+// active at all.
+func (m *Manager) sinceProgress(runID string) (time.Duration, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rs, ok := m.active[runID]
+	if !ok {
+		return 0, false
+	}
+	return time.Since(rs.progress), true
 }
 
 func (m *Manager) takeRun(runID, agentID string) (*runState, error) {
@@ -408,13 +493,59 @@ func (m *Manager) RunRestore(ctx context.Context, req RestoreRequest) (Result, e
 	return m.wait(ctx, req.RunID, rs)
 }
 
+// wait blocks until the run finishes, bounded in two phases.
+//
+// Until the agent collects the dispatch, the bound is PickupTimeout — an agent
+// that has not taken the work after many heartbeats is not going to. Once it
+// has, there is no bound on how long the backup may legitimately take, only on
+// how long it may say nothing: a run that goes quiet for StallTimeout has lost
+// its agent. The caller's ctx still carries policy.maxDurationMinutes, which
+// remains the only cap on total run length.
 func (m *Manager) wait(ctx context.Context, runID string, rs *runState) (Result, error) {
+	pickup := time.NewTimer(m.PickupTimeout)
+	defer pickup.Stop()
+
 	select {
 	case res := <-rs.done:
 		return res, res.Err
 	case <-ctx.Done():
 		m.abandon(runID)
 		return Result{}, ctx.Err()
+	case <-pickup.C:
+		m.abandon(runID)
+		return Result{}, fmt.Errorf("%w within %s — it may be offline, or stopped",
+			ErrPickupTimeout, m.PickupTimeout)
+	case <-rs.picked:
+	}
+
+	/* Polling rather than one long timer: the deadline moves forward with every
+	   chunk, so what is being watched is the gap between signs of life, not a
+	   fixed point in time. */
+	tick := m.StallTimeout / 10
+	if tick <= 0 {
+		tick = time.Second
+	}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case res := <-rs.done:
+			return res, res.Err
+		case <-ctx.Done():
+			m.abandon(runID)
+			return Result{}, ctx.Err()
+		case <-ticker.C:
+			silent, active := m.sinceProgress(runID)
+			if !active {
+				// finish() removed it; the result is on its way.
+				continue
+			}
+			if silent >= m.StallTimeout {
+				m.abandon(runID)
+				return Result{}, fmt.Errorf("%w for %s", ErrStalled, silent.Round(time.Second))
+			}
+		}
 	}
 }
 
@@ -437,6 +568,7 @@ func (m *Manager) AcceptChunk(ctx context.Context, runID, agentID, sha string, d
 	if rs.sess != nil {
 		rs.sess.RecordChunk(int64(len(data)), uploaded)
 	}
+	m.noteProgress(runID)
 	return uploaded == 0, nil
 }
 
@@ -532,12 +664,30 @@ func (m *Manager) RestoreStream(ctx context.Context, runID, agentID string, w io
 	if rs.dispatch.Type != DispatchRestore || rs.manifest == nil {
 		return fmt.Errorf("agentmgr: run %s is not a restore run", runID)
 	}
+	/* A restore is one long response rather than many small requests, so bytes
+	   leaving here are its only sign of life. Without this the stall watchdog
+	   would see silence for the whole transfer and kill a working restore. */
+	pw := &progressWriter{w: w, note: func() { m.noteProgress(runID) }}
 	for _, d := range rs.manifest.Disks {
-		if err := rs.sess.RestoreDisk(ctx, d, w); err != nil {
+		if err := rs.sess.RestoreDisk(ctx, d, pw); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// progressWriter reports liveness as bytes pass through it.
+type progressWriter struct {
+	w    io.Writer
+	note func()
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	if n > 0 {
+		p.note()
+	}
+	return n, err
 }
 
 func statsOf(rs *runState) engine.Stats {

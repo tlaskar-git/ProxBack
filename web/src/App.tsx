@@ -51,7 +51,7 @@ type Phase =
 function BootScreen({ message, onRetry }: { message?: string; onRetry?: () => void }) {
   return (
     <div className="flex min-h-full flex-col items-center justify-center gap-4 bg-slate-950 px-6 text-center">
-      <BrandMark className="size-8 text-accent-400" title="ProxBack" />
+      <BrandMark className="size-8 text-slate-100" title="ProxBack" />
       {message ? (
         <>
           <div>

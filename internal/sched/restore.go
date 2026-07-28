@@ -199,9 +199,10 @@ func (m *Manager) restoreAgent(ctx context.Context, sess *engine.Session, eng *e
 	m.logRun(ctx, run.ID, "restoring %s to agent %s into %s",
 		man.SourceName, agent.Hostname, spec.Agent.DestPath)
 	sess.SetStep("Dispatching restore to agent " + agent.Hostname)
-	dctx, cancel := context.WithTimeout(ctx, AgentDispatchTimeout)
-	defer cancel()
-	_, err = m.agents.RunRestore(dctx, agentmgr.RestoreRequest{
+	// Bounded by agentmgr's pickup and stall watchdogs, not by a flat deadline:
+	// restoring a large file set legitimately takes longer than any fixed
+	// timeout worth setting.
+	_, err = m.agents.RunRestore(ctx, agentmgr.RestoreRequest{
 		RunID:    run.ID,
 		AgentID:  agent.ID,
 		JobName:  run.JobName,

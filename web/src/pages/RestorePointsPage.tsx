@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
+  ChevronRight,
   Database,
   History,
   Laptop,
@@ -34,7 +35,6 @@ import {
   EmptyState,
   ErrorBlock,
   IconButton,
-  LoadingBlock,
   Num,
   PageHeader,
   SkeletonRows,
@@ -340,29 +340,48 @@ export function RestorePointsPage() {
   }, [])
   const { data, loading, error, reload, refresh } = useAsync(loader)
 
-  const [selectedKey, setSelectedKey] = useState<string | null>(null)
+  /**
+   * Which workloads are expanded. `null` means the operator has not touched the
+   * list yet, in which case the newest workload is open — the page is useful on
+   * arrival without pre-empting any later choice.
+   */
+  const [openKeys, setOpenKeys] = useState<ReadonlySet<string> | null>(null)
   const [restoring, setRestoring] = useState<Backup | null>(null)
 
   const groups = useMemo(() => groupSources(data?.backups ?? []), [data?.backups])
-  /* Falling back to the first group means the page opens on the most recently
-     protected workload instead of a placeholder, and a workload that is pruned
-     away while selected hands over to a real chain rather than a blank panel. */
-  const selected = useMemo(
-    () => groups.find((group) => group.key === selectedKey) ?? groups[0] ?? null,
-    [groups, selectedKey],
+
+  const open = useMemo(
+    () => openKeys ?? new Set(groups[0] ? [groups[0].key] : []),
+    [openKeys, groups],
   )
 
-  /* The list already carries every point, so the chain view filters it rather
-     than issuing a second request — one source of truth, and no window where
-     the two disagree after a delete. */
-  const detail = useMemo(() => {
-    if (!selected) return null
-    return (data?.backups ?? [])
-      .filter((backup) => sourceKey(backup) === selected.key)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-  }, [data?.backups, selected])
+  const toggle = (key: string) => {
+    const next = new Set(open)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    setOpenKeys(next)
+  }
 
-  const depths = useMemo(() => chainDepths(detail ?? []), [detail])
+  /* The list already carries every point, so the chains are grouped from it
+     rather than fetched again — one source of truth, and no window where the
+     two disagree after a delete. */
+  const chains = useMemo(() => {
+    const byWorkload = new Map<string, Backup[]>()
+    for (const backup of data?.backups ?? []) {
+      const key = sourceKey(backup)
+      const chain = byWorkload.get(key)
+      if (chain) chain.push(backup)
+      else byWorkload.set(key, [backup])
+    }
+    for (const chain of byWorkload.values()) {
+      chain.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+    }
+    return byWorkload
+  }, [data?.backups])
+
+  /* Depth resolves through parent ids, which never cross a workload, so one
+     pass over every point gives the same answer as one pass per chain. */
+  const depths = useMemo(() => chainDepths(data?.backups ?? []), [data?.backups])
 
   /**
    * The target a point lives on. A point can outlive the target record, so this
@@ -405,127 +424,121 @@ export function RestorePointsPage() {
           }
         />
       ) : (
-        <div className="grid gap-4 lg:grid-cols-[22rem_1fr]">
-          <Card className="h-fit lg:sticky lg:top-4">
-            <CardHeader title="Workloads" subtitle={`${groups.length} with restore points`} />
-            {/* A long estate scrolls inside the card rather than setting the
-                height of the whole row, which would leave the chain panel
-                beside it padded out with empty space. */}
-            <ul className="divide-y divide-slate-800 lg:max-h-[calc(100vh-14rem)] lg:overflow-y-auto">
-              {groups.map((group) => {
-                const active = selected?.key === group.key
-                return (
-                  <li key={group.key}>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedKey(group.key)}
-                      aria-pressed={active}
+        /* One full-width list rather than a master/detail split. A split puts a
+           tall list of workloads beside a panel holding one workload's points,
+           and grid rows are as tall as their tallest cell, so the short side is
+           padded out with empty space that grows with the size of the estate.
+           Expanding in place cannot produce that gap at any number of
+           workloads or points. */
+        <Card>
+          <CardHeader title="Workloads" subtitle={`${groups.length} with restore points`} />
+          <ul className="divide-y divide-slate-800">
+            {groups.map((group) => {
+              const expanded = open.has(group.key)
+              const chain = chains.get(group.key) ?? []
+              const panelId = `chain-${group.key.replace(/[^a-zA-Z0-9_-]/g, '-')}`
+              const identity = {
+                hostName: group.hostName,
+                name: group.sourceName,
+                vmid: group.sourceKind === 'vm' ? sourceVMID(group.sourceId) : null,
+                node: group.node,
+              }
+              return (
+                <li key={group.key}>
+                  <button
+                    type="button"
+                    onClick={() => toggle(group.key)}
+                    aria-expanded={expanded}
+                    aria-controls={panelId}
+                    aria-label={`${identityText(identity)} — ${
+                      expanded ? 'hide' : 'show'
+                    } ${formatCount(group.count)} restore ${
+                      group.count === 1 ? 'point' : 'points'
+                    }`}
+                    className={cn(
+                      'flex w-full items-start gap-3 px-4 py-3.5 text-left transition-colors duration-150',
+                      expanded ? 'bg-accent-500/[0.07]' : 'hover:bg-slate-800/40',
+                    )}
+                  >
+                    <ChevronRight
                       className={cn(
-                        'flex w-full items-start gap-3 px-4 py-3 text-left transition-colors duration-150',
-                        active ? 'bg-accent-500/10' : 'hover:bg-slate-800/40',
+                        'mt-1.5 size-4 shrink-0 text-slate-500 transition-transform duration-150',
+                        expanded && 'rotate-90 text-accent-300',
+                      )}
+                      aria-hidden
+                    />
+                    <span
+                      className={cn(
+                        'mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg border',
+                        expanded
+                          ? 'border-accent-500/40 bg-accent-500/15 text-accent-300'
+                          : 'border-slate-800 bg-slate-950/60 text-slate-500',
                       )}
                     >
-                      <span
-                        className={cn(
-                          'mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg border',
-                          active
-                            ? 'border-accent-500/40 bg-accent-500/15 text-accent-300'
-                            : 'border-slate-800 bg-slate-950/60 text-slate-500',
-                        )}
-                      >
-                        {group.sourceKind === 'vm' ? (
-                          <Laptop className="size-3.5" aria-hidden />
-                        ) : (
-                          <ShieldCheck className="size-3.5" aria-hidden />
-                        )}
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <WorkloadIdentity
-                          emphasis={active ? 'strong' : 'normal'}
-                          workload={{
-                            hostName: group.hostName,
-                            name: group.sourceName,
-                            vmid: group.sourceKind === 'vm' ? sourceVMID(group.sourceId) : null,
-                            node: group.node,
-                          }}
-                        />
-                        <span className="mt-1 block truncate text-meta text-slate-500">
-                          <Num>{formatCount(group.count)}</Num>{' '}
-                          {group.count === 1 ? 'point' : 'points'} ·{' '}
-                          <Num>{formatBytes(group.totalBytes)}</Num> · newest{' '}
-                          <Num>{formatRelative(group.latest)}</Num>
-                        </span>
-                        <span
-                          className={cn(
-                            'mt-0.5 block truncate text-meta',
-                            group.lastVerifiedAt ? 'text-ok-400' : 'text-slate-600',
-                          )}
-                        >
-                          {group.lastVerifiedAt
-                            ? `Integrity verified ${formatRelative(group.lastVerifiedAt)}`
-                            : 'No point verified yet'}
-                        </span>
-                      </span>
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
-          </Card>
-
-          {/* `min-w-0` is load-bearing: a `1fr` track defaults to min-width
-              auto, so without it the widest chain row sets the column width and
-              the page scrolls sideways instead of the row truncating. */}
-          <Card className="h-fit min-w-0">
-            {!selected ? null : (
-              <>
-                <CardHeader
-                  title={identityText({
-                    hostName: selected.hostName,
-                    name: selected.sourceName,
-                    vmid: selected.sourceKind === 'vm' ? sourceVMID(selected.sourceId) : null,
-                    node: selected.node,
-                  })}
-                  subtitle={
-                    selected.sourceKind === 'vm'
-                      ? 'Virtual machine — agentless image backup'
-                      : 'Agent — file-level backup'
-                  }
-                  actions={
-                    <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
-                      <Database className="size-3.5" aria-hidden />
-                      <Num>{formatBytes(selected.totalBytes)}</Num> total
+                      {group.sourceKind === 'vm' ? (
+                        <Laptop className="size-3.5" aria-hidden />
+                      ) : (
+                        <ShieldCheck className="size-3.5" aria-hidden />
+                      )}
                     </span>
-                  }
-                />
-                {loading && !detail ? (
-                  <LoadingBlock label="Loading restore points…" />
-                ) : !detail || detail.length === 0 ? (
-                  <EmptyState
-                    className="border-0 bg-transparent"
-                    icon={<History className="size-5" aria-hidden />}
-                    title="Every point for this workload has gone"
-                    description="Retention pruned them, or they were deleted by hand. The next successful run of its job writes a fresh full backup."
-                    action={<Button onClick={() => void refresh()}>Check again</Button>}
-                  />
-                ) : (
-                  <div className="divide-y divide-slate-800">
-                    {detail.map((backup) => (
-                      <BackupRow
-                        key={String(backup.id)}
-                        backup={backup}
-                        target={targetOf(backup)}
-                        depth={depths.get(String(backup.id)) ?? 0}
-                        onRestore={() => setRestoring(backup)}
-                        onDeleted={() => void refresh()}
+
+                    <span className="min-w-0 flex-1">
+                      <WorkloadIdentity
+                        emphasis={expanded ? 'strong' : 'normal'}
+                        workload={identity}
                       />
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
-          </Card>
-        </div>
+                      <span className="mt-1 block truncate text-meta text-slate-500">
+                        <Num>{formatCount(group.count)}</Num>{' '}
+                        {group.count === 1 ? 'point' : 'points'} ·{' '}
+                        <Num>{formatBytes(group.totalBytes)}</Num> · newest{' '}
+                        <Num>{formatRelative(group.latest)}</Num>
+                        {' · '}
+                        <span className={group.lastVerifiedAt ? 'text-ok-400' : 'text-slate-600'}>
+                          {group.lastVerifiedAt
+                            ? `integrity verified ${formatRelative(group.lastVerifiedAt)}`
+                            : 'no point verified yet'}
+                        </span>
+                      </span>
+                    </span>
+
+                    <span className="hidden shrink-0 items-center gap-1.5 pt-0.5 text-xs text-slate-500 sm:inline-flex">
+                      <Database className="size-3.5" aria-hidden />
+                      <Num>{formatBytes(group.totalBytes)}</Num> total
+                    </span>
+                  </button>
+
+                  {expanded ? (
+                    <div
+                      id={panelId}
+                      /* `min-w-0` keeps a wide chain row inside the card: without
+                         it the row sets the width and the page scrolls sideways
+                         instead of the row truncating. */
+                      className="min-w-0 border-t border-slate-800/70 bg-slate-950/40"
+                    >
+                      <p className="px-5 pt-3 text-meta text-slate-500">
+                        {group.sourceKind === 'vm'
+                          ? 'Virtual machine — agentless image backup'
+                          : 'Agent — file-level backup'}
+                      </p>
+                      <div className="divide-y divide-slate-800/70">
+                        {chain.map((backup) => (
+                          <BackupRow
+                            key={String(backup.id)}
+                            backup={backup}
+                            target={targetOf(backup)}
+                            depth={depths.get(String(backup.id)) ?? 0}
+                            onRestore={() => setRestoring(backup)}
+                            onDeleted={() => void refresh()}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </li>
+              )
+            })}
+          </ul>
+        </Card>
       )}
 
       <RestoreWizard

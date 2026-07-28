@@ -7,107 +7,281 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-// writeTar streams the include paths as a deterministic tar archive. Entries are
-// named "<base of include path>/<relative path>" so multiple include paths can
-// never collide.
-func writeTar(w io.Writer, paths []string) error {
+// maxRecordedSkips bounds the skip list carried back to the server. A backup of
+// a whole drive can legitimately skip thousands of locked files; the operator
+// needs a representative sample and a count, not every path.
+const maxRecordedSkips = 50
+
+// tarOptions tunes a backup walk.
+type tarOptions struct {
+	// Exclude holds glob patterns from the job's protection policy. A pattern
+	// matches against the entry's archive name, its path relative to the
+	// include root, and its base name, so both "**/node_modules" and
+	// "node_modules" do what an operator expects.
+	Exclude []string
+}
+
+// tarReport describes what a walk actually managed to archive. Skips are not
+// failures: a live filesystem always contains files that cannot be read, and a
+// backup that aborts on the first locked file protects nothing.
+type tarReport struct {
+	Files    int
+	Dirs     int
+	Excluded int
+	// Skipped samples the entries that could not be read, up to
+	// maxRecordedSkips. SkippedCount is the true total.
+	Skipped      []string
+	SkippedCount int
+	// Changed counts files whose size moved while they were being read.
+	Changed int
+}
+
+func (r *tarReport) skip(pathname string, err error) {
+	r.SkippedCount++
+	if len(r.Skipped) < maxRecordedSkips {
+		r.Skipped = append(r.Skipped, fmt.Sprintf("%s: %v", pathname, err))
+	}
+}
+
+// archivePrefix derives the name an include path's contents live under inside
+// the archive.
+//
+// filepath.Base is not usable directly: on Windows it answers `\` for a drive
+// root such as `D:\`, which produced entries named "\/..." that no tar format
+// can encode. A drive root becomes its letter, a Unix root becomes "root", and
+// anything else keeps its base name.
+func archivePrefix(root string) string {
+	if vol := filepath.VolumeName(root); vol != "" {
+		// `D:\` or `D:` -> "D"; a UNC share `\\host\share` -> "host_share".
+		trimmed := strings.Trim(root[len(vol):], `\/`)
+		if trimmed == "" {
+			cleaned := strings.NewReplacer(`\`, "_", "/", "_", ":", "").Replace(vol)
+			return strings.Trim(cleaned, "_")
+		}
+	}
+	base := filepath.Base(root)
+	switch base {
+	case "/", `\`, ".", "..", "":
+		return "root"
+	}
+	return base
+}
+
+// excluded reports whether an entry matches any of the policy's patterns.
+func excluded(patterns []string, archiveName, relName, baseName string) bool {
+	for _, pattern := range patterns {
+		p := strings.TrimSpace(filepath.ToSlash(pattern))
+		if p == "" {
+			continue
+		}
+		for _, candidate := range []string{archiveName, relName, baseName} {
+			if matchGlob(p, candidate) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// matchGlob is path.Match extended with "**", which spans separators. Anything
+// path.Match rejects as malformed simply does not match, so a bad pattern can
+// never silently exclude everything.
+func matchGlob(pattern, name string) bool {
+	if pattern == name {
+		return true
+	}
+	if !strings.Contains(pattern, "**") {
+		ok, err := path.Match(pattern, name)
+		return err == nil && ok
+	}
+	// Split on "**" and require the literal parts to appear in order.
+	parts := strings.Split(pattern, "**")
+	rest := name
+	for i, part := range parts {
+		part = strings.Trim(part, "/")
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(rest, part)
+		if idx < 0 {
+			return false
+		}
+		if i == 0 && !strings.HasPrefix(rest, part) && !strings.HasPrefix(pattern, "**") {
+			return false
+		}
+		rest = rest[idx+len(part):]
+	}
+	return true
+}
+
+// writeTar streams the include paths as a tar archive. Entries are named
+// "<prefix>/<relative path>" so multiple include paths can never collide.
+//
+// Entries that cannot be read are skipped and reported rather than failing the
+// run: on a real machine a walk meets files held open by other processes,
+// permission-denied directories and paths that vanish mid-walk, none of which
+// should cost the operator every other file on the disk.
+func writeTar(w io.Writer, paths []string, opts tarOptions) (tarReport, error) {
+	var report tarReport
 	tw := tar.NewWriter(w)
 	for _, p := range paths {
 		if strings.TrimSpace(p) == "" {
-			return fmt.Errorf("agent: refusing empty include path")
+			return report, fmt.Errorf("agent: refusing empty include path")
 		}
 		root := filepath.Clean(p)
 		info, err := os.Stat(root)
 		if err != nil {
-			return fmt.Errorf("agent: stat include path %q: %w", root, err)
+			// The include path itself is configuration: if it is wrong, say so.
+			return report, fmt.Errorf("agent: stat include path %q: %w", root, err)
 		}
-		base := filepath.Base(root)
+		prefix := archivePrefix(root)
 		if !info.IsDir() {
-			if err := addFile(tw, root, base, info); err != nil {
-				return err
+			if err := addFile(tw, root, prefix, info, &report); err != nil {
+				return report, err
 			}
 			continue
 		}
-		walkErr := filepath.WalkDir(root, func(path string, de fs.DirEntry, err error) error {
+
+		walkErr := filepath.WalkDir(root, func(pathname string, de fs.DirEntry, err error) error {
 			if err != nil {
-				return err
+				// An unreadable directory costs its subtree, not the backup.
+				if pathname == root {
+					return err
+				}
+				report.skip(pathname, err)
+				if de != nil && de.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
 			}
-			rel, err := filepath.Rel(root, path)
+			rel, err := filepath.Rel(root, pathname)
 			if err != nil {
-				return err
+				report.skip(pathname, err)
+				return nil
 			}
-			name := base
-			if rel != "." {
-				name = base + "/" + filepath.ToSlash(rel)
+			relSlash := filepath.ToSlash(rel)
+			name := prefix
+			if relSlash != "." {
+				name = prefix + "/" + relSlash
+			}
+			if relSlash != "." && excluded(opts.Exclude, name, relSlash, filepath.Base(pathname)) {
+				report.Excluded++
+				if de.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
 			}
 			info, err := de.Info()
 			if err != nil {
-				return err
+				report.skip(pathname, err)
+				return nil
 			}
 			switch {
 			case de.IsDir():
-				return addDir(tw, name, info)
+				if err := addDir(tw, name, info); err != nil {
+					return err
+				}
+				report.Dirs++
+				return nil
 			case info.Mode().IsRegular():
-				return addFile(tw, path, name, info)
+				return addFile(tw, pathname, name, info, &report)
 			default:
-				// Symlinks, devices and sockets are skipped.
+				// Symlinks, junctions, devices and sockets are not followed:
+				// following them duplicates data and can loop.
 				return nil
 			}
 		})
 		if walkErr != nil {
-			return fmt.Errorf("agent: walk %q: %w", root, walkErr)
+			return report, fmt.Errorf("agent: walk %q: %w", root, walkErr)
 		}
 	}
 	if err := tw.Close(); err != nil {
-		return fmt.Errorf("agent: finish tar: %w", err)
+		return report, fmt.Errorf("agent: finish tar: %w", err)
 	}
-	return nil
+	return report, nil
+}
+
+// header builds an entry header. Format is deliberately left unset so the tar
+// writer picks the least exotic encoding each entry actually needs — forcing
+// USTAR made any path over 100 bytes unrepresentable, which is ordinary for
+// content-addressed stores such as pnpm's.
+func header(name string, info os.FileInfo, typeflag byte, size int64) *tar.Header {
+	return &tar.Header{
+		Name:     name,
+		Mode:     int64(info.Mode().Perm()),
+		Size:     size,
+		Typeflag: typeflag,
+		ModTime:  info.ModTime().UTC().Truncate(time.Second),
+	}
 }
 
 func addDir(tw *tar.Writer, name string, info os.FileInfo) error {
-	h := &tar.Header{
-		Name:     strings.TrimSuffix(name, "/") + "/",
-		Mode:     int64(info.Mode().Perm()),
-		Typeflag: tar.TypeDir,
-		ModTime:  info.ModTime().UTC().Truncate(time.Second),
-		Format:   tar.FormatUSTAR,
-	}
+	h := header(strings.TrimSuffix(name, "/")+"/", info, tar.TypeDir, 0)
 	if err := tw.WriteHeader(h); err != nil {
 		return fmt.Errorf("agent: tar dir header %q: %w", name, err)
 	}
 	return nil
 }
 
-func addFile(tw *tar.Writer, path, name string, info os.FileInfo) error {
-	h := &tar.Header{
-		Name:     name,
-		Mode:     int64(info.Mode().Perm()),
-		Size:     info.Size(),
-		Typeflag: tar.TypeReg,
-		ModTime:  info.ModTime().UTC().Truncate(time.Second),
-		Format:   tar.FormatUSTAR,
-	}
-	if err := tw.WriteHeader(h); err != nil {
-		return fmt.Errorf("agent: tar file header %q: %w", name, err)
-	}
-	f, err := os.Open(path)
+// addFile writes one regular file. A file that cannot be opened is skipped. A
+// file whose size moves while being read is padded or truncated to the size
+// already declared in its header, because tar cannot revise it — log files grow
+// during a backup and that must not corrupt the archive or fail the run.
+func addFile(tw *tar.Writer, pathname, name string, info os.FileInfo, report *tarReport) error {
+	f, err := os.Open(pathname)
 	if err != nil {
-		return fmt.Errorf("agent: open %q: %w", path, err)
+		report.skip(pathname, err)
+		return nil
 	}
 	defer f.Close()
-	n, err := io.Copy(tw, f)
+
+	size := info.Size()
+	if err := tw.WriteHeader(header(name, info, tar.TypeReg, size)); err != nil {
+		return fmt.Errorf("agent: tar file header %q: %w", name, err)
+	}
+	n, err := io.Copy(tw, io.LimitReader(f, size))
 	if err != nil {
-		return fmt.Errorf("agent: read %q: %w", path, err)
+		// The header is already committed, so the entry must be completed with
+		// the declared number of bytes or the archive is malformed.
+		if padErr := pad(tw, size-n); padErr != nil {
+			return fmt.Errorf("agent: pad %q after read error: %w", name, padErr)
+		}
+		report.skip(pathname, err)
+		report.Changed++
+		report.Files++
+		return nil
 	}
-	if n != info.Size() {
-		return fmt.Errorf("agent: %q changed size while reading (%d != %d)", path, n, info.Size())
+	if n < size {
+		if err := pad(tw, size-n); err != nil {
+			return fmt.Errorf("agent: pad %q: %w", name, err)
+		}
+		report.Changed++
 	}
+	report.Files++
 	return nil
+}
+
+func pad(w io.Writer, n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	_, err := io.CopyN(w, zeroReader{}, n)
+	return err
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }
 
 // extractTar unpacks a tar stream below dest, rejecting path traversal.
@@ -176,9 +350,11 @@ func permOf(mode int64, fallback os.FileMode) os.FileMode {
 	return p
 }
 
-// estimateSize sums the size of every regular file under the include paths so the
-// server can report a meaningful progress percentage.
-func estimateSize(paths []string) (int64, error) {
+// estimateSize sums the size of every regular file under the include paths so
+// the server can report a meaningful progress percentage. It tolerates the same
+// unreadable entries the backup walk does, since an estimate that fails would
+// stop a backup that could otherwise have run.
+func estimateSize(paths []string, opts tarOptions) (int64, error) {
 	var total int64
 	for _, p := range paths {
 		if strings.TrimSpace(p) == "" {
@@ -193,9 +369,30 @@ func estimateSize(paths []string) (int64, error) {
 			total += info.Size() + 1024
 			continue
 		}
-		err = filepath.WalkDir(root, func(_ string, de fs.DirEntry, err error) error {
+		prefix := archivePrefix(root)
+		err = filepath.WalkDir(root, func(pathname string, de fs.DirEntry, err error) error {
 			if err != nil {
-				return err
+				if pathname == root {
+					return err
+				}
+				if de != nil && de.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			rel, relErr := filepath.Rel(root, pathname)
+			if relErr != nil {
+				return nil
+			}
+			relSlash := filepath.ToSlash(rel)
+			if relSlash != "." {
+				name := prefix + "/" + relSlash
+				if excluded(opts.Exclude, name, relSlash, filepath.Base(pathname)) {
+					if de.IsDir() {
+						return fs.SkipDir
+					}
+					return nil
+				}
 			}
 			// Every tar entry costs a 512 byte header.
 			total += 512
@@ -204,7 +401,7 @@ func estimateSize(paths []string) (int64, error) {
 			}
 			fi, err := de.Info()
 			if err != nil {
-				return err
+				return nil
 			}
 			if fi.Mode().IsRegular() {
 				total += fi.Size()

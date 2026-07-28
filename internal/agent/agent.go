@@ -334,16 +334,22 @@ func (a *Agent) runBackup(ctx context.Context, d agentmgr.Dispatch) error {
 	if chunkSize <= 0 {
 		chunkSize = engine.ChunkSize
 	}
-	total, err := estimateSize(d.Paths)
+	// Exclusions come from the job's protection policy. They shape both the
+	// estimate and the walk, so progress does not count data that is never
+	// going to be archived.
+	opts := tarOptions{Exclude: d.ExcludePaths}
+	total, err := estimateSize(d.Paths, opts)
 	if err != nil {
 		return err
 	}
 
 	pr, pw := io.Pipe()
 	tarErr := make(chan error, 1)
+	reports := make(chan tarReport, 1)
 	go func() {
-		err := writeTar(pw, d.Paths)
+		report, err := writeTar(pw, d.Paths, opts)
 		_ = pw.CloseWithError(err)
+		reports <- report
 		tarErr <- err
 	}()
 
@@ -378,11 +384,27 @@ func (a *Agent) runBackup(ctx context.Context, d agentmgr.Dispatch) error {
 	if terr := <-tarErr; terr != nil && uploadErr == nil {
 		uploadErr = terr
 	}
+	report := <-reports
 	if uploadErr != nil {
 		return uploadErr
 	}
 
-	complete := agentmgr.CompleteRequest{Disks: []engine.DiskManifest{stream}}
+	// Unreadable files are normal on a live machine, but the operator must be
+	// told what was left out rather than discovering it during a restore.
+	if report.SkippedCount > 0 || report.Excluded > 0 || report.Changed > 0 {
+		a.log.Warn("backup completed with omissions",
+			"run", d.RunID, "skipped", report.SkippedCount,
+			"excluded", report.Excluded, "changedWhileReading", report.Changed,
+			"examples", strings.Join(report.Skipped, "; "))
+	}
+
+	complete := agentmgr.CompleteRequest{
+		Disks:         []engine.DiskManifest{stream},
+		FilesTotal:    report.Files,
+		SkippedTotal:  report.SkippedCount,
+		SkippedSample: report.Skipped,
+		ExcludedTotal: report.Excluded,
+	}
 	if err := a.doJSON(ctx, http.MethodPost, "/api/agents/runs/"+d.RunID+"/complete", complete, nil, true); err != nil {
 		return fmt.Errorf("agent: complete run: %w", err)
 	}

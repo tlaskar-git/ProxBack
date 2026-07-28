@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -355,6 +356,34 @@ func (m *Manager) AcceptChunk(ctx context.Context, runID, agentID, sha string, d
 // CompleteRequest is the body of POST /api/agents/runs/{runId}/complete.
 type CompleteRequest struct {
 	Disks []engine.DiskManifest `json:"disks"`
+	// What the guest could and could not archive. A live filesystem always
+	// holds files that cannot be read, and the operator has to learn that from
+	// the run rather than from a restore. All optional: an older agent simply
+	// reports nothing.
+	FilesTotal    int      `json:"filesTotal,omitempty"`
+	SkippedTotal  int      `json:"skippedTotal,omitempty"`
+	SkippedSample []string `json:"skippedSample,omitempty"`
+	ExcludedTotal int      `json:"excludedTotal,omitempty"`
+}
+
+// Omissions renders the run-log line describing what a completed agent backup
+// left out, or "" when it archived everything it was asked to.
+func (r CompleteRequest) Omissions() string {
+	if r.SkippedTotal == 0 && r.ExcludedTotal == 0 {
+		return ""
+	}
+	parts := []string{}
+	if r.SkippedTotal > 0 {
+		part := fmt.Sprintf("%d file(s) could not be read and were skipped", r.SkippedTotal)
+		if len(r.SkippedSample) > 0 {
+			part += " (e.g. " + r.SkippedSample[0] + ")"
+		}
+		parts = append(parts, part)
+	}
+	if r.ExcludedTotal > 0 {
+		parts = append(parts, fmt.Sprintf("%d entr(ies) matched an exclusion", r.ExcludedTotal))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // Complete finalises an agent-driven run.

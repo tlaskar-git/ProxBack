@@ -1,6 +1,8 @@
 package api
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -8,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"proxback/internal/blobstore"
 	"proxback/internal/pve"
 	"proxback/internal/s3target"
 	"proxback/internal/sched"
@@ -100,6 +103,12 @@ func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {
 			s.log.Warn("proxmox token has no privileges", "host", host.Name, "hint", warning)
 		}
 	}
+	// The endpoint and token id are recorded; the token secret never is.
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditHostCreate, ObjectKind: "host",
+		ObjectID: host.ID, ObjectName: host.Name,
+		Detail: host.BaseURL + " as " + host.TokenID,
+	})
 	writeJSON(w, http.StatusOK, toHostDTO(host))
 }
 
@@ -143,10 +152,18 @@ func (s *Server) handleTestHost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteHost(w http.ResponseWriter, r *http.Request) {
-	if err := s.st.DeletePVEHost(r.Context(), chi.URLParam(r, "id")); err != nil {
+	id := chi.URLParam(r, "id")
+	name := ""
+	if host, err := s.st.PVEHostByID(r.Context(), id); err == nil {
+		name = host.Name
+	}
+	if err := s.st.DeletePVEHost(r.Context(), id); err != nil {
 		s.notFoundOr(w, err, "host")
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditHostDelete, ObjectKind: "host", ObjectID: id, ObjectName: name,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -278,21 +295,40 @@ func (s *Server) handleListVMs(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- targets
 
+// targetDTO is the wire shape of a backup target. Which half is populated
+// follows kind: an S3 target carries endpoint/bucket/region/pathStyle, a
+// filesystem target carries path plus its capacity. freeBytes and totalBytes are
+// 0 when they do not apply or the platform cannot report them.
 type targetDTO struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Endpoint  string `json:"endpoint"`
-	Bucket    string `json:"bucket"`
-	Region    string `json:"region"`
-	PathStyle bool   `json:"pathStyle"`
-	Status    string `json:"status"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	Path       string `json:"path"`
+	Endpoint   string `json:"endpoint"`
+	Bucket     string `json:"bucket"`
+	Region     string `json:"region"`
+	PathStyle  bool   `json:"pathStyle"`
+	Status     string `json:"status"`
+	FreeBytes  int64  `json:"freeBytes"`
+	TotalBytes int64  `json:"totalBytes"`
+	// Warnings carries the diagnostics of a connection test (a path that is not a
+	// mount point, a target sharing a disk with ProxBack itself). It is only
+	// present on the responses that ran one.
+	Warnings []blobstore.Warning `json:"warnings,omitempty"`
 }
 
 func toTargetDTO(t *store.S3Target) targetDTO {
-	return targetDTO{
-		ID: t.ID, Name: t.Name, Endpoint: t.Endpoint, Bucket: t.Bucket,
+	d := targetDTO{
+		ID: t.ID, Name: t.Name, Kind: t.Kind, Path: t.Path,
+		Endpoint: t.Endpoint, Bucket: t.Bucket,
 		Region: t.Region, PathStyle: t.PathStyle, Status: t.Status,
 	}
+	if t.IsFilesystem() {
+		// Capacity is read live: it is the number that tells an operator a target is
+		// about to fill up, and a cached one would be worse than none.
+		d.FreeBytes, d.TotalBytes = blobstore.Capacity(t.Path)
+	}
+	return d
 }
 
 func (s *Server) handleListTargets(w http.ResponseWriter, r *http.Request) {
@@ -309,13 +345,88 @@ func (s *Server) handleListTargets(w http.ResponseWriter, r *http.Request) {
 }
 
 type createTargetRequest struct {
-	Name      string `json:"name"`
+	Name string `json:"name"`
+	// Kind is "s3" or "filesystem". Empty is inferred from the fields present, so
+	// a client that predates filesystem targets keeps working unchanged.
+	Kind      string `json:"kind"`
+	Path      string `json:"path"`
 	Endpoint  string `json:"endpoint"`
 	Region    string `json:"region"`
 	Bucket    string `json:"bucket"`
 	AccessKey string `json:"accessKey"`
 	SecretKey string `json:"secretKey"`
 	PathStyle bool   `json:"pathStyle"`
+	// AllowSameFilesystem accepts a filesystem target on the same filesystem as
+	// ProxBack's own data directory. It is refused by default because a backup on
+	// the disk it is protecting dies with that disk; the single-disk homelab that
+	// really means it says so here.
+	AllowSameFilesystem bool `json:"allowSameFilesystem"`
+}
+
+// normalize trims the request, settles its kind and rejects a mix of the two
+// shapes. Sending S3 credentials with a path is not a target ProxBack can make
+// sense of, and quietly ignoring half of the request is how an operator ends up
+// backing up somewhere they did not intend.
+func (b *createTargetRequest) normalize() error {
+	b.Name = strings.TrimSpace(b.Name)
+	b.Kind = strings.ToLower(strings.TrimSpace(b.Kind))
+	b.Path = strings.TrimSpace(b.Path)
+	b.Bucket = strings.TrimSpace(b.Bucket)
+	b.Endpoint = strings.TrimSpace(b.Endpoint)
+	b.Region = strings.TrimSpace(b.Region)
+	if b.Name == "" {
+		return errors.New("name is required")
+	}
+	if b.Kind == "" {
+		if b.Path != "" {
+			b.Kind = store.TargetKindFilesystem
+		} else {
+			b.Kind = store.TargetKindS3
+		}
+	}
+	switch b.Kind {
+	case store.TargetKindFilesystem:
+		if b.Path == "" {
+			return errors.New(`a filesystem target requires "path": the directory or mount point to back up to`)
+		}
+		var s3Fields []string
+		for _, f := range []struct {
+			name string
+			set  bool
+		}{
+			{"endpoint", b.Endpoint != ""},
+			{"region", b.Region != ""},
+			{"bucket", b.Bucket != ""},
+			{"accessKey", b.AccessKey != ""},
+			{"secretKey", b.SecretKey != ""},
+			{"pathStyle", b.PathStyle},
+		} {
+			if f.set {
+				s3Fields = append(s3Fields, f.name)
+			}
+		}
+		if len(s3Fields) > 0 {
+			return fmt.Errorf(`a filesystem target takes only "path", but object storage fields were also set: %s`,
+				strings.Join(s3Fields, ", "))
+		}
+		return nil
+	case store.TargetKindS3:
+		if b.Bucket == "" {
+			return errors.New(`an S3 target requires "bucket"`)
+		}
+		if b.Path != "" {
+			return errors.New(`an S3 target has no "path" — remove it, or set "kind":"filesystem" to back up to a directory`)
+		}
+		if b.AllowSameFilesystem {
+			return errors.New(`"allowSameFilesystem" only applies to a filesystem target`)
+		}
+		if b.Region == "" {
+			b.Region = "us-east-1"
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown target kind %q: use \"s3\" or \"filesystem\"", b.Kind)
+	}
 }
 
 func (s *Server) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
@@ -323,28 +434,50 @@ func (s *Server) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	body.Name = strings.TrimSpace(body.Name)
-	body.Bucket = strings.TrimSpace(body.Bucket)
-	if body.Name == "" || body.Bucket == "" {
-		writeError(w, http.StatusBadRequest, "name and bucket are required")
+	if err := body.normalize(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.Region == "" {
-		body.Region = "us-east-1"
+	target := &store.S3Target{
+		Name: body.Name, Kind: body.Kind, Status: "unknown",
 	}
-	target, err := s.st.CreateS3Target(r.Context(), &store.S3Target{
-		Name: body.Name, Endpoint: s3target.NormalizeEndpoint(body.Endpoint),
-		Region: body.Region, Bucket: body.Bucket,
-		AccessKey: body.AccessKey, SecretKey: body.SecretKey, PathStyle: body.PathStyle,
-		Status: "unknown",
-	})
+	var warnings []blobstore.Warning
+	if body.Kind == store.TargetKindFilesystem {
+		// A filesystem target is checked *before* it is stored: an unwritable path or
+		// one on ProxBack's own disk is a configuration mistake to report, not a
+		// broken target to save.
+		diag, err := blobstore.Check(blobstore.CheckRequest{
+			Path:                body.Path,
+			DataDir:             s.dataDir,
+			AllowSameFilesystem: body.AllowSameFilesystem,
+		})
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Store the resolved absolute path: a relative one would depend on the
+		// server's working directory, which nothing should.
+		target.Path = diag.Path
+		warnings = diag.Warnings
+		for _, warn := range warnings {
+			s.log.Warn("filesystem target warning", "target", body.Name, "code", warn.Code, "detail", warn.Detail)
+		}
+	} else {
+		target.Endpoint = s3target.NormalizeEndpoint(body.Endpoint)
+		target.Region = body.Region
+		target.Bucket = body.Bucket
+		target.AccessKey = body.AccessKey
+		target.SecretKey = body.SecretKey
+		target.PathStyle = body.PathStyle
+	}
+	target, err := s.st.CreateS3Target(r.Context(), target)
 	if err != nil {
 		s.serverError(w, err)
 		return
 	}
 	// Best effort connectivity probe so the UI shows a status immediately.
 	status := "online"
-	if err := s.probeTarget(r, target); err != nil {
+	if _, err := s.probeTarget(r, target); err != nil {
 		s.log.Warn("target probe failed", "target", target.Name, "error", err)
 		status = "error"
 	}
@@ -353,19 +486,41 @@ func (s *Server) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target.Status = status
-	s.log.Info("backup target added", "target", target.Name, "bucket", target.Bucket, "status", status)
-	writeJSON(w, http.StatusOK, toTargetDTO(target))
+	s.log.Info("backup target added", "target", target.Name, "kind", target.Kind,
+		"bucket", target.Bucket, "path", target.Path, "status", status)
+	// Where the target points is recorded; the access key and secret key are not.
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditTargetCreate, ObjectKind: "target",
+		ObjectID: target.ID, ObjectName: target.Name,
+		Detail: targetAuditDetail(target),
+	})
+	out := toTargetDTO(target)
+	out.Warnings = warnings
+	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *Server) probeTarget(r *http.Request, t *store.S3Target) error {
-	client, err := s3target.New(r.Context(), s3target.Config{
-		Endpoint: t.Endpoint, Region: t.Region, Bucket: t.Bucket,
-		AccessKey: t.AccessKey, SecretKey: t.SecretKey, PathStyle: t.PathStyle,
-	})
-	if err != nil {
-		return err
+// probeTarget runs the target's own connection test: a probe object round trip on
+// object storage, the full path diagnosis on a filesystem target. The diagnosis is
+// nil for an S3 target, which has no path to diagnose.
+//
+// Testing an *existing* filesystem target never refuses it for sharing a
+// filesystem with the data directory — that decision was made when the target was
+// created, and flipping a working target to "error" for it would be a lie. The
+// warning is still reported.
+func (s *Server) probeTarget(r *http.Request, t *store.S3Target) (*blobstore.Diagnosis, error) {
+	if t.IsFilesystem() {
+		diag, err := blobstore.Check(blobstore.CheckRequest{
+			Path:                t.Path,
+			DataDir:             s.dataDir,
+			AllowSameFilesystem: true,
+		})
+		return &diag, err
 	}
-	return client.Test(r.Context())
+	bs, err := sched.StoreForTarget(r.Context(), t)
+	if err != nil {
+		return nil, err
+	}
+	return nil, bs.Test(r.Context())
 }
 
 func (s *Server) handleTestTarget(w http.ResponseWriter, r *http.Request) {
@@ -374,22 +529,61 @@ func (s *Server) handleTestTarget(w http.ResponseWriter, r *http.Request) {
 		s.notFoundOr(w, err, "target")
 		return
 	}
-	if err := s.probeTarget(r, target); err != nil {
-		_ = s.st.UpdateS3TargetStatus(r.Context(), target.ID, "error")
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
-		return
+	diag, probeErr := s.probeTarget(r, target)
+	out := map[string]any{"ok": probeErr == nil}
+	if probeErr != nil {
+		out["error"] = probeErr.Error()
 	}
-	if err := s.st.UpdateS3TargetStatus(r.Context(), target.ID, "online"); err != nil {
+	if diag != nil {
+		// Structured diagnostics, not a pass/fail: "it works, but that path is not a
+		// mount point" is the single most useful thing to tell a NAS operator.
+		out["path"] = diag.Path
+		out["freeBytes"] = diag.FreeBytes
+		out["totalBytes"] = diag.TotalBytes
+		out["isMountPoint"] = diag.IsMountPoint
+		out["sameFilesystemAsDataDir"] = diag.SameFilesystemAsDataDir
+		if diag.FilesystemType != "" {
+			out["filesystemType"] = diag.FilesystemType
+		}
+		if diag.MountPoint != "" {
+			out["mountPoint"] = diag.MountPoint
+		}
+		out["warnings"] = diag.Warnings
+	}
+	status := "online"
+	if probeErr != nil {
+		status = "error"
+	}
+	if err := s.st.UpdateS3TargetStatus(r.Context(), target.ID, status); err != nil {
 		s.serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, out)
+}
+
+// targetAuditDetail describes where a target points, and nothing that could
+// authenticate to it: never the access key, never the secret key.
+func targetAuditDetail(t *store.S3Target) string {
+	if t.IsFilesystem() {
+		return "filesystem target at " + t.Path
+	}
+	return "s3 target " + t.Bucket + " at " + t.Endpoint
 }
 
 func (s *Server) handleDeleteTarget(w http.ResponseWriter, r *http.Request) {
-	if err := s.st.DeleteS3Target(r.Context(), chi.URLParam(r, "id")); err != nil {
+	id := chi.URLParam(r, "id")
+	name, detail := "", ""
+	if target, err := s.st.S3TargetByID(r.Context(), id); err == nil {
+		name = target.Name
+		detail = targetAuditDetail(target)
+	}
+	if err := s.st.DeleteS3Target(r.Context(), id); err != nil {
 		s.notFoundOr(w, err, "target")
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditTargetDelete, ObjectKind: "target",
+		ObjectID: id, ObjectName: name, Detail: detail,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

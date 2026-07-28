@@ -44,6 +44,7 @@ import {
   StatusPill,
   toneForStatus,
 } from './ui'
+import { roleDeniedReason, useSession } from '../session'
 import { useAsync } from '../lib/useAsync'
 import { formatRelative } from '../lib/format'
 
@@ -119,6 +120,10 @@ function AssignControl({
 export function HelpersSection({ hosts }: { hosts: Host[] }) {
   const toast = useToast()
   const confirm = useConfirm()
+  const { can, role } = useSession()
+  const denied = can.manageInfrastructure
+    ? undefined
+    : roleDeniedReason(role, 'deploy or remove node helpers')
   const loader = useCallback(() => listHelpers(), [])
   const { data, loading, error, reload, refresh } = useAsync(loader)
   const helpers = useMemo(() => data ?? [], [data])
@@ -239,6 +244,9 @@ export function HelpersSection({ hosts }: { hosts: Host[] }) {
               variant="primary"
               icon={<ServerCog className="size-3.5" aria-hidden />}
               onClick={() => setDeployOpen(true)}
+              disabled={!can.manageInfrastructure}
+              title={denied}
+              aria-label={denied ? `Deploy helper — ${denied}` : undefined}
             >
               Deploy helper
             </Button>
@@ -337,8 +345,13 @@ export function HelpersSection({ hosts }: { hosts: Host[] }) {
                     <td className="px-5 py-3 text-right">
                       <IconButton
                         variant="dangerQuiet"
-                        aria-label={`Remove the helper for ${helper.node}`}
-                        title="Remove helper"
+                        aria-label={
+                          denied
+                            ? `Remove the helper for ${helper.node} — ${denied}`
+                            : `Remove the helper for ${helper.node}`
+                        }
+                        title={denied ?? 'Remove helper'}
+                        disabled={!can.manageInfrastructure}
                         loading={deleting === String(helper.id)}
                         onClick={() => void onDelete(helper)}
                       >
@@ -395,7 +408,8 @@ export function HelpersSection({ hosts }: { hosts: Host[] }) {
               </label>
               <Button
                 loading={generating}
-                disabled={!tokenHostId}
+                disabled={!tokenHostId || !can.manageInfrastructure}
+                title={denied}
                 icon={<KeyRound className="size-4" aria-hidden />}
                 onClick={() => void onGenerate()}
               >

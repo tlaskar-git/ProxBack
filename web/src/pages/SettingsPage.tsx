@@ -21,6 +21,7 @@ import {
   getUpdateStatus,
   isApiError,
   putSettings,
+  ROLE_LABEL,
   testWebhook,
 } from '../api'
 import type { Compression, NotifyOn, Settings, UpdateStatus } from '../api'
@@ -634,7 +635,7 @@ function ChangePasswordCard() {
 
 export function SettingsPage() {
   const toast = useToast()
-  const { setServerName } = useSession()
+  const { setServerName, can, role } = useSession()
   const loader = useCallback(() => getSettings(), [])
   const { data, loading, error, reload } = useAsync(loader)
 
@@ -739,6 +740,29 @@ export function SettingsPage() {
   const onSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     void persist('server')
+  }
+
+  /**
+   * Server settings are administrator-only and the server enforces that. Rather
+   * than render four cards whose every control is refused, the page says out
+   * loud that they exist and are not yours — and keeps the one card that is:
+   * your own password, which every role may change.
+   */
+  if (!can.manageInfrastructure) {
+    return (
+      <>
+        <PageHeader
+          title="Settings"
+          description="Your password. Server settings belong to administrators."
+        />
+        <SectionNote>
+          Server identity, throughput, notifications and software updates are administrator-only on
+          this server. You are signed in as {ROLE_LABEL[role].toLowerCase()}, so they are not shown
+          — ask an administrator if something there needs changing.
+        </SectionNote>
+        <ChangePasswordCard />
+      </>
+    )
   }
 
   return (

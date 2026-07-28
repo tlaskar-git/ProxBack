@@ -604,6 +604,8 @@ function StorageCard({ stats }: { stats: DashboardStats }) {
 /** The percentage always; the ratio only when the run actually has one. */
 function ReductionCell({ run }: { run: JobRun }) {
   const reduction = reductionOf(run)
+  // A restore or verification only reads, so there is nothing to report here.
+  if (!reduction.applies) return <span className="text-meta text-slate-600">—</span>
   return (
     <span className="inline-flex items-baseline gap-1.5">
       <Num className="text-meta text-slate-200">{formatReduction(reduction.pct)}</Num>

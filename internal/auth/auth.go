@@ -70,13 +70,35 @@ func (s *Service) NeedsSetup(ctx context.Context) (bool, error) {
 	return n == 0, nil
 }
 
-// CreateUser creates a user with a bcrypt-hashed password.
+// MinPasswordLength is the shortest password the server accepts, wherever one is
+// set: first-run setup, an admin creating or resetting an account, or a user
+// changing their own.
+const MinPasswordLength = 8
+
+// CreateUser creates the installation's first account, which is an admin: the
+// user who completes setup owns the installation.
 func (s *Service) CreateUser(ctx context.Context, username, password string) (*store.User, error) {
+	return s.CreateUserWithRole(ctx, username, password, store.RoleAdmin)
+}
+
+// CreateUserWithRole creates a user with a bcrypt-hashed password and a role.
+func (s *Service) CreateUserWithRole(ctx context.Context, username, password string, role store.Role) (*store.User, error) {
 	hash, err := HashPassword(password)
 	if err != nil {
 		return nil, err
 	}
-	return s.st.CreateUser(ctx, username, hash)
+	return s.st.CreateUser(ctx, username, hash, role)
+}
+
+// SetPassword replaces a user's password without knowing the old one. It is the
+// admin reset path; a user changing their own password goes through
+// ChangePassword, which proves they know the current one.
+func (s *Service) SetPassword(ctx context.Context, userID int64, newPassword string) error {
+	hash, err := HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	return s.st.UpdateUserPassword(ctx, userID, hash)
 }
 
 // DefaultAdminUsername and DefaultAdminPassword are the credentials seeded on

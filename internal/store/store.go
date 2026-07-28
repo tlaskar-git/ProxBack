@@ -120,6 +120,8 @@ CREATE TABLE IF NOT EXISTS vms_cache (
 CREATE TABLE IF NOT EXISTS s3_targets (
 	id             TEXT PRIMARY KEY,
 	name           TEXT NOT NULL,
+	kind           TEXT NOT NULL DEFAULT 's3',
+	path           TEXT NOT NULL DEFAULT '',
 	endpoint       TEXT NOT NULL,
 	region         TEXT NOT NULL,
 	bucket         TEXT NOT NULL,
@@ -307,6 +309,19 @@ var addedColumns = []struct{ table, column, definition string }{
 	// existing row holds — means the defaults, i.e. exactly the behaviour a job
 	// had before policies existed.
 	{"jobs", "policy", "TEXT NOT NULL DEFAULT ''"},
+	// A user's role. The default is deliberately the empty string rather than a
+	// real role: migrateUserRoles is the only thing that grants admin, and it
+	// only ever touches rows that predate the column, so a value this code did
+	// not write can never be mistaken for a privileged one.
+	{"users", "role", "TEXT NOT NULL DEFAULT ''"},
+	// When a user last signed in. Never set for a user who has not.
+	{"users", "last_login_at", "TEXT"},
+	// A backup target is either object storage or a mounted path. Every row
+	// written before this column existed is object storage, which is exactly what
+	// the default says, so an upgraded installation keeps working untouched.
+	{"s3_targets", "kind", "TEXT NOT NULL DEFAULT 's3'"},
+	// The base path of a filesystem target; empty for an S3 target.
+	{"s3_targets", "path", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // helperIdentitySQL enforces the (host_id, node) identity of a node helper. It
@@ -340,6 +355,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.migrateJobRetention(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateUserRoles(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateAudit(ctx); err != nil {
 		return err
 	}
 	return s.normalizeTimestamps(ctx)

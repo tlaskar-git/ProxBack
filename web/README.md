@@ -23,7 +23,12 @@ npm run lint       # oxlint
   `parseSchedule`, `parseRetention`, `parsePolicy`, `reductionOf`.
 - `src/theme.tsx` — light / system / dark, persisted, applied as `data-theme`.
 - `src/App.tsx` — auth gate: `GET /api/setup/status`, then `GET /api/me`,
-  routing to Setup, Login, or the authenticated shell.
+  routing to Setup, Login, or the authenticated shell. `AdminOnly` wraps the
+  admin-only routes so a bookmarked `/users` explains itself instead of
+  erroring.
+- `src/session.tsx` — the signed-in user, their `role`, and the `can`
+  capability set derived from it by `capabilitiesFor`. `roleDeniedReason`
+  produces the sentence attached to a control disabled purely by role.
 - `src/components/` — layout shell plus the shared primitives (buttons, cards,
   status pills, chips, segmented control, progress bars, arc gauge, sparkline,
   modal, toasts, confirm dialog, disclosure, definition list).
@@ -31,6 +36,12 @@ npm run lint       # oxlint
     there is no stock icon standing in for a logo anywhere.
   - `Identity.tsx` — `WorkloadIdentity` / `identityText`, the canonical
     `cluster / name (vmid) / node`.
+  - `TargetIdentity.tsx` — `TargetKindChip`, `TARGET_KIND_ICON` and
+    `TargetCapacityLine`: how a storage target is recognised wherever it is
+    displayed or chosen.
+  - `ChoiceTile` (in `ui.tsx`) — the one "pick exactly one of these, and here
+    is what each one means" shape: job kind, target kind, restore mode, role.
+    Tiles are radios and callers wrap them in `role="radiogroup"`.
   - `ScheduleEditor.tsx` — the whole scheduling control: cadence, time, days.
   - `RetentionStep.tsx` — keep-last plus the GFS disclosure and the live
     keep-vs-prune preview.
@@ -60,6 +71,12 @@ healthy" were the same token.
   button, no brand surface may borrow them.
 - A run that is *running* carries the brand tone, not green: activity is not
   evidence of health.
+- The Audit page is the one place red does not mean "a backup failed": a
+  **denied** attempt is the finding the log exists to surface, so it gets a
+  tinted row and a hard left edge. `error` there is amber — the attempt was
+  permitted and did not complete.
+- A role is slate. It is an attribute of an account, not a verdict about the
+  estate, so `RoleBadge` never borrows a state colour.
 - `PillTone` is named for meaning — `ok | warn | fail | brand | neutral` — so a
   call site cannot quietly pick a pigment.
 
@@ -105,6 +122,36 @@ re-points every ramp variable, so a utility like `text-slate-400` keeps meaning
 - Every quantity — bytes, counts, durations, ratios, percentages — renders
   through `<Num>` (`font-mono tabular-nums`) so columns line up and polled
   values never reflow the row.
+- **Hiding is courtesy; the server enforces.** `GET /api/me` carries the role,
+  `capabilitiesFor` turns it into `can`, and the console uses it to hide nav
+  items and mutating controls. A hidden control is never a security boundary —
+  every mutating route carries a required role and answers 403. Where an
+  absence would be confusing, the control is **disabled with the reason** in
+  both `title` and `aria-label` (a disabled button is not focusable, so the
+  label is what assistive tech reads) rather than vanishing: a viewer should
+  understand the product has a Run button they lack rights to, not conclude it
+  does not exist. Nav is the exception — a page whose every control is refused
+  is not a page.
+- A `403` is explained, never shown raw. Every catch site funnels through
+  `errorMessage`, which turns a role refusal into "Your role does not allow
+  this." and appends the server's detail only when it adds something.
+- **A storage target is a path, not a protocol.** ProxBack has no NFS or SMB
+  client; the operator mounts the share with the OS and points a `filesystem`
+  target at the mount path. The Add-target flow therefore asks for the *kind*
+  first and then shows only that kind's fields — never both.
+- **A warning is not a failure.** A connection test that reports "this path is
+  not a mount point" or "same filesystem as ProxBack's own data" succeeded:
+  amber and informational. Red is blocking. Collapsing the two is exactly how
+  "the NAS never mounted" gets read as success.
+- Target `kind` travels with the target everywhere it is displayed or chosen —
+  targets page, job row, job wizard, restore points, restore review — because
+  "local or offsite?" changes both the recovery speed and the blast radius.
+- Filesystem targets show capacity from `freeBytes`/`totalBytes`, amber under
+  10% free. A bucket is elastic and reports neither, so nothing is drawn for
+  one: an empty bar would read as "full".
+- **Contract safety rules are enforced in the UI too, before the click.** The
+  last administrator's demote and delete controls are disabled with the reason
+  attached rather than left inviting and answered with a 409.
 - **The console shows evidence, not opinion.** The dashboard verdict is the
   server's `GET /api/posture`; the UI renders `reasons[]` with their workload
   counts and never derives a verdict of its own. When posture cannot be

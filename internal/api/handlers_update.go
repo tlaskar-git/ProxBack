@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"proxback/internal/store"
 	"proxback/internal/update"
 	"proxback/internal/version"
 )
@@ -99,6 +100,10 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, err)
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditUpdateApply, ObjectKind: "server", ObjectName: "proxback-server",
+		Detail: "updated from " + version.Version + " to " + rel.Version(),
+	})
 	restarting := s.restart != nil
 	if restarting {
 		s.log.Info("update installed; restarting", "version", rel.Version())

@@ -229,6 +229,26 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		current.UploadLimitMbps = *body.UploadLimitMbps
 	}
+	// What changed is recorded as a list of field names, never as values: a
+	// webhook URL routinely carries a token in its path, and an audit trail must
+	// not become a place secrets are kept.
+	var changed []string
+	for _, f := range []struct {
+		name    string
+		changed bool
+	}{
+		{"serverName", body.ServerName != nil},
+		{"concurrency", body.Concurrency != nil},
+		{"webhookUrl", body.WebhookURL != nil},
+		{"notifyOn", body.NotifyOn != nil},
+		{"uploadConcurrency", body.UploadConcurrency != nil},
+		{"compression", body.Compression != nil},
+		{"uploadLimitMbps", body.UploadLimitMbps != nil},
+	} {
+		if f.changed {
+			changed = append(changed, f.name)
+		}
+	}
 	if err := s.st.SaveSettings(r.Context(), current); err != nil {
 		s.serverError(w, err)
 		return
@@ -239,6 +259,12 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.sched.SetConcurrency(saved.Concurrency)
+	if len(changed) > 0 {
+		s.audit(r, store.AuditEntry{
+			Action: store.AuditSettingsModify, ObjectKind: "settings",
+			Detail: "changed " + strings.Join(changed, ", "),
+		})
+	}
 	writeJSON(w, http.StatusOK, s.settingsDTO(saved))
 }
 

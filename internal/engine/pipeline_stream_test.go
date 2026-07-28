@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"proxback/internal/blobstore"
 	"proxback/internal/engine"
 	"proxback/internal/s3sim"
 	"proxback/internal/s3target"
@@ -66,7 +67,11 @@ func (s *s3Stub) failChunkKey(sha string) {
 }
 
 // newStubEngine builds an engine whose target is the S3 simulator behind a stub
-// that can delay and fail uploads.
+// that can delay and fail uploads. The tests that use it are about the upload
+// pipeline's behaviour under latency and injected HTTP failures, which is why they
+// are S3-only: the equivalent failure injection for a filesystem target lives in
+// internal/blobstore. Everything that is about the engine rather than the transport
+// runs over both kinds of store (see eachBackend).
 func newStubEngine(t *testing.T, opts engine.Options) (*engine.Engine, *s3target.Client, *store.Store, *s3Stub) {
 	t.Helper()
 	ctx := context.Background()
@@ -203,46 +208,50 @@ func TestConcurrencyDoesNotChangeTheResult(t *testing.T) {
 		size   int64
 		stats  engine.Stats
 	}
-	run := func(workers int) outcome {
-		eng, _, _, _ := newStubEngine(t, engine.Options{UploadConcurrency: workers})
-		sess := eng.NewSession(int64(len(data)), nil)
-		dm, err := sess.BackupStream(ctx, "scsi0", bytes.NewReader(data))
-		if err != nil {
-			t.Fatalf("backup with %d workers: %v", workers, err)
-		}
-		if !bytes.Equal(restoreAll(t, eng, dm), data) {
-			t.Fatalf("restore with %d workers differs from the input", workers)
-		}
-		return outcome{chunks: dm.Chunks, size: dm.SizeBytes, stats: sess.Stats()}
-	}
-
-	serial := run(1)
-	for _, workers := range []int{2, 4, 8, 16} {
-		got := run(workers)
-		if len(got.chunks) != len(serial.chunks) {
-			t.Fatalf("%d workers produced %d chunks, serial produced %d", workers, len(got.chunks), len(serial.chunks))
-		}
-		for i := range serial.chunks {
-			if got.chunks[i] != serial.chunks[i] {
-				t.Fatalf("%d workers: chunk %d = %+v, serial = %+v", workers, i, got.chunks[i], serial.chunks[i])
+	for _, be := range backends() {
+		t.Run(be.name, func(t *testing.T) {
+			run := func(workers int) outcome {
+				eng, _, _ := newEngineOn(t, be, engine.Options{UploadConcurrency: workers})
+				sess := eng.NewSession(int64(len(data)), nil)
+				dm, err := sess.BackupStream(ctx, "scsi0", bytes.NewReader(data))
+				if err != nil {
+					t.Fatalf("backup with %d workers: %v", workers, err)
+				}
+				if !bytes.Equal(restoreAll(t, eng, dm), data) {
+					t.Fatalf("restore with %d workers differs from the input", workers)
+				}
+				return outcome{chunks: dm.Chunks, size: dm.SizeBytes, stats: sess.Stats()}
 			}
-		}
-		if got.size != serial.size {
-			t.Fatalf("%d workers: disk size %d, serial %d", workers, got.size, serial.size)
-		}
-		if got.stats.BytesProcessed != serial.stats.BytesProcessed ||
-			got.stats.BytesUploaded != serial.stats.BytesUploaded ||
-			got.stats.BytesDeduped != serial.stats.BytesDeduped ||
-			got.stats.ChunksTotal != serial.stats.ChunksTotal ||
-			got.stats.ChunksUploaded != serial.stats.ChunksUploaded ||
-			got.stats.ChunksDeduped != serial.stats.ChunksDeduped {
-			t.Fatalf("%d workers: stats %+v, serial %+v", workers, got.stats, serial.stats)
-		}
-	}
-	// The duplicated chunk must have been uploaded once and deduplicated twice,
-	// which is exactly what a serial pipeline would have done.
-	if serial.stats.ChunksUploaded != 4 || serial.stats.ChunksDeduped != 2 {
-		t.Fatalf("baseline accounting = %+v, want 4 uploads / 2 dedups", serial.stats)
+
+			serial := run(1)
+			for _, workers := range []int{2, 4, 8, 16} {
+				got := run(workers)
+				if len(got.chunks) != len(serial.chunks) {
+					t.Fatalf("%d workers produced %d chunks, serial produced %d", workers, len(got.chunks), len(serial.chunks))
+				}
+				for i := range serial.chunks {
+					if got.chunks[i] != serial.chunks[i] {
+						t.Fatalf("%d workers: chunk %d = %+v, serial = %+v", workers, i, got.chunks[i], serial.chunks[i])
+					}
+				}
+				if got.size != serial.size {
+					t.Fatalf("%d workers: disk size %d, serial %d", workers, got.size, serial.size)
+				}
+				if got.stats.BytesProcessed != serial.stats.BytesProcessed ||
+					got.stats.BytesUploaded != serial.stats.BytesUploaded ||
+					got.stats.BytesDeduped != serial.stats.BytesDeduped ||
+					got.stats.ChunksTotal != serial.stats.ChunksTotal ||
+					got.stats.ChunksUploaded != serial.stats.ChunksUploaded ||
+					got.stats.ChunksDeduped != serial.stats.ChunksDeduped {
+					t.Fatalf("%d workers: stats %+v, serial %+v", workers, got.stats, serial.stats)
+				}
+			}
+			// The duplicated chunk must have been uploaded once and deduplicated twice,
+			// which is exactly what a serial pipeline would have done.
+			if serial.stats.ChunksUploaded != 4 || serial.stats.ChunksDeduped != 2 {
+				t.Fatalf("baseline accounting = %+v, want 4 uploads / 2 dedups", serial.stats)
+			}
+		})
 	}
 }
 
@@ -350,9 +359,12 @@ func TestParallelUploadsAreFasterThanSerialOnes(t *testing.T) {
 // ---------------------------------------------------------------- compression
 
 func TestCompressionRoundTripAndAccounting(t *testing.T) {
-	ctx := context.Background()
-	eng, client, st, _ := newStubEngine(t, engine.Options{Compression: engine.CompressionZstd})
+	eachBackendWithOptions(t, engine.Options{Compression: engine.CompressionZstd},
+		testCompressionRoundTripAndAccounting)
+}
 
+func testCompressionRoundTripAndAccounting(t *testing.T, eng *engine.Engine, client blobstore.Store, st *store.Store) {
+	ctx := context.Background()
 	data := compressibleBytes(9 << 20)
 	sess := eng.NewSession(int64(len(data)), nil)
 	dm, err := sess.BackupStream(ctx, "scsi0", bytes.NewReader(data))
@@ -413,9 +425,14 @@ func TestCompressionRoundTripAndAccounting(t *testing.T) {
 // TestIncompressibleChunksAreStoredRaw covers already compressed or encrypted
 // disks: spending CPU to make the object bigger would be the worst of both.
 func TestIncompressibleChunksAreStoredRaw(t *testing.T) {
-	ctx := context.Background()
-	eng, client, _, _ := newStubEngine(t, engine.Options{Compression: engine.CompressionZstd})
+	eachBackendWithOptions(t, engine.Options{Compression: engine.CompressionZstd},
+		func(t *testing.T, eng *engine.Engine, client blobstore.Store, _ *store.Store) {
+			testIncompressibleChunksAreStoredRaw(t, eng, client)
+		})
+}
 
+func testIncompressibleChunksAreStoredRaw(t *testing.T, eng *engine.Engine, client blobstore.Store) {
+	ctx := context.Background()
 	data := deterministicBytes(6<<20, 4242)
 	sess := eng.NewSession(int64(len(data)), nil)
 	dm, err := sess.BackupStream(ctx, "scsi0", bytes.NewReader(data))
@@ -446,8 +463,12 @@ func TestIncompressibleChunksAreStoredRaw(t *testing.T) {
 // after compression was enabled routinely references chunks uploaded before it,
 // and both forms have to reassemble into one stream.
 func TestMixedRawAndCompressedChunksRestore(t *testing.T) {
+	eachBackendWithOptions(t, engine.Options{Compression: engine.CompressionOff},
+		testMixedRawAndCompressedChunksRestore)
+}
+
+func testMixedRawAndCompressedChunksRestore(t *testing.T, off *engine.Engine, client blobstore.Store, st *store.Store) {
 	ctx := context.Background()
-	off, client, st, _ := newStubEngine(t, engine.Options{Compression: engine.CompressionOff})
 
 	// First half uploaded with compression off (stored raw, pre-v0.3.2 style).
 	first := compressibleBytes(8 << 20)
@@ -495,10 +516,13 @@ func TestMixedRawAndCompressedChunksRestore(t *testing.T) {
 // magic introduces: raw data that happens to begin with "PBZ1". Decompression
 // fails, the reader falls back to raw, and the SHA-256 check confirms it.
 func TestRawChunkStartingWithTheMagicStillRestores(t *testing.T) {
-	ctx := context.Background()
-	// Compression off, so the bytes reach the bucket verbatim — magic and all.
-	eng, client, st, _ := newStubEngine(t, engine.Options{Compression: engine.CompressionOff})
+	// Compression off, so the bytes reach the target verbatim — magic and all.
+	eachBackendWithOptions(t, engine.Options{Compression: engine.CompressionOff},
+		testRawChunkStartingWithTheMagicStillRestores)
+}
 
+func testRawChunkStartingWithTheMagicStillRestores(t *testing.T, eng *engine.Engine, client blobstore.Store, st *store.Store) {
+	ctx := context.Background()
 	data := append([]byte("PBZ1"), deterministicBytes(2<<20, 909)...)
 	dm, err := eng.NewSession(int64(len(data)), nil).BackupStream(ctx, "scsi0", bytes.NewReader(data))
 	if err != nil {
@@ -526,12 +550,28 @@ func TestRawChunkStartingWithTheMagicStillRestores(t *testing.T) {
 func TestDedupIsIndependentOfTheCompressionSetting(t *testing.T) {
 	ctx := context.Background()
 
-	for _, tc := range []struct{ name, first, second string }{
+	type flip struct{ name, first, second string }
+	cases := []flip{
 		{"off-then-zstd", engine.CompressionOff, engine.CompressionZstd},
 		{"zstd-then-off", engine.CompressionZstd, engine.CompressionOff},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			eng, client, st, _ := newStubEngine(t, engine.Options{Compression: tc.first})
+	}
+	var combos []struct {
+		backend
+		flip
+	}
+	for _, be := range backends() {
+		for _, tc := range cases {
+			combos = append(combos, struct {
+				backend
+				flip
+			}{be, tc})
+		}
+	}
+	for _, combo := range combos {
+		tc := combo.flip
+		be := combo.backend
+		t.Run(be.name+"/"+tc.name, func(t *testing.T) {
+			eng, client, st := newEngineOn(t, be, engine.Options{Compression: tc.first})
 			data := compressibleBytes(12 << 20)
 
 			first := eng.NewSession(int64(len(data)), nil)
@@ -631,9 +671,12 @@ func TestUploadRateLimitCapsThroughput(t *testing.T) {
 // production incident where a run interrupted by a server restart had its 24.8 GB
 // of already uploaded chunks collected as orphans, forcing a full re-upload.
 func TestGCGraceKeepsAnInterruptedBackupResumable(t *testing.T) {
-	ctx := context.Background()
-	eng, client, st, _ := newStubEngine(t, engine.Options{UploadConcurrency: 4})
+	eachBackendWithOptions(t, engine.Options{UploadConcurrency: 4},
+		testGCGraceKeepsAnInterruptedBackupResumable)
+}
 
+func testGCGraceKeepsAnInterruptedBackupResumable(t *testing.T, eng *engine.Engine, client blobstore.Store, st *store.Store) {
+	ctx := context.Background()
 	data := deterministicBytes(20<<20, 8181)
 	// An interrupted run: chunks are uploaded and indexed, but the process dies
 	// before the manifest is written, so nothing references them.
@@ -700,9 +743,13 @@ func TestGCGraceKeepsAnInterruptedBackupResumable(t *testing.T) {
 // TestGCStillCollectsChunksOlderThanTheGraceWindow keeps retention honest: the
 // grace window delays collection, it does not disable it.
 func TestGCStillCollectsChunksOlderThanTheGraceWindow(t *testing.T) {
-	ctx := context.Background()
-	eng, _, st, _ := newStubEngine(t, engine.Options{})
+	eachBackend(t, func(t *testing.T, eng *engine.Engine, _ blobstore.Store, st *store.Store) {
+		testGCStillCollectsChunksOlderThanTheGraceWindow(t, eng, st)
+	})
+}
 
+func testGCStillCollectsChunksOlderThanTheGraceWindow(t *testing.T, eng *engine.Engine, st *store.Store) {
+	ctx := context.Background()
 	data := deterministicBytes(8<<20, 2727)
 	dm, err := eng.NewSession(int64(len(data)), nil).BackupStream(ctx, "scsi0", bytes.NewReader(data))
 	if err != nil {
@@ -735,8 +782,14 @@ func TestGCStillCollectsChunksOlderThanTheGraceWindow(t *testing.T) {
 // TestGCGraceCanBeDisabled documents the option the scheduler passes through for
 // installations (and tests) that want immediate collection.
 func TestGCGraceCanBeDisabled(t *testing.T) {
+	eachBackendWithOptions(t, engine.Options{GCGrace: -1},
+		func(t *testing.T, eng *engine.Engine, _ blobstore.Store, st *store.Store) {
+			testGCGraceCanBeDisabled(t, eng, st)
+		})
+}
+
+func testGCGraceCanBeDisabled(t *testing.T, eng *engine.Engine, st *store.Store) {
 	ctx := context.Background()
-	eng, _, st, _ := newStubEngine(t, engine.Options{GCGrace: -1})
 	if eng.GCGrace() != 0 {
 		t.Fatalf("GCGrace = %v, want the grace window disabled", eng.GCGrace())
 	}

@@ -67,13 +67,18 @@ type apiVM struct {
 }
 
 type apiTarget struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Endpoint  string `json:"endpoint"`
-	Bucket    string `json:"bucket"`
-	Region    string `json:"region"`
-	PathStyle bool   `json:"pathStyle"`
-	Status    string `json:"status"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Kind is "s3" or "filesystem"; the fields of the other kind stay empty.
+	Kind       string `json:"kind"`
+	Path       string `json:"path"`
+	Endpoint   string `json:"endpoint"`
+	Bucket     string `json:"bucket"`
+	Region     string `json:"region"`
+	PathStyle  bool   `json:"pathStyle"`
+	Status     string `json:"status"`
+	FreeBytes  int64  `json:"freeBytes"`
+	TotalBytes int64  `json:"totalBytes"`
 }
 
 type apiJobSource struct {
@@ -3349,6 +3354,363 @@ func TestEndToEnd(t *testing.T) {
 		h.ok(http.MethodGet, "/api/backups?jobId="+job.ID, nil, &backups)
 		if len(backups) == 0 {
 			t.Fatal("a retention policy that keeps nothing deleted every restore point")
+		}
+	})
+
+	// ---- Step 29: the whole product against a filesystem target -------------
+	//
+	// A homelab or SMB backs up to a NAS or a local disk first and copies offsite
+	// second, so everything above has to work with no object storage anywhere:
+	// backup, dedup, incremental, verification, a byte-identical restore and
+	// retention with orphan collection, all against a path.
+	t.Run("29-filesystem-target-end-to-end", func(t *testing.T) {
+		s3ChunksBefore, s3BytesBefore := h.chunkBytes(vmBucket)
+
+		// The helpers registered by the steps above went away with their
+		// subtests, so this scenario is the agentless one: the server exports
+		// each disk from the Proxmox API itself. Retiring the stale
+		// registrations is what an operator would do too — a helper that no
+		// longer answers is not a route to keep.
+		var helpers []struct {
+			ID   string `json:"id"`
+			Node string `json:"node"`
+		}
+		h.ok(http.MethodGet, "/api/helpers", nil, &helpers)
+		for _, hp := range helpers {
+			h.ok(http.MethodDelete, "/api/helpers/"+hp.ID, nil, nil)
+		}
+
+		share := filepath.Join(t.TempDir(), "nas", "proxback")
+		if err := os.MkdirAll(share, 0o755); err != nil {
+			t.Fatalf("create the share: %v", err)
+		}
+
+		// Backing up onto the filesystem ProxBack itself runs from is refused, and
+		// the refusal says how to accept the risk on purpose. The E2E data
+		// directory and this share are both temp directories, so that is the case
+		// here on any platform that can compare filesystems.
+		code, body := h.do(http.MethodPost, "/api/targets", map[string]any{
+			"name": "nas-storage", "kind": "filesystem", "path": share,
+		})
+		switch code {
+		case http.StatusBadRequest:
+			if !strings.Contains(string(body), "allowSameFilesystem") {
+				t.Fatalf("refusal does not explain the override: %s", body)
+			}
+			t.Logf("same-filesystem refusal: %s", body)
+		case http.StatusOK:
+			t.Logf("the share is on a different filesystem than the data directory; " +
+				"the same-filesystem refusal is covered in internal/api and internal/blobstore")
+			var accepted apiTarget
+			if err := json.Unmarshal(body, &accepted); err != nil {
+				t.Fatalf("decode target: %v", err)
+			}
+			h.ok(http.MethodDelete, "/api/targets/"+accepted.ID, nil, nil)
+		default:
+			t.Fatalf("POST /api/targets = %d (%s)", code, body)
+		}
+
+		// A mix of the two shapes is refused rather than half applied.
+		if code, body := h.do(http.MethodPost, "/api/targets", map[string]any{
+			"name": "confused", "kind": "filesystem", "path": share, "bucket": vmBucket,
+		}); code != http.StatusBadRequest || !strings.Contains(string(body), "bucket") {
+			t.Fatalf("a filesystem target with a bucket = %d (%s), want 400 naming bucket", code, body)
+		}
+
+		var nasTarget apiTarget
+		h.ok(http.MethodPost, "/api/targets", map[string]any{
+			"name": "nas-storage", "kind": "filesystem", "path": share,
+			"allowSameFilesystem": true,
+		}, &nasTarget)
+		if nasTarget.ID == "" || nasTarget.Kind != "filesystem" || nasTarget.Path != share {
+			t.Fatalf("created filesystem target = %+v", nasTarget)
+		}
+		if nasTarget.Bucket != "" || nasTarget.Endpoint != "" {
+			t.Fatalf("filesystem target carries object storage fields: %+v", nasTarget)
+		}
+		if nasTarget.Status != "online" {
+			t.Fatalf("filesystem target status = %q, want online", nasTarget.Status)
+		}
+		if nasTarget.TotalBytes <= 0 || nasTarget.FreeBytes <= 0 {
+			t.Logf("this platform does not report capacity for %s", share)
+		}
+
+		// The listing keeps both kinds side by side, with capacity for the path.
+		var targets []apiTarget
+		h.ok(http.MethodGet, "/api/targets", nil, &targets)
+		var listed apiTarget
+		for _, tg := range targets {
+			switch tg.ID {
+			case nasTarget.ID:
+				listed = tg
+			default:
+				if tg.Kind != "s3" {
+					t.Fatalf("existing target %s reports kind %q, want s3", tg.Name, tg.Kind)
+				}
+				if tg.Path != "" || tg.FreeBytes != 0 || tg.TotalBytes != 0 {
+					t.Fatalf("an S3 target reports a path or capacity: %+v", tg)
+				}
+			}
+		}
+		if listed.ID == "" || listed.Path != share || listed.TotalBytes != nasTarget.TotalBytes {
+			t.Fatalf("listed filesystem target = %+v", listed)
+		}
+
+		// The connection test is a diagnosis, not a pass/fail: the share is a
+		// subdirectory, so it is not a mount point and the console is told so.
+		var probe struct {
+			OK             bool   `json:"ok"`
+			Error          string `json:"error"`
+			Path           string `json:"path"`
+			FreeBytes      int64  `json:"freeBytes"`
+			TotalBytes     int64  `json:"totalBytes"`
+			FilesystemType string `json:"filesystemType"`
+			MountPoint     string `json:"mountPoint"`
+			IsMountPoint   bool   `json:"isMountPoint"`
+			Warnings       []struct {
+				Code   string `json:"code"`
+				Detail string `json:"detail"`
+			} `json:"warnings"`
+		}
+		h.ok(http.MethodPost, "/api/targets/"+nasTarget.ID+"/test", nil, &probe)
+		if !probe.OK {
+			t.Fatalf("filesystem target test failed: %s", probe.Error)
+		}
+		if probe.Path != share {
+			t.Fatalf("test reported path %q, want %s", probe.Path, share)
+		}
+		if probe.IsMountPoint {
+			t.Fatalf("a subdirectory was reported as a mount point: %+v", probe)
+		}
+		if len(probe.Warnings) == 0 {
+			t.Fatal("the connection test reported no diagnostics for a non-mount-point share")
+		}
+		for _, w := range probe.Warnings {
+			if w.Code == "" || w.Detail == "" {
+				t.Fatalf("warning %+v is not usable by a console", w)
+			}
+			t.Logf("target diagnostic %s: %s", w.Code, w.Detail)
+		}
+
+		// ---- on-disk helpers: the point of a path target is that you can look
+		// at it, so the assertions below read the tree directly.
+		chunkFiles := func() []string {
+			entries, err := os.ReadDir(filepath.Join(share, "chunks"))
+			if err != nil {
+				t.Fatalf("read the chunk directory: %v", err)
+			}
+			out := make([]string, 0, len(entries))
+			for _, e := range entries {
+				out = append(out, e.Name())
+			}
+			return out
+		}
+		chunkTotal := func() int64 {
+			var total int64
+			for _, name := range chunkFiles() {
+				info, err := os.Stat(filepath.Join(share, "chunks", name))
+				if err != nil {
+					t.Fatalf("stat chunk %s: %v", name, err)
+				}
+				total += info.Size()
+			}
+			return total
+		}
+		manifestFiles := func() []string {
+			var out []string
+			root := filepath.Join(share, "manifests")
+			if err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					if os.IsNotExist(err) {
+						return nil
+					}
+					return err
+				}
+				if !info.IsDir() {
+					rel, relErr := filepath.Rel(share, path)
+					if relErr != nil {
+						return relErr
+					}
+					out = append(out, filepath.ToSlash(rel))
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("walk the manifest tree: %v", err)
+			}
+			sort.Strings(out)
+			return out
+		}
+
+		// ---- a full backup ---------------------------------------------------
+		var nasJob apiJob
+		h.ok(http.MethodPost, "/api/jobs", map[string]any{
+			"name": "nightly-nas", "kind": "vm", "targetId": nasTarget.ID,
+			"schedule": "manual", "retention": 2, "enabled": true,
+			"sources": []map[string]any{
+				{"hostId": host.ID, "vmid": 101, "name": "db-01"},
+			},
+		}, &nasJob)
+		if nasJob.TargetName != "nas-storage" {
+			t.Fatalf("job target = %q", nasJob.TargetName)
+		}
+
+		full := h.runJob(nasJob.ID)
+		if full.BytesProcessed != int64(16*mib) || full.BytesUploaded != int64(16*mib) {
+			t.Fatalf("first run to the share = %d processed / %d uploaded, want %d / %d",
+				full.BytesProcessed, full.BytesUploaded, 16*mib, 16*mib)
+		}
+		// The layout on disk is exactly the documented one, and it is the same
+		// layout an S3 target holds: chunks/<sha> and manifests/<kind>/<id>/<id>.json.
+		if got := chunkFiles(); len(got) != 4 {
+			t.Fatalf("the share holds %d chunks, want 4 (16 MiB in 4 MiB chunks): %v", len(got), got)
+		}
+		for _, name := range chunkFiles() {
+			if len(name) != 64 {
+				t.Fatalf("chunk file %q is not a SHA-256 content address", name)
+			}
+		}
+		if total := chunkTotal(); total != int64(16*mib) {
+			t.Fatalf("the share holds %d chunk bytes, want %d", total, 16*mib)
+		}
+		manifests := manifestFiles()
+		if len(manifests) != 1 ||
+			!strings.HasPrefix(manifests[0], "manifests/vm/"+host.ID+"_101/") ||
+			!strings.HasSuffix(manifests[0], ".json") {
+			t.Fatalf("manifest tree = %v", manifests)
+		}
+
+		// ---- an unchanged re-run deduplicates, an incremental uploads the delta
+		dedup := h.runJob(nasJob.ID)
+		if dedup.BytesUploaded != 0 || dedup.DedupRatio < 0.999 {
+			t.Fatalf("unchanged re-run to the share uploaded %d bytes (ratio %v)",
+				dedup.BytesUploaded, dedup.DedupRatio)
+		}
+		if got := len(chunkFiles()); got != 4 {
+			t.Fatalf("a deduplicated run grew the share to %d chunks", got)
+		}
+
+		disk, changed, err := h.sim.Mutate(101)
+		if err != nil {
+			t.Fatalf("mutate db-01: %v", err)
+		}
+		if changed != 1 {
+			t.Fatalf("the simulator changed %d chunks, want 1", changed)
+		}
+		incr := h.runJob(nasJob.ID)
+		if incr.BytesUploaded != int64(4*mib) {
+			t.Fatalf("incremental to the share uploaded %d bytes, want one 4 MiB chunk", incr.BytesUploaded)
+		}
+		if got := len(chunkFiles()); got != 5 {
+			t.Fatalf("the share holds %d chunks after an incremental, want 5", got)
+		}
+
+		var points []apiBackup
+		h.ok(http.MethodGet, "/api/backups?targetId="+nasTarget.ID, nil, &points)
+		if len(points) != 2 {
+			t.Fatalf("restore points on the share = %d, want 2 (keep last 2)", len(points))
+		}
+		newest := points[0]
+		if newest.Kind != "incremental" || newest.ParentID != points[1].ID {
+			t.Fatalf("newest point = %q with parent %q", newest.Kind, newest.ParentID)
+		}
+		if newest.TargetID != nasTarget.ID || len(newest.Disks) != 1 {
+			t.Fatalf("newest point = %+v", newest)
+		}
+
+		// ---- verification re-hashes every chunk on the share -----------------
+		verify := h.waitRun(h.verify(newest.ID), 90*time.Second)
+		if verify.Status != "success" {
+			t.Fatalf("verification against the share finished %q: %s", verify.Status, verify.Error)
+		}
+		if verify.BytesProcessed != newest.SizeBytes || verify.BytesUploaded != 0 {
+			t.Fatalf("verification read %d bytes and uploaded %d, want %d / 0",
+				verify.BytesProcessed, verify.BytesUploaded, newest.SizeBytes)
+		}
+		verified := h.backupByID(newest.SourceKind, newest.SourceID, newest.ID)
+		if verified.LastVerifyResult != "passed" || verified.LastVerifiedAt == nil ||
+			verified.VerifiedBytes != newest.SizeBytes {
+			t.Fatalf("verification evidence on the restore point = %+v", verified)
+		}
+
+		// ---- a byte-identical restore ---------------------------------------
+		node := ""
+		for _, v := range vms {
+			if v.VMID == 101 {
+				node = v.Node
+			}
+		}
+		if node == "" {
+			t.Fatal("db-01 is not in the inventory")
+		}
+		var started struct {
+			RunID string `json:"runId"`
+		}
+		h.ok(http.MethodPost, "/api/restores", map[string]any{
+			"backupId": newest.ID,
+			"vm":       map[string]any{"hostId": host.ID, "node": node, "vmid": 9998},
+		}, &started)
+		restore := h.waitRun(started.RunID, 90*time.Second)
+		if restore.Status != "success" {
+			t.Fatalf("restore from the share finished %q: %s", restore.Status, restore.Error)
+		}
+		if restore.Restore == nil || restore.Restore.Mode != "alongside" || restore.Restore.VMID != 9998 {
+			t.Fatalf("restore destination = %+v", restore.Restore)
+		}
+		want := h.fetchRaw(fmt.Sprintf("%s/sim/disk/101/%s", h.simURL, disk))
+		got := h.fetchRaw(fmt.Sprintf("%s/sim/imported/9998/%s", h.simURL, disk))
+		if len(got) != len(want) {
+			t.Fatalf("restored %s is %d bytes, the live disk is %d", disk, len(got), len(want))
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("restored %s differs from the live disk", disk)
+		}
+
+		// ---- retention prunes and orphan chunks leave the share --------------
+		h.ok(http.MethodPatch, "/api/jobs/"+nasJob.ID, map[string]any{"retention": 1}, &nasJob)
+		pruned := h.runJob(nasJob.ID)
+		if pruned.BytesUploaded != 0 {
+			t.Fatalf("the pruning run uploaded %d bytes", pruned.BytesUploaded)
+		}
+		h.ok(http.MethodGet, "/api/backups?targetId="+nasTarget.ID, nil, &points)
+		if len(points) != 1 {
+			t.Fatalf("keep-last-1 left %d restore points on the share", len(points))
+		}
+		if manifests := manifestFiles(); len(manifests) != 1 {
+			t.Fatalf("the share holds %d manifests after pruning, want 1: %v", len(manifests), manifests)
+		}
+		// The chunk the pruned restore point referenced is unreferenced now, and
+		// orphan collection removes it from the share (the 24 h grace is switched
+		// off for this suite).
+		if got := chunkFiles(); len(got) != 4 {
+			t.Fatalf("the share holds %d chunks after collection, want 4: %v", len(got), got)
+		}
+		if total := chunkTotal(); total != int64(16*mib) {
+			t.Fatalf("the share holds %d chunk bytes after collection, want %d", total, 16*mib)
+		}
+		// The surviving restore point still restores, which is what makes the
+		// collection above safe rather than merely tidy.
+		h.ok(http.MethodPost, "/api/restores", map[string]any{
+			"backupId": points[0].ID,
+			"vm":       map[string]any{"hostId": host.ID, "node": node, "vmid": 9997},
+		}, &started)
+		if run := h.waitRun(started.RunID, 90*time.Second); run.Status != "success" {
+			t.Fatalf("restore after collection finished %q: %s", run.Status, run.Error)
+		}
+		if !bytes.Equal(h.fetchRaw(fmt.Sprintf("%s/sim/imported/9997/%s", h.simURL, disk)), want) {
+			t.Fatalf("restore after collection differs from the live disk")
+		}
+
+		// No object storage was involved in any of this.
+		if chunks, bytesOnS3 := h.chunkBytes(vmBucket); chunks != s3ChunksBefore || bytesOnS3 != s3BytesBefore {
+			t.Fatalf("the object storage bucket changed during a filesystem-only scenario: "+
+				"%d chunks / %d bytes, was %d / %d", chunks, bytesOnS3, s3ChunksBefore, s3BytesBefore)
+		}
+
+		// Deleting the target leaves the operator's data on the share: ProxBack
+		// removes its own bookkeeping, never the files on someone's NAS.
+		h.ok(http.MethodDelete, "/api/targets/"+nasTarget.ID, nil, nil)
+		if got := len(chunkFiles()); got != 4 {
+			t.Fatalf("deleting the target removed %d chunks from the share", 4-got)
 		}
 	})
 }

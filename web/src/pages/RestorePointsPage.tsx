@@ -16,13 +16,16 @@ import {
   listAgents,
   listBackups,
   listHosts,
+  listTargets,
   listVMs,
+  targetLocation,
   verifyBackup,
 } from '../api'
-import type { Agent, Backup, CachedVM, Host, ID, SourceKind } from '../api'
+import type { Agent, Backup, CachedVM, Host, ID, SourceKind, Target } from '../api'
 import { useConfirm } from '../components/Confirm'
 import { WorkloadIdentity, identityText } from '../components/Identity'
 import { RestoreWizard } from '../components/RestoreWizard'
+import { TargetKindChip } from '../components/TargetIdentity'
 import { useToast } from '../components/Toast'
 import {
   Button,
@@ -40,12 +43,14 @@ import {
 import { cn } from '../lib/cn'
 import { useAsync } from '../lib/useAsync'
 import { formatBytes, formatCount, formatDateTime, formatRelative } from '../lib/format'
+import { roleDeniedReason, useSession } from '../session'
 
 interface RestoreData {
   backups: Backup[]
   hosts: Host[]
   agents: Agent[]
   vms: CachedVM[]
+  targets: Target[]
 }
 
 /**
@@ -162,11 +167,14 @@ function VerificationBadge({ backup }: { backup: Backup }) {
 
 function BackupRow({
   backup,
+  target,
   depth,
   onRestore,
   onDeleted,
 }: {
   backup: Backup
+  /** The target holding this point, when it is still configured. */
+  target?: Target
   depth: number
   onRestore: () => void
   onDeleted: () => void
@@ -174,8 +182,11 @@ function BackupRow({
   const toast = useToast()
   const confirm = useConfirm()
   const navigate = useNavigate()
+  const { can, role } = useSession()
   const [deleting, setDeleting] = useState(false)
   const [verifying, setVerifying] = useState(false)
+
+  const denied = can.operateJobs ? undefined : roleDeniedReason(role, 'restore, verify or prune')
 
   const onVerify = async () => {
     setVerifying(true)
@@ -239,8 +250,18 @@ function BackupRow({
             </p>
             <StatusPill tone="neutral" label={backup.kind === 'full' ? 'full' : 'incremental'} />
             <VerificationBadge backup={backup} />
+            {/* Where this point physically lives: local storage restores fast,
+                an offsite bucket has to come back down the wire first. */}
+            {target ? <TargetKindChip kind={target.kind} /> : null}
           </div>
           <p className="mt-0.5 truncate text-xs text-slate-500">
+            {target ? (
+              <>
+                On <span className="text-slate-400">{target.name}</span>{' '}
+                <span className="font-mono">{targetLocation(target)}</span>
+                {' · '}
+              </>
+            ) : null}
             <Num>{formatBytes(backup.sizeBytes)}</Num> source data ·{' '}
             <Num>{formatBytes(backup.uploadedBytes)}</Num> transferred to target
             {backup.disks.length > 0 ? (
@@ -264,13 +285,24 @@ function BackupRow({
           size="sm"
           variant="primary"
           icon={<RotateCcw className="size-3.5" aria-hidden />}
+          disabled={!can.operateJobs}
+          title={denied}
+          aria-label={denied ? `Restore — ${denied}` : undefined}
           onClick={onRestore}
         >
           Restore
         </Button>
         <IconButton
-          aria-label={`Verify the restore point from ${formatDateTime(backup.createdAt)}`}
-          title="Verify integrity — read every block back from the target and re-check its hash"
+          aria-label={
+            denied
+              ? `Verify the restore point from ${formatDateTime(backup.createdAt)} — ${denied}`
+              : `Verify the restore point from ${formatDateTime(backup.createdAt)}`
+          }
+          title={
+            denied ??
+            'Verify integrity — read every block back from the target and re-check its hash'
+          }
+          disabled={!can.operateJobs}
           loading={verifying}
           onClick={() => void onVerify()}
         >
@@ -278,8 +310,13 @@ function BackupRow({
         </IconButton>
         <IconButton
           variant="dangerQuiet"
-          aria-label={`Delete the restore point from ${formatDateTime(backup.createdAt)}`}
-          title="Delete restore point"
+          aria-label={
+            denied
+              ? `Delete the restore point from ${formatDateTime(backup.createdAt)} — ${denied}`
+              : `Delete the restore point from ${formatDateTime(backup.createdAt)}`
+          }
+          title={denied ?? 'Delete restore point'}
+          disabled={!can.operateJobs}
           loading={deleting}
           onClick={() => void onDelete()}
         >
@@ -292,13 +329,14 @@ function BackupRow({
 
 export function RestorePointsPage() {
   const loader = useCallback(async (): Promise<RestoreData> => {
-    const [backups, hosts, agents, vms] = await Promise.all([
+    const [backups, hosts, agents, vms, targets] = await Promise.all([
       listBackups(),
       listHosts(),
       listAgents(),
       listVMs(),
+      listTargets(),
     ])
-    return { backups, hosts, agents, vms }
+    return { backups, hosts, agents, vms, targets }
   }, [])
   const { data, loading, error, reload, refresh } = useAsync(loader)
 
@@ -322,6 +360,13 @@ export function RestorePointsPage() {
   }, [data?.backups, selected])
 
   const depths = useMemo(() => chainDepths(detail ?? []), [detail])
+
+  /**
+   * The target a point lives on. A point can outlive the target record, so this
+   * is allowed to come back undefined and the row simply says less.
+   */
+  const targetOf = (backup: Backup): Target | undefined =>
+    (data?.targets ?? []).find((target) => String(target.id) === String(backup.targetId))
 
   return (
     <>
@@ -474,6 +519,7 @@ export function RestorePointsPage() {
                       <BackupRow
                         key={String(backup.id)}
                         backup={backup}
+                        target={targetOf(backup)}
                         depth={depths.get(String(backup.id)) ?? 0}
                         onRestore={() => setRestoring(backup)}
                         onDeleted={() => void refresh()}
@@ -489,6 +535,7 @@ export function RestorePointsPage() {
 
       <RestoreWizard
         backup={restoring}
+        target={restoring ? targetOf(restoring) : undefined}
         hosts={data?.hosts ?? []}
         agents={data?.agents ?? []}
         vms={data?.vms ?? []}

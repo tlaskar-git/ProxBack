@@ -394,6 +394,111 @@ export function Segmented<T extends string>({
 }
 
 /* ---------------------------------------------------------------------------
+ * Choice tile
+ *
+ * The one shape for "pick exactly one of these, and here is what each one
+ * means": job kind, storage-target kind, restore mode, a role. A tile carries
+ * its own one-line explanation, which is what keeps the console from making an
+ * operator guess what a word like "operator" or "filesystem" buys them.
+ *
+ * Callers wrap a set of tiles in `role="radiogroup"` with an `aria-label`; each
+ * tile is a radio, so arrow-key and screen-reader behaviour come for free.
+ * ------------------------------------------------------------------------- */
+
+/** `fail` is for a genuinely destructive choice (overwrite), never for emphasis. */
+export type ChoiceTone = 'brand' | 'fail'
+
+export function ChoiceTile({
+  selected,
+  onSelect,
+  title,
+  description,
+  icon,
+  disabled,
+  disabledReason,
+  tone = 'brand',
+  /** One short line along the bottom edge — capacity, a count, a status. */
+  meta,
+  /** Small badge beside the title, e.g. the target kind. */
+  badge,
+  className,
+}: {
+  selected: boolean
+  onSelect: () => void
+  title: string
+  description: string
+  icon: ReactNode
+  disabled?: boolean
+  disabledReason?: string
+  tone?: ChoiceTone
+  meta?: ReactNode
+  badge?: ReactNode
+  className?: string
+}) {
+  const id = useId()
+  const descriptionId = `${id}-description`
+  const destructive = tone === 'fail'
+
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={selected}
+      aria-label={title}
+      aria-describedby={descriptionId}
+      disabled={disabled}
+      title={disabled ? disabledReason : undefined}
+      onClick={onSelect}
+      className={cn(
+        'flex w-full flex-col gap-2 rounded-xl border px-4 py-3.5 text-left transition-colors duration-150',
+        selected
+          ? destructive
+            ? 'border-fail-500/60 bg-fail-500/10'
+            : 'border-accent-500/50 bg-accent-500/10'
+          : 'border-slate-800 bg-slate-950/40 hover:border-slate-700 hover:bg-slate-900/60',
+        disabled && 'cursor-not-allowed opacity-50',
+        className,
+      )}
+    >
+      <span className="flex items-start gap-3">
+        <span
+          className={cn(
+            'mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg border',
+            selected
+              ? destructive
+                ? 'border-fail-500/50 bg-fail-500/15 text-fail-300'
+                : 'border-accent-500/40 bg-accent-500/15 text-accent-300'
+              : 'border-slate-800 bg-slate-900 text-slate-500',
+          )}
+        >
+          {icon}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span
+              className={cn(
+                'text-sm font-medium',
+                selected ? (destructive ? 'text-fail-200' : 'text-slate-50') : 'text-slate-200',
+              )}
+            >
+              {title}
+            </span>
+            {badge}
+          </span>
+          <span
+            id={descriptionId}
+            className="mt-0.5 block text-xs leading-relaxed text-slate-500"
+          >
+            {description}
+          </span>
+        </span>
+      </span>
+      {meta ? <span className="block">{meta}</span> : null}
+    </button>
+  )
+}
+
+/* ---------------------------------------------------------------------------
  * Status pill
  * ------------------------------------------------------------------------- */
 
@@ -515,11 +620,18 @@ export function ProgressBar({
   value,
   tone = 'brand',
   active = false,
+  ariaLabel,
   className,
 }: {
   value: number
   tone?: PillTone
   active?: boolean
+  /**
+   * Name for the bar when it is the *only* statement of what it measures — a
+   * capacity meter, say. Run progress already has its percentage and step in
+   * text beside it, so it needs none.
+   */
+  ariaLabel?: string
   className?: string
 }) {
   const pct = Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0))
@@ -534,6 +646,7 @@ export function ProgressBar({
     <div
       className={cn('h-1.5 w-full overflow-hidden rounded-full bg-slate-800', className)}
       role="progressbar"
+      aria-label={ariaLabel}
       aria-valuenow={Math.round(pct)}
       aria-valuemin={0}
       aria-valuemax={100}

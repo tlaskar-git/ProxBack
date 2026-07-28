@@ -26,10 +26,12 @@ import {
   parsePolicy,
   patchJob,
   runJob,
+  TARGET_KIND_SHORT,
   vmSourcesOf,
 } from '../api'
 import type { Agent, CachedVM, ID, Job, Target } from '../api'
 import { identityText } from '../components/Identity'
+import { TARGET_KIND_ICON } from '../components/TargetIdentity'
 import { JobWizard } from '../components/JobWizard'
 import { PolicySummary } from '../components/PolicyStep'
 import { useConfirm } from '../components/Confirm'
@@ -49,6 +51,7 @@ import {
   StatusPill,
   Toggle,
 } from '../components/ui'
+import { roleDeniedReason, useSession } from '../session'
 import { useAsync, usePolling } from '../lib/useAsync'
 import {
   clampPct,
@@ -99,22 +102,28 @@ function JobRow({
   job,
   agents,
   vms,
+  targets,
   onChanged,
   onEdit,
 }: {
   job: Job
   agents: Agent[]
   vms: CachedVM[]
+  targets: Target[]
   onChanged: () => void
   onEdit: () => void
 }) {
   const toast = useToast()
   const confirm = useConfirm()
   const navigate = useNavigate()
+  const { can, role } = useSession()
   const [busy, setBusy] = useState<'run' | 'toggle' | 'delete' | null>(null)
 
   const lastRun = job.lastRun
   const running = lastRun?.status === 'running'
+  const denied = can.operateJobs ? undefined : roleDeniedReason(role, 'run or change backup jobs')
+  const target = targets.find((item) => String(item.id) === String(job.targetId))
+  const TargetIcon = target ? TARGET_KIND_ICON[target.kind] : Database
 
   const onRun = async () => {
     setBusy('run')
@@ -205,9 +214,14 @@ function JobRow({
           )}
 
           <div className="mt-2.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs text-slate-500">
+            {/* The target's kind rides along, so a glance answers "is this job
+                writing locally or offsite?" without opening it. */}
             <span className="inline-flex items-center gap-1.5">
-              <Database className="size-3.5 text-slate-600" aria-hidden />
+              <TargetIcon className="size-3.5 text-slate-600" aria-hidden />
               {job.targetName || 'No target'}
+              {target ? (
+                <span className="text-slate-600">{TARGET_KIND_SHORT[target.kind]}</span>
+              ) : null}
             </span>
             <span className="inline-flex items-center gap-1.5">
               <CalendarClock className="size-3.5 text-slate-600" aria-hidden />
@@ -258,30 +272,45 @@ function JobRow({
           ) : null}
         </div>
 
+        {/* A viewer keeps these controls, disabled and explained: they should
+            understand the product runs jobs and that they lack the rights,
+            rather than conclude the feature does not exist. */}
         <div className="flex shrink-0 items-center gap-2">
           <Toggle
             checked={job.enabled}
             onChange={(checked) => void onToggle(checked)}
-            disabled={busy !== null}
-            label={`${job.enabled ? 'Disable' : 'Enable'} ${job.name}`}
+            disabled={busy !== null || !can.operateJobs}
+            label={
+              denied
+                ? `${job.enabled ? 'Disable' : 'Enable'} ${job.name} — ${denied}`
+                : `${job.enabled ? 'Disable' : 'Enable'} ${job.name}`
+            }
           />
           <Button
             size="sm"
             variant="primary"
             icon={<Play className="size-3.5" aria-hidden />}
             loading={busy === 'run'}
-            disabled={running || busy !== null}
+            disabled={running || busy !== null || !can.operateJobs}
+            title={denied}
+            aria-label={denied ? `Run ${job.name} now — ${denied}` : undefined}
             onClick={() => void onRun()}
           >
             {running ? 'Running' : 'Run Now'}
           </Button>
-          <IconButton aria-label={`Edit ${job.name}`} title="Edit job" onClick={onEdit}>
+          <IconButton
+            aria-label={denied ? `Edit ${job.name} — ${denied}` : `Edit ${job.name}`}
+            title={denied ?? 'Edit job'}
+            disabled={!can.operateJobs}
+            onClick={onEdit}
+          >
             <Pencil className="size-4" aria-hidden />
           </IconButton>
           <IconButton
             variant="dangerQuiet"
-            aria-label={`Delete ${job.name}`}
-            title="Delete job"
+            aria-label={denied ? `Delete ${job.name} — ${denied}` : `Delete ${job.name}`}
+            title={denied ?? 'Delete job'}
+            disabled={!can.operateJobs}
             loading={busy === 'delete'}
             onClick={() => void onDelete()}
           >
@@ -295,6 +324,7 @@ function JobRow({
 
 export function JobsPage() {
   const navigate = useNavigate()
+  const { can, role } = useSession()
   const loader = useCallback(async (): Promise<JobsData> => {
     const [jobs, targets, vms, agents] = await Promise.all([
       listJobs(),
@@ -322,6 +352,20 @@ export function JobsPage() {
     setWizardOpen(true)
   }
 
+  const denied = can.operateJobs ? undefined : roleDeniedReason(role, 'create backup jobs')
+  const createButton = (
+    <Button
+      variant="primary"
+      icon={<Plus className="size-4" aria-hidden />}
+      onClick={openCreate}
+      disabled={!can.operateJobs}
+      title={denied}
+      aria-label={denied ? `Create Job — ${denied}` : undefined}
+    >
+      Create Job
+    </Button>
+  )
+
   return (
     <>
       <PageHeader
@@ -342,13 +386,7 @@ export function JobsPage() {
             >
               Refresh
             </Button>
-            <Button
-              variant="primary"
-              icon={<Plus className="size-4" aria-hidden />}
-              onClick={openCreate}
-            >
-              Create Job
-            </Button>
+            {createButton}
           </>
         }
       />
@@ -364,15 +402,7 @@ export function JobsPage() {
           icon={<CalendarClock className="size-5" aria-hidden />}
           title="No backup jobs yet"
           description="A job ties sources — virtual machines or an agent’s paths — to a storage target, a schedule, and a retention count. Create one to start protecting data."
-          action={
-            <Button
-              variant="primary"
-              icon={<Plus className="size-4" aria-hidden />}
-              onClick={openCreate}
-            >
-              Create Job
-            </Button>
-          }
+          action={createButton}
         />
       ) : (
         <Card className="divide-y divide-slate-800">
@@ -382,6 +412,7 @@ export function JobsPage() {
               job={job}
               agents={data?.agents ?? []}
               vms={data?.vms ?? []}
+              targets={data?.targets ?? []}
               onChanged={() => void refresh()}
               onEdit={() => openEdit(job)}
             />

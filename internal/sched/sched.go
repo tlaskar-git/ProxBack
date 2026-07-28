@@ -18,6 +18,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"proxback/internal/agentmgr"
+	"proxback/internal/blobstore"
 	"proxback/internal/engine"
 	"proxback/internal/helperclient"
 	"proxback/internal/notify"
@@ -872,14 +873,7 @@ func (m *Manager) engineForJob(ctx context.Context, targetID string, uploadLimit
 	if err != nil {
 		return nil, nil, fmt.Errorf("load settings: %w", err)
 	}
-	client, err := s3target.New(ctx, s3target.Config{
-		Endpoint:  target.Endpoint,
-		Region:    target.Region,
-		Bucket:    target.Bucket,
-		AccessKey: target.AccessKey,
-		SecretKey: target.SecretKey,
-		PathStyle: target.PathStyle,
-	})
+	bs, err := StoreForTarget(ctx, target)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -890,7 +884,7 @@ func (m *Manager) engineForJob(ctx context.Context, targetID string, uploadLimit
 		limit = uploadLimitOverride
 	}
 	engine.SetUploadLimitMbps(float64(limit))
-	eng := engine.NewWithOptions(client, target.ID, m.st, m.log, engine.Options{
+	eng := engine.NewWithOptions(bs, target.ID, m.st, m.log, engine.Options{
 		UploadConcurrency: settings.UploadConcurrency,
 		Compression:       settings.Compression,
 		GCGrace:           gcGrace(),
@@ -907,6 +901,25 @@ func (m *Manager) applyGlobalUploadLimit(ctx context.Context) {
 		return
 	}
 	engine.SetUploadLimitMbps(float64(settings.UploadLimitMbps))
+}
+
+// StoreForTarget opens the storage a target's kind implies: an S3 client for
+// object storage, a filesystem store for a mounted path. It is the single place
+// where a target's kind is turned into behaviour — the engine, the scheduler and
+// the API all work with the resulting blobstore.Store and never branch on kind
+// again.
+func StoreForTarget(ctx context.Context, t *store.S3Target) (blobstore.Store, error) {
+	if t.IsFilesystem() {
+		return blobstore.NewFilesystem(t.Path)
+	}
+	return s3target.New(ctx, s3target.Config{
+		Endpoint:  t.Endpoint,
+		Region:    t.Region,
+		Bucket:    t.Bucket,
+		AccessKey: t.AccessKey,
+		SecretKey: t.SecretKey,
+		PathStyle: t.PathStyle,
+	})
 }
 
 // PVEClient builds a client for a stored Proxmox host.

@@ -1,13 +1,15 @@
 /**
  * ProxBack identity.
  *
- * The mark is a stack of three layers cut on the diagonal: the top layer is
- * whole, the ones beneath are the same shape offset and clipped — restore
- * points behind the live one. The notch on the right reads as the "B" of
- * ProxBack at small sizes and as a chevron pointing back in time at large
- * ones. It is drawn from a 24-unit grid so it stays crisp at 16px favicon
- * sizes, and it carries no gradient so it survives monochrome printing,
- * a single-colour favicon, and dark or light backgrounds.
+ * The mark is a stack of storage platters with a restore arrow curving back
+ * into it: "data kept, and brought back". Both halves are literal on purpose —
+ * a stack of discs reads as storage to anyone, and the counter-clockwise arrow
+ * is the universal restore/rewind gesture, so the mark is guessable without a
+ * caption.
+ *
+ * Drawn on a 24-unit grid with 1.9 stroke weights so the platter separations
+ * survive a 16px favicon, and with no gradient so it works monochrome, in a
+ * single-colour favicon, and on light or dark backgrounds.
  */
 
 export function BrandMark({
@@ -22,41 +24,31 @@ export function BrandMark({
       viewBox="0 0 24 24"
       className={className}
       fill="none"
+      stroke="currentColor"
+      strokeWidth="1.9"
+      strokeLinecap="round"
+      strokeLinejoin="round"
       role={title ? 'img' : 'presentation'}
       aria-label={title}
       aria-hidden={title ? undefined : true}
     >
-      {/* Oldest layer — furthest back, most recessed. */}
-      <path
-        d="M4 15.4 12 19.6 20 15.4"
-        stroke="currentColor"
-        strokeWidth="1.6"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        opacity="0.32"
-      />
-      {/* Middle layer. */}
-      <path
-        d="M4 11.7 12 15.9 20 11.7"
-        stroke="currentColor"
-        strokeWidth="1.6"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        opacity="0.62"
-      />
-      {/* Live layer — the solid volume the eye lands on. */}
-      <path
-        d="M12 3.2 20.4 7.6a.7.7 0 0 1 0 1.24L12 13.3a.9.9 0 0 1-.84 0L2.76 8.84a.7.7 0 0 1 0-1.24L11.16 3.2a.9.9 0 0 1 .84 0Z"
-        fill="currentColor"
-      />
+      {/* Top platter — the solid one, so the stack reads as full. */}
+      <ellipse cx="12" cy="6.2" rx="7.4" ry="3.1" fill="currentColor" stroke="none" />
+      {/* Stack walls. */}
+      <path d="M4.6 6.2v5.1c0 1.71 3.31 3.1 7.4 3.1s7.4-1.39 7.4-3.1V6.2" />
+      {/* Lower platter edge — a third layer of depth without extra clutter. */}
+      <path d="M4.6 11.3v5.1c0 1.44 2.35 2.66 5.56 3" />
+      <path d="M19.4 11.3v3" />
+      {/* Restore arrow: sweeps up the right side and points back into the stack. */}
+      <path d="M19.4 20.4a5.2 5.2 0 1 0-4.1-8.4" />
+      <path d="M15.1 15.4v-3.6h3.6" />
     </svg>
   )
 }
 
 /**
- * Mark plus wordmark. `tone="brand"` tints the mark with the accent; the
- * wordmark stays neutral so the lockup does not compete with status colour
- * elsewhere on the page.
+ * Mark plus wordmark. The mark carries the brand colour; the wordmark stays
+ * neutral so the lockup never competes with a status colour on the same screen.
  */
 export function BrandLockup({
   className,
@@ -73,10 +65,7 @@ export function BrandLockup({
     <div className={className}>
       <div className="flex items-center gap-2.5">
         <BrandMark className={`${markSize} text-accent-400`} title="ProxBack" />
-        <span
-          className={`${nameSize} font-semibold tracking-[-0.01em] text-slate-50`}
-          style={{ fontFeatureSettings: '"ss01"' }}
-        >
+        <span className={`${nameSize} font-semibold tracking-[-0.01em] text-slate-50`}>
           Prox<span className="text-slate-400">Back</span>
         </span>
       </div>

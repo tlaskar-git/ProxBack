@@ -6,6 +6,7 @@ import type { ID, RunDetail, RunLogLine } from '../api'
 import { Modal } from './Modal'
 import { useConfirm } from './Confirm'
 import { SourceBreakdown } from './RunLive'
+import { roleDeniedReason, useSession } from '../session'
 import { useToast } from './Toast'
 import {
   Button,
@@ -54,6 +55,7 @@ export function RunDetailModal({
 }) {
   const toast = useToast()
   const confirm = useConfirm()
+  const { can, role } = useSession()
   const [run, setRun] = useState<RunDetail | null>(null)
   const [lines, setLines] = useState<RunLogLine[]>([])
   const [loading, setLoading] = useState(false)
@@ -164,6 +166,9 @@ export function RunDetailModal({
   )
   const running = run?.status === 'running'
   const failed = run?.status === 'failed' || run?.status === 'canceled'
+  const denied = can.operateJobs
+    ? undefined
+    : roleDeniedReason(role, 'cancel, retry or delete runs')
 
   return (
     <Modal
@@ -186,6 +191,9 @@ export function RunDetailModal({
             <Button
               variant="danger"
               loading={busy}
+              disabled={!can.operateJobs}
+              title={denied}
+              aria-label={denied ? `Cancel run — ${denied}` : undefined}
               icon={<Ban className="size-4" aria-hidden />}
               onClick={() => void onCancel()}
             >
@@ -197,6 +205,9 @@ export function RunDetailModal({
                 <Button
                   variant="primary"
                   loading={busy}
+                  disabled={!can.operateJobs}
+                  title={denied}
+                  aria-label={denied ? `Retry — ${denied}` : undefined}
                   icon={<RotateCcw className="size-4" aria-hidden />}
                   onClick={() => void onRetry()}
                 >
@@ -206,6 +217,9 @@ export function RunDetailModal({
               <Button
                 variant="danger"
                 loading={busy}
+                disabled={!can.operateJobs}
+                title={denied}
+                aria-label={denied ? `Delete from history — ${denied}` : undefined}
                 icon={<Trash2 className="size-4" aria-hidden />}
                 onClick={() => void onDelete()}
               >
@@ -252,14 +266,19 @@ export function RunDetailModal({
             <Figure
               label="Data reduction"
               value={
-                <span className="inline-flex items-baseline gap-1.5">
-                  {formatReduction(reduction.pct)}
-                  {reduction.ratio === null ? null : (
-                    <span className="text-meta font-normal text-slate-500">
-                      {formatRatio(reduction.ratio)}
-                    </span>
-                  )}
-                </span>
+                reduction.applies ? (
+                  <span className="inline-flex items-baseline gap-1.5">
+                    {formatReduction(reduction.pct)}
+                    {reduction.ratio === null ? null : (
+                      <span className="text-meta font-normal text-slate-500">
+                        {formatRatio(reduction.ratio)}
+                      </span>
+                    )}
+                  </span>
+                ) : (
+                  // Reading back a restore point reduces nothing.
+                  <span className="text-slate-600">—</span>
+                )
               }
             />
             <Figure label="Duration" value={formatDuration(run.startedAt, run.finishedAt)} />

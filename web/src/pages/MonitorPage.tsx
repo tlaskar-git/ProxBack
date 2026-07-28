@@ -30,6 +30,7 @@ import {
   Select,
   SkeletonRows,
 } from '../components/ui'
+import { roleDeniedReason, useSession } from '../session'
 import { useAsync, usePolling } from '../lib/useAsync'
 import {
   formatBytes,
@@ -64,10 +65,12 @@ function HistoryRow({
 }) {
   const toast = useToast()
   const confirm = useConfirm()
+  const { can, role } = useSession()
   const [busy, setBusy] = useState<'cancel' | 'retry' | null>(null)
   const running = run.status === 'running'
   const failed = run.status === 'failed'
   const reduction = reductionOf(run)
+  const denied = can.operateJobs ? undefined : roleDeniedReason(role, 'cancel or retry runs')
 
   const onCancel = async () => {
     const ok = await confirm({
@@ -156,19 +159,27 @@ function HistoryRow({
         <Num className="text-meta text-slate-300">{formatBytes(run.bytesUploaded)}</Num>
       </td>
       <td className="px-4 py-2.5 text-right whitespace-nowrap">
-        <span className="inline-flex items-baseline gap-1.5">
-          <Num className="text-meta text-slate-200">{formatReduction(reduction.pct)}</Num>
-          {reduction.ratio === null ? null : (
-            <Num className="text-micro text-slate-500">{formatRatio(reduction.ratio)}</Num>
-          )}
-        </span>
+        {reduction.applies ? (
+          <span className="inline-flex items-baseline gap-1.5">
+            <Num className="text-meta text-slate-200">{formatReduction(reduction.pct)}</Num>
+            {reduction.ratio === null ? null : (
+              <Num className="text-micro text-slate-500">{formatRatio(reduction.ratio)}</Num>
+            )}
+          </span>
+        ) : (
+          // Restores and verifications only read — nothing to reduce.
+          <span className="text-meta text-slate-600">—</span>
+        )}
       </td>
       <td className="w-20 px-4 py-2.5" onClick={(event) => event.stopPropagation()}>
         <div className="flex items-center justify-end gap-1">
           {failed ? (
             <IconButton
-              aria-label={`Retry the ${run.jobName} run`}
-              title="Run this job again"
+              aria-label={
+                denied ? `Retry the ${run.jobName} run — ${denied}` : `Retry the ${run.jobName} run`
+              }
+              title={denied ?? 'Run this job again'}
+              disabled={!can.operateJobs}
               loading={busy === 'retry'}
               onClick={() => void onRetry()}
             >
@@ -177,8 +188,13 @@ function HistoryRow({
           ) : null}
           {running ? (
             <IconButton
-              aria-label={`Cancel the run of ${run.jobName}`}
-              title="Cancel this run"
+              aria-label={
+                denied
+                  ? `Cancel the run of ${run.jobName} — ${denied}`
+                  : `Cancel the run of ${run.jobName}`
+              }
+              title={denied ?? 'Cancel this run'}
+              disabled={!can.operateJobs}
               loading={busy === 'cancel'}
               onClick={() => void onCancel()}
             >
@@ -271,9 +287,12 @@ export function MonitorPage() {
   const { data, loading, error, reload, refresh } = useAsync(loader)
   const toast = useToast()
   const confirm = useConfirm()
+  const { can, role } = useSession()
   const [openRun, setOpenRun] = useState<ID | null>(null)
   const [clearing, setClearing] = useState(false)
   const [samples, setSamples] = useState<Record<string, number[]>>({})
+
+  const denied = can.operateJobs ? undefined : roleDeniedReason(role, 'cancel runs or clear history')
 
   const runs = useMemo(() => data?.runs ?? [], [data])
   const jobs = data?.jobs ?? []
@@ -396,8 +415,10 @@ export function MonitorPage() {
                 variant="dangerQuiet"
                 icon={<Eraser className="size-4" aria-hidden />}
                 loading={clearing}
+                disabled={!can.operateJobs}
                 onClick={() => void onClear('finished')}
-                title="Remove finished runs from the history"
+                title={denied ?? 'Remove finished runs from the history'}
+                aria-label={denied ? `Clear history — ${denied}` : undefined}
               >
                 Clear history
               </Button>
@@ -449,6 +470,9 @@ export function MonitorPage() {
                         size="sm"
                         variant="danger"
                         icon={<Ban className="size-3.5" aria-hidden />}
+                        disabled={!can.operateJobs}
+                        title={denied}
+                        aria-label={denied ? `Cancel this run — ${denied}` : undefined}
                         onClick={() => void onCancelLive(detail)}
                       >
                         Cancel

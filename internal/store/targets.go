@@ -8,25 +8,31 @@ import (
 	"time"
 )
 
-const targetCols = `id, name, endpoint, region, bucket, access_key, secret_key_enc, path_style, status, created_at`
+const targetCols = `id, name, kind, path, endpoint, region, bucket, access_key, secret_key_enc, path_style, status, created_at`
 
 func (s *Store) scanTarget(sc interface{ Scan(...any) error }) (*S3Target, error) {
 	var t S3Target
 	var enc []byte
 	var pathStyle int
 	var created string
-	if err := sc.Scan(&t.ID, &t.Name, &t.Endpoint, &t.Region, &t.Bucket, &t.AccessKey, &enc, &pathStyle, &t.Status, &created); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.Kind, &t.Path, &t.Endpoint, &t.Region, &t.Bucket, &t.AccessKey, &enc, &pathStyle, &t.Status, &created); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("scan s3 target: %w", err)
+		return nil, fmt.Errorf("scan target: %w", err)
 	}
 	secret, err := s.Decrypt(enc)
 	if err != nil {
-		return nil, fmt.Errorf("s3 target %s secret key: %w", t.ID, err)
+		return nil, fmt.Errorf("target %s secret key: %w", t.ID, err)
 	}
 	t.SecretKey = secret
 	t.PathStyle = pathStyle != 0
+	// A row written before targets had a kind is object storage, which is the
+	// column default; an empty value can only come from a hand-edited database, and
+	// reading it as S3 is the same safe answer.
+	if t.Kind == "" {
+		t.Kind = TargetKindS3
+	}
 	t.CreatedAt = parseTime(created)
 	return &t, nil
 }
@@ -39,16 +45,20 @@ func (s *Store) CreateS3Target(ctx context.Context, t *S3Target) (*S3Target, err
 	if t.Status == "" {
 		t.Status = "unknown"
 	}
+	if t.Kind == "" {
+		t.Kind = TargetKindS3
+	}
 	t.CreatedAt = Now()
 	enc, err := s.Encrypt(t.SecretKey)
 	if err != nil {
 		return nil, err
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO s3_targets (`+targetCols+`) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		t.ID, t.Name, t.Endpoint, t.Region, t.Bucket, t.AccessKey, enc, boolInt(t.PathStyle), t.Status, fmtTime(t.CreatedAt))
+		`INSERT INTO s3_targets (`+targetCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		t.ID, t.Name, t.Kind, t.Path, t.Endpoint, t.Region, t.Bucket, t.AccessKey, enc,
+		boolInt(t.PathStyle), t.Status, fmtTime(t.CreatedAt))
 	if err != nil {
-		return nil, fmt.Errorf("create s3 target: %w", err)
+		return nil, fmt.Errorf("create target: %w", err)
 	}
 	return t, nil
 }

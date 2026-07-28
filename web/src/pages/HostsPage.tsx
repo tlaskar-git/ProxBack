@@ -24,6 +24,7 @@ import {
   StatusPill,
   toneForStatus,
 } from '../components/ui'
+import { roleDeniedReason, useSession } from '../session'
 import { useAsync } from '../lib/useAsync'
 import { formatRelative } from '../lib/format'
 
@@ -218,8 +219,13 @@ function HostCard({
 }) {
   const toast = useToast()
   const confirm = useConfirm()
+  const { can, role } = useSession()
   const [testing, setTesting] = useState(false)
   const [deleting, setDeleting] = useState(false)
+
+  const denied = can.manageInfrastructure
+    ? undefined
+    : roleDeniedReason(role, 'change Proxmox hosts')
 
   const onTest = async () => {
     setTesting(true)
@@ -304,16 +310,20 @@ function HostCard({
           size="sm"
           onClick={() => void onTest()}
           loading={testing}
+          disabled={!can.manageInfrastructure}
+          title={denied}
+          aria-label={denied ? `Test Connection to ${host.name} — ${denied}` : undefined}
           icon={<Plug className="size-3.5" aria-hidden />}
         >
           Test Connection
         </Button>
         <IconButton
           variant="dangerQuiet"
-          aria-label={`Remove ${host.name}`}
-          title="Remove host"
+          aria-label={denied ? `Remove ${host.name} — ${denied}` : `Remove ${host.name}`}
+          title={denied ?? 'Remove host'}
           className="ml-auto"
           loading={deleting}
+          disabled={!can.manageInfrastructure}
           onClick={() => void onDelete()}
         >
           <Trash2 className="size-4" aria-hidden />
@@ -324,6 +334,7 @@ function HostCard({
 }
 
 export function HostsPage() {
+  const { can, role } = useSession()
   const loader = useCallback(() => listHosts(), [])
   const { data, loading, error, reload, refresh } = useAsync(loader)
   const [addOpen, setAddOpen] = useState(false)
@@ -335,6 +346,22 @@ export function HostsPage() {
     seen.add(host.id)
     return true
   })
+
+  const denied = can.manageInfrastructure
+    ? undefined
+    : roleDeniedReason(role, 'add Proxmox hosts')
+  const addButton = (
+    <Button
+      variant="primary"
+      icon={<Plus className="size-4" aria-hidden />}
+      onClick={() => setAddOpen(true)}
+      disabled={!can.manageInfrastructure}
+      title={denied}
+      aria-label={denied ? `Add Host — ${denied}` : undefined}
+    >
+      Add Host
+    </Button>
+  )
 
   return (
     <>
@@ -350,13 +377,7 @@ export function HostsPage() {
             >
               Refresh
             </Button>
-            <Button
-              variant="primary"
-              icon={<Plus className="size-4" aria-hidden />}
-              onClick={() => setAddOpen(true)}
-            >
-              Add Host
-            </Button>
+            {addButton}
           </>
         }
       />
@@ -370,15 +391,7 @@ export function HostsPage() {
           icon={<Server className="size-5" aria-hidden />}
           title="No Proxmox hosts yet"
           description="Add a host with a Proxmox VE API token so ProxBack can list its virtual machines, take snapshots, and stream disks to your storage targets."
-          action={
-            <Button
-              variant="primary"
-              icon={<Plus className="size-4" aria-hidden />}
-              onClick={() => setAddOpen(true)}
-            >
-              Add Host
-            </Button>
-          }
+          action={addButton}
         />
       ) : (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">

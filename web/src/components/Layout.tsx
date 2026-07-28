@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import {
   Activity,
@@ -9,13 +9,17 @@ import {
   Laptop,
   LogOut,
   Menu,
+  ScrollText,
   Server,
   Settings as SettingsIcon,
   ShieldCheck,
   TriangleAlert,
+  Users,
   X,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
+import { ROLE_LABEL } from '../api'
+import type { Capabilities, Role } from '../api'
 import { cn } from '../lib/cn'
 import { useSession } from '../session'
 import { ThemeToggle } from '../theme'
@@ -27,6 +31,12 @@ interface NavItem {
   label: string
   icon: LucideIcon
   end?: boolean
+  /**
+   * Capability required to see this item at all. Nav is the one place hiding is
+   * the right call: a page whose every control is refused is not a page, and
+   * the server refuses it anyway.
+   */
+  needs?: keyof Capabilities
 }
 
 const NAV_GROUPS: { heading: string; items: NavItem[] }[] = [
@@ -53,9 +63,39 @@ const NAV_GROUPS: { heading: string; items: NavItem[] }[] = [
   },
   {
     heading: 'System',
-    items: [{ to: '/settings', label: 'Settings', icon: SettingsIcon }],
+    items: [
+      { to: '/users', label: 'Users', icon: Users, needs: 'manageUsers' },
+      { to: '/audit', label: 'Audit', icon: ScrollText, needs: 'viewAudit' },
+      { to: '/settings', label: 'Settings', icon: SettingsIcon },
+    ],
   },
 ]
+
+/** Drops the items this role cannot use, and any group left empty by that. */
+function navFor(can: Capabilities): { heading: string; items: NavItem[] }[] {
+  return NAV_GROUPS.map((group) => ({
+    heading: group.heading,
+    items: group.items.filter((item) => (item.needs ? can[item.needs] : true)),
+  })).filter((group) => group.items.length > 0)
+}
+
+/**
+ * The signed-in role, beside the name. Slate rather than a status colour: a
+ * role is an attribute of the account, not a verdict about the estate.
+ */
+function RoleBadge({ role, className }: { role: Role; className?: string }) {
+  return (
+    <span
+      className={cn(
+        'shrink-0 rounded border border-slate-800 bg-slate-900 px-1.5 py-0.5 text-micro font-medium tracking-[0.08em] text-slate-500 uppercase',
+        className,
+      )}
+      title={`Signed in with the ${ROLE_LABEL[role].toLowerCase()} role`}
+    >
+      {role}
+    </span>
+  )
+}
 
 function SidebarBrand() {
   return (
@@ -70,10 +110,16 @@ function SidebarBrand() {
  * active state that is a filled slab with a hard accent edge — visible from
  * the far side of the screen, unlike a tint alone.
  */
-function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
+function SidebarNav({
+  groups,
+  onNavigate,
+}: {
+  groups: { heading: string; items: NavItem[] }[]
+  onNavigate?: () => void
+}) {
   return (
     <nav className="flex-1 overflow-y-auto px-2.5 py-3">
-      {NAV_GROUPS.map((group, index) => (
+      {groups.map((group, index) => (
         <div key={group.heading} className={cn(index > 0 && 'mt-5')}>
           <div className="mb-1.5 flex items-center gap-2 px-2">
             <span className="text-micro font-semibold tracking-[0.14em] text-slate-600 uppercase">
@@ -120,9 +166,10 @@ function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 export function Layout() {
-  const { user, serverName, signOut, mustChangePassword, serverVersion } = useSession()
+  const { user, role, can, serverName, signOut, mustChangePassword, serverVersion } = useSession()
   const [drawerOpen, setDrawerOpen] = useState(false)
   const location = useLocation()
+  const groups = useMemo(() => navFor(can), [can])
 
   useEffect(() => {
     setDrawerOpen(false)
@@ -133,14 +180,19 @@ export function Layout() {
       {/* Desktop sidebar */}
       <aside className="fixed inset-y-0 left-0 hidden w-56 flex-col border-r border-slate-800/90 bg-slate-900/45 lg:flex">
         <SidebarBrand />
-        <SidebarNav />
-        <div className="flex items-center justify-between gap-2 border-t border-slate-800/80 px-4 py-2.5">
-          <p className="truncate text-micro text-slate-600">Signed in as {user.username}</p>
-          {serverVersion ? (
-            <span className="shrink-0 font-mono text-micro text-slate-600" title="Server version">
-              v{serverVersion}
-            </span>
-          ) : null}
+        <SidebarNav groups={groups} />
+        <div className="border-t border-slate-800/80 px-4 py-2.5">
+          <div className="flex items-center gap-2">
+            <p className="min-w-0 flex-1 truncate text-micro text-slate-600">
+              Signed in as {user.username}
+            </p>
+            {serverVersion ? (
+              <span className="shrink-0 font-mono text-micro text-slate-600" title="Server version">
+                v{serverVersion}
+              </span>
+            ) : null}
+          </div>
+          <RoleBadge role={role} className="mt-1.5 inline-block" />
         </div>
       </aside>
 
@@ -155,7 +207,11 @@ export function Layout() {
           />
           <aside className="pb-modal-in relative flex h-full w-56 flex-col border-r border-slate-800 bg-slate-900">
             <SidebarBrand />
-            <SidebarNav onNavigate={() => setDrawerOpen(false)} />
+            <SidebarNav groups={groups} onNavigate={() => setDrawerOpen(false)} />
+            <div className="border-t border-slate-800/80 px-4 py-2.5">
+              <p className="truncate text-micro text-slate-600">Signed in as {user.username}</p>
+              <RoleBadge role={role} className="mt-1.5 inline-block" />
+            </div>
           </aside>
         </div>
       ) : null}
@@ -180,7 +236,10 @@ export function Layout() {
 
           <div className="ml-auto flex items-center gap-2">
             <ThemeToggle />
-            <span className="hidden text-meta text-slate-500 sm:inline">{user.username}</span>
+            <span className="hidden items-center gap-1.5 text-meta text-slate-500 sm:inline-flex">
+              {user.username}
+              <RoleBadge role={role} />
+            </span>
             <Button size="sm" icon={<LogOut className="size-3.5" aria-hidden />} onClick={signOut}>
               Sign out
             </Button>

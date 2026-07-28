@@ -382,12 +382,15 @@ export function LiveRunCard({
                 <>
                   {formatBytes(detail.bytesUploaded)}
                   {/* The ratio only appears when one exists; a run that has
-                      uploaded nothing is 100% avoided, not "1.0×". */}
-                  <span className="ml-1.5 text-meta font-normal text-slate-500">
-                    {reduction.ratio === null
-                      ? formatReduction(reduction.pct)
-                      : formatRatio(reduction.ratio)}
-                  </span>
+                      uploaded nothing is 100% avoided, not "1.0×". A restore or
+                      verification reduces nothing, so it says nothing. */}
+                  {reduction.applies ? (
+                    <span className="ml-1.5 text-meta font-normal text-slate-500">
+                      {reduction.ratio === null
+                        ? formatReduction(reduction.pct)
+                        : formatRatio(reduction.ratio)}
+                    </span>
+                  ) : null}
                 </>
               }
             />

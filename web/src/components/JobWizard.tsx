@@ -1,10 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { ReactNode } from 'react'
 import {
   Check,
   ChevronLeft,
   ChevronRight,
-  Database,
   FolderPlus,
   Info,
   Laptop,
@@ -26,6 +24,7 @@ import {
   patchJob,
   retentionRuleCount,
   tagsOf,
+  targetLocation,
   vmSourcesOf,
   vmsWithTag,
 } from '../api'
@@ -53,6 +52,11 @@ import {
 import { useServerTimezone } from '../lib/useServerTimezone'
 import { WorkloadIdentity } from './Identity'
 import { Modal } from './Modal'
+import {
+  TARGET_KIND_ICON,
+  TargetCapacityLine,
+  TargetKindChip,
+} from './TargetIdentity'
 import { PolicyStep, PolicySummary } from './PolicyStep'
 import { RetentionStep } from './RetentionStep'
 import { isScheduleComplete, ScheduleEditor } from './ScheduleEditor'
@@ -61,6 +65,7 @@ import {
   Button,
   Chip,
   ChipButton,
+  ChoiceTile,
   Field,
   IconButton,
   Input,
@@ -175,55 +180,6 @@ function StepRail({ step }: { step: number }) {
         )
       })}
     </ol>
-  )
-}
-
-function SelectTile({
-  selected,
-  onClick,
-  title,
-  description,
-  icon,
-  disabled,
-}: {
-  selected: boolean
-  onClick: () => void
-  title: string
-  description: string
-  icon: ReactNode
-  disabled?: boolean
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      aria-pressed={selected}
-      className={cn(
-        'flex w-full items-start gap-3 rounded-xl border px-4 py-3.5 text-left transition-colors duration-150',
-        selected
-          ? 'border-accent-500/50 bg-accent-500/10'
-          : 'border-slate-800 bg-slate-950/40 hover:border-slate-700 hover:bg-slate-900/60',
-        disabled && 'cursor-not-allowed opacity-50',
-      )}
-    >
-      <span
-        className={cn(
-          'mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg border',
-          selected
-            ? 'border-accent-500/40 bg-accent-500/15 text-accent-300'
-            : 'border-slate-800 bg-slate-900 text-slate-500',
-        )}
-      >
-        {icon}
-      </span>
-      <span className="min-w-0">
-        <span className={cn('block text-sm font-medium', selected ? 'text-slate-50' : 'text-slate-200')}>
-          {title}
-        </span>
-        <span className="mt-0.5 block text-xs leading-relaxed text-slate-500">{description}</span>
-      </span>
-    </button>
   )
 }
 
@@ -449,19 +405,25 @@ export function JobWizard({
             )}
           </Field>
 
-          <div className="grid gap-3 sm:grid-cols-2">
-            <SelectTile
+          <div
+            role="radiogroup"
+            aria-label="What this job backs up"
+            className="grid gap-3 sm:grid-cols-2"
+          >
+            <ChoiceTile
               selected={state.kind === 'vm'}
-              onClick={() => patch({ kind: 'vm' })}
+              onSelect={() => patch({ kind: 'vm' })}
               disabled={Boolean(editJob)}
+              disabledReason="The job kind cannot be changed after creation."
               icon={<Laptop className="size-4" aria-hidden />}
               title="Virtual machines"
               description="Agentless image backup through the Proxmox API — snapshot, export each disk, done."
             />
-            <SelectTile
+            <ChoiceTile
               selected={state.kind === 'agent'}
-              onClick={() => patch({ kind: 'agent' })}
+              onSelect={() => patch({ kind: 'agent' })}
               disabled={Boolean(editJob)}
+              disabledReason="The job kind cannot be changed after creation."
               icon={<ShieldCheck className="size-4" aria-hidden />}
               title="Agent — file level"
               description="An in-guest agent tars the paths you choose and streams them through the server."
@@ -665,12 +627,16 @@ export function JobWizard({
                     install the agent inside the guest.
                   </p>
                 ) : (
-                  <div className="grid gap-2 sm:grid-cols-2">
+                  <div
+                    role="radiogroup"
+                    aria-label="Agent this job backs up"
+                    className="grid gap-2 sm:grid-cols-2"
+                  >
                     {agents.map((agent) => (
-                      <SelectTile
+                      <ChoiceTile
                         key={String(agent.id)}
                         selected={String(state.agentId) === String(agent.id)}
-                        onClick={() => patch({ agentId: agent.id })}
+                        onSelect={() => patch({ agentId: agent.id })}
                         icon={<ShieldCheck className="size-4" aria-hidden />}
                         title={agent.hostname}
                         description={`${agent.os}/${agent.arch} · agent ${agent.version} · ${agent.status}`}
@@ -732,31 +698,42 @@ export function JobWizard({
         </div>
       ) : null}
 
-      {/* Step 2 — target */}
+      {/* Step 2 — target. The kind travels with each option, because "local or
+          offsite?" is the question an operator is actually answering here. */}
       {step === 1 ? (
         <div className="space-y-3">
           <p className="text-xs font-medium text-slate-400">Where should the backups be written?</p>
           {targets.length === 0 ? (
             <p className="rounded-lg border border-dashed border-slate-800 bg-slate-950/40 px-4 py-8 text-center text-xs text-slate-500">
-              No storage targets yet. Add an S3-compatible bucket on the Storage Targets page first.
+              No storage targets yet. Add one on the Storage Targets page first — a local or network
+              path such as a NAS, or an S3-compatible bucket.
             </p>
           ) : (
-            <div className="grid gap-2 sm:grid-cols-2">
-              {targets.map((target) => (
-                <SelectTile
-                  key={String(target.id)}
-                  selected={String(state.targetId) === String(target.id)}
-                  onClick={() => patch({ targetId: target.id })}
-                  icon={<Database className="size-4" aria-hidden />}
-                  title={target.name}
-                  description={`${target.bucket} · ${target.endpoint.replace(/^https?:\/\//, '')}`}
-                />
-              ))}
+            <div
+              role="radiogroup"
+              aria-label="Storage target for this job"
+              className="grid gap-2 sm:grid-cols-2"
+            >
+              {targets.map((target) => {
+                const Icon = TARGET_KIND_ICON[target.kind]
+                return (
+                  <ChoiceTile
+                    key={String(target.id)}
+                    selected={String(state.targetId) === String(target.id)}
+                    onSelect={() => patch({ targetId: target.id })}
+                    icon={<Icon className="size-4" aria-hidden />}
+                    title={target.name}
+                    description={targetLocation(target)}
+                    badge={<TargetKindChip kind={target.kind} />}
+                    meta={<TargetCapacityLine target={target} />}
+                  />
+                )
+              })}
             </div>
           )}
           <SectionNote>
-            Data reduction happens per target, so pointing several jobs at the same bucket shrinks
-            total storage.
+            Data reduction happens per target, so pointing several jobs at the same target shrinks
+            total storage. A local target restores fastest; an offsite one survives the building.
           </SectionNote>
         </div>
       ) : null}
@@ -836,7 +813,20 @@ export function JobWizard({
                   }`
                 ),
               },
-              { label: 'Target', value: selectedTarget?.name ?? '—' },
+              {
+                label: 'Target',
+                value: selectedTarget ? (
+                  <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-1">
+                    {selectedTarget.name}
+                    <TargetKindChip kind={selectedTarget.kind} />
+                    <span className="font-mono text-meta text-slate-500">
+                      {targetLocation(selectedTarget)}
+                    </span>
+                  </span>
+                ) : (
+                  '—'
+                ),
+              },
               {
                 label: 'Schedule',
                 value: (

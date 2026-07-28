@@ -107,6 +107,75 @@ available uplink, because nothing was read or hashed while a chunk was in flight
 Backup flow (agentless): snapshot VM → export each disk stream through the engine → delete
 snapshot → write manifest per disk (one backupID covers all disks of the VM).
 
+## v0.6.0 — users, roles, and accountability
+
+One shared admin account destroys attribution and makes delegation impossible. Three roles
+cover the realistic cases without becoming enterprise IAM.
+
+| Role | Can |
+|---|---|
+| `admin` | Everything, including users, credentials, storage targets, hosts, settings, updates |
+| `operator` | Run and cancel jobs, restore, verify, create/edit jobs. **Cannot** touch users, credentials, hosts, targets, settings or updates |
+| `viewer` | Read everything except secrets. No mutation at all |
+
+- `users.role` column (existing single user migrates to `admin`).
+- `GET /api/users` → `[{"id","username","role","createdAt","lastLoginAt"?}]` (never a hash).
+- `POST /api/users {"username","password","role"}` — admin only; password ≥ 8 chars.
+- `PATCH /api/users/{id} {"role"?,"password"?}` — admin only. A user may always change
+  **their own** password via the existing `/api/me/password`.
+- `DELETE /api/users/{id}` — admin only.
+- **The last admin cannot be deleted or demoted** (409). You cannot lock yourself out.
+- Deleting a user revokes their sessions immediately.
+- `GET /api/me` gains `"role"` so the console can hide what a user cannot do. Hiding is
+  courtesy; **the server enforces**. Every mutating route carries a required role, and a
+  forbidden request is `403 {"error":...}` — never a silent no-op.
+
+### Audit trail
+
+Roles without attribution are theatre, so mutations are recorded.
+
+- `audit_log` (append-only): id, at, actor username, actor id, action, object kind/id/name,
+  result (`ok`/`denied`/`error`), source IP, detail. Secrets are never stored.
+- Recorded: sign-in and failed sign-in, user create/modify/delete, host/target/helper/agent
+  create/delete, job create/modify/delete, run start/cancel/retry, restore (with mode and
+  destination), verification, restore-point deletion, retention/GC-triggered deletion,
+  settings changes, software update.
+- `GET /api/audit?limit=&action=&actor=` → newest first, admin only.
+- Retention: keep the newest 50,000 entries; trim on write.
+
+## v0.6.0 — local and NAS storage targets
+
+Object storage is not how most people back up. A homelab or SMB backs up to a NAS or a
+local disk first, and copies offsite second. ProxBack must support both.
+
+**Design decision: a target is a *path*, not a protocol.** ProxBack does not implement NFS
+or SMB clients. The operator mounts the share with the OS (`/etc/fstab`, `autofs`) and
+points a target at the mount path — which is how Proxmox Backup Server, Veeam repositories
+and restic all work. It keeps credentials, retries, locking and kernel caching where they
+belong, and means CIFS/SMB, NFS, iSCSI, a USB disk and a ZFS dataset are all supported on
+day one with no protocol code.
+
+- `s3_targets` becomes the general `targets` table (kept under the old name for migration
+  simplicity) with `kind`: `"s3"` (default, existing rows) | `"filesystem"`.
+  Filesystem targets use `path`; S3 fields stay empty and vice versa.
+- The engine talks to a `Store` interface (Put/Get/Head/Delete/List) rather than to
+  `*s3target.Client`. Two implementations: the existing S3 client, and a filesystem store
+  writing `<path>/chunks/<sha>` and `<path>/manifests/...` — the same layout, so a target
+  can be inspected, rsynced offsite, or migrated between kinds without translation.
+  Filesystem writes are atomic (temp file + rename within the same directory) so a crash or
+  a yanked NFS mount cannot leave a half-written chunk that would later fail verification.
+- `Target` DTO gains `kind`, `path`, and for filesystem targets `freeBytes`/`totalBytes`
+  (`GET /api/targets` reports capacity so the console can warn before a target fills).
+  `POST /api/targets` accepts either shape; validation rejects a mix.
+- Connection test for a filesystem target: the path must exist, be a directory, be writable
+  (probe file written, read back, removed), and **not be on the same filesystem as the
+  ProxBack data directory unless explicitly allowed** — backing up to the disk you are
+  running on is a foot-gun worth naming. It reports the detected filesystem type and free
+  space, and warns when a path is not a mount point (a common mistake: writing into the
+  empty mountpoint directory because the NAS failed to mount).
+- Retention, verification, restore, GC and the 24h chunk grace behave identically for both
+  kinds — they go through the interface.
+
 ## v0.5.0 — trust, policy depth, and identity
 
 Driven by an external product review. Three classes of work: correctness defects that

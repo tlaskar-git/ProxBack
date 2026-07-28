@@ -19,6 +19,7 @@ import {
   StatusPill,
   toneForStatus,
 } from '../components/ui'
+import { roleDeniedReason, useSession } from '../session'
 import { useAsync } from '../lib/useAsync'
 import { formatDateTime, formatRelative } from '../lib/format'
 
@@ -45,7 +46,10 @@ function windowsCommand(origin: string, token: string): string {
 function AgentTable({ agents, onChanged }: { agents: Agent[]; onChanged: () => void }) {
   const toast = useToast()
   const confirm = useConfirm()
+  const { can, role } = useSession()
   const [deleting, setDeleting] = useState<string | null>(null)
+
+  const denied = can.manageInfrastructure ? undefined : roleDeniedReason(role, 'remove agents')
 
   const onDelete = async (agent: Agent) => {
     const ok = await confirm({
@@ -115,8 +119,11 @@ function AgentTable({ agents, onChanged }: { agents: Agent[]; onChanged: () => v
               <td className="px-5 py-3 text-right">
                 <IconButton
                   variant="dangerQuiet"
-                  aria-label={`Remove ${agent.hostname}`}
-                  title="Remove agent"
+                  aria-label={
+                    denied ? `Remove ${agent.hostname} — ${denied}` : `Remove ${agent.hostname}`
+                  }
+                  title={denied ?? 'Remove agent'}
+                  disabled={!can.manageInfrastructure}
                   loading={deleting === String(agent.id)}
                   onClick={() => void onDelete(agent)}
                 >
@@ -133,8 +140,13 @@ function AgentTable({ agents, onChanged }: { agents: Agent[]; onChanged: () => v
 
 function DeploySection() {
   const toast = useToast()
+  const { can, role } = useSession()
   const [token, setToken] = useState<EnrollToken | null>(null)
   const [generating, setGenerating] = useState(false)
+
+  const denied = can.manageInfrastructure
+    ? undefined
+    : roleDeniedReason(role, 'enroll new agents')
 
   const origin = useMemo(
     () => (typeof window === 'undefined' ? '' : window.location.origin),
@@ -164,6 +176,9 @@ function DeploySection() {
           <Button
             variant="primary"
             loading={generating}
+            disabled={!can.manageInfrastructure}
+            title={denied}
+            aria-label={denied ? `Generate enrollment token — ${denied}` : undefined}
             icon={<KeyRound className="size-4" aria-hidden />}
             onClick={() => void onGenerate()}
           >

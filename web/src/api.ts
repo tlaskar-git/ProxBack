@@ -16,10 +16,102 @@
  */
 export type ID = string | number
 
+/* Users and roles (v0.6.0) -------------------------------------------------
+ *
+ * Three roles cover the realistic cases without becoming enterprise IAM. The
+ * console uses them to hide what a user cannot do — **hiding is courtesy, the
+ * server enforces**, and every mutating route answers a forbidden request with
+ * a 403 rather than a silent no-op.
+ * ------------------------------------------------------------------------- */
+
+export type Role = 'admin' | 'operator' | 'viewer'
+
+export const ROLES: Role[] = ['admin', 'operator', 'viewer']
+
+/** Title case for a role, for labels and pills. */
+export const ROLE_LABEL: Record<Role, string> = {
+  admin: 'Administrator',
+  operator: 'Operator',
+  viewer: 'Viewer',
+}
+
+/**
+ * One line of what each role can do, taken from the PLAN capability table and
+ * written for the operator choosing it — nobody should have to guess what
+ * "operator" means.
+ */
+export const ROLE_SUMMARY: Record<Role, string> = {
+  admin: 'Everything: users, storage targets, Proxmox hosts, credentials, settings and updates.',
+  operator:
+    'Run, cancel and edit backup jobs, restore and verify. Cannot touch users, hosts, targets, credentials or settings.',
+  viewer: 'Read-only. Sees every page and no secrets, and cannot change anything.',
+}
+
+/** Normalises anything the server may send in a `role` field. */
+export function parseRole(value: unknown): Role {
+  return value === 'operator' || value === 'viewer' || value === 'admin' ? value : 'admin'
+}
+
+/**
+ * What the signed-in role may change. Derived once here so no component
+ * hard-codes a role comparison and quietly disagrees with another.
+ */
+export interface Capabilities {
+  /** Create, re-role, reset and delete users; read the audit trail. */
+  manageUsers: boolean
+  /** Hosts, storage targets, helpers, agents, settings and software updates. */
+  manageInfrastructure: boolean
+  /** Run/cancel/retry runs, create and edit jobs, restore, verify, prune. */
+  operateJobs: boolean
+  /** The audit trail is admin-only per the contract. */
+  viewAudit: boolean
+}
+
+export function capabilitiesFor(role: Role): Capabilities {
+  const admin = role === 'admin'
+  return {
+    manageUsers: admin,
+    manageInfrastructure: admin,
+    operateJobs: admin || role === 'operator',
+    viewAudit: admin,
+  }
+}
+
 export interface User {
   id: ID
   username: string
+  /**
+   * v0.6.0. Absent on a server that predates roles — which has exactly one
+   * admin account, so `parseRole` reads a missing role as `admin` and the
+   * console hides nothing it should not.
+   */
+  role?: Role
 }
+
+/** A row of `GET /api/users` — never a password hash. */
+export interface UserAccount {
+  id: ID
+  username: string
+  role: Role
+  createdAt: string
+  lastLoginAt?: string | null
+}
+
+export interface UserCreate {
+  username: string
+  /** At least 8 characters; the server rejects anything shorter. */
+  password: string
+  role: Role
+}
+
+/** `PATCH /api/users/{id}` — either field on its own is valid. */
+export interface UserPatch {
+  role?: Role
+  password?: string
+}
+
+/** Minimum password length the contract states, echoed in the UI copy. */
+export const MIN_PASSWORD_LENGTH = 8
 
 export interface SetupStatus {
   needsSetup: boolean
@@ -33,10 +125,20 @@ export interface AuthResponse {
 
 export interface MeResponse {
   user: User
+  /**
+   * v0.6.0 role of the signed-in user. Servers carry it at the top level or
+   * inside `user` — read it through `roleOf`, never directly.
+   */
+  role?: Role
   /** True while the seeded default admin/admin credentials are unchanged. */
   mustChangePassword?: boolean
   /** Version of the server build answering this request. */
   serverVersion?: string
+}
+
+/** The signed-in user's role, wherever the server put it. */
+export function roleOf(me: MeResponse): Role {
+  return parseRole(me.user?.role ?? me.role)
 }
 
 export interface UpdateStatus {
@@ -198,21 +300,74 @@ export interface CachedVM extends VM {
   hostName: string
 }
 
-/* S3 targets -------------------------------------------------------------- */
+/* Storage targets (v0.6.0: S3 *or* a local/network path) ------------------
+ *
+ * A target is a **path, not a protocol**. ProxBack implements no NFS or SMB
+ * client: the operator mounts the share with the operating system and points a
+ * filesystem target at the mount path, which is how Proxmox Backup Server,
+ * Veeam repositories and restic all work.
+ * ------------------------------------------------------------------------- */
 
 export type TargetStatus = 'ok' | 'error' | 'unknown' | (string & {})
+
+/** `s3` is the default and what every pre-v0.6.0 row migrates to. */
+export type TargetKind = 's3' | 'filesystem'
+
+export const TARGET_KIND_LABEL: Record<TargetKind, string> = {
+  filesystem: 'Local or network path',
+  s3: 'S3-compatible object storage',
+}
+
+/** Short form for a card badge or a table cell. */
+export const TARGET_KIND_SHORT: Record<TargetKind, string> = {
+  filesystem: 'Local path',
+  s3: 'S3 object storage',
+}
+
+/** One line of what each kind is for, shown next to the choice. */
+export const TARGET_KIND_SUMMARY: Record<TargetKind, string> = {
+  filesystem: 'A NAS, an NFS or SMB mount, a USB disk or a ZFS dataset already mounted on this server.',
+  s3: 'An offsite bucket — Backblaze B2, AWS S3 or MinIO.',
+}
+
+/** Whether a target is on this machine's storage or somewhere else entirely. */
+export function isOffsite(kind: TargetKind): boolean {
+  return kind === 's3'
+}
+
+export function parseTargetKind(value: unknown): TargetKind {
+  return value === 'filesystem' ? 'filesystem' : 's3'
+}
 
 export interface Target {
   id: ID
   name: string
+  /** v0.6.0. Absent on older servers, where every target is S3. */
+  kind: TargetKind
+  /** Filesystem targets: the already-mounted directory ProxBack writes into. */
+  path?: string
   endpoint: string
   bucket: string
   region: string
   pathStyle: boolean
   status: TargetStatus
+  /**
+   * Filesystem targets only: capacity as the server last measured it. An S3
+   * bucket is elastic and reports neither — a NAS is not, which is exactly why
+   * these are shown.
+   */
+  freeBytes?: number
+  totalBytes?: number
+  /**
+   * True when this target was accepted on the same filesystem as ProxBack's
+   * own data directory. Normally refused, because backing up to the disk you
+   * are running on is not a backup.
+   */
+  allowSameFilesystem?: boolean
 }
 
-export interface TargetCreate {
+export interface S3TargetCreate {
+  kind: 's3'
   name: string
   endpoint: string
   region: string
@@ -222,9 +377,137 @@ export interface TargetCreate {
   pathStyle: boolean
 }
 
+export interface FilesystemTargetCreate {
+  kind: 'filesystem'
+  name: string
+  /** Absolute path to a directory the operating system has already mounted. */
+  path: string
+  /** Opt out of the same-filesystem refusal. Off unless deliberately chosen. */
+  allowSameFilesystem: boolean
+}
+
+/**
+ * `POST /api/targets` accepts either shape and validation rejects a mix, so the
+ * console never sends both sets of fields.
+ */
+export type TargetCreate = S3TargetCreate | FilesystemTargetCreate
+
+/**
+ * One structured caution from a connection test. A warning is *not* a failure:
+ * the target works, and something about it will bite later.
+ *
+ * Known codes are given operator copy by `describeTargetWarning`; anything the
+ * server adds later still renders, using its own message.
+ */
+export interface TargetWarning {
+  code: string
+  message: string
+}
+
 export interface TargetTestResult {
   ok: boolean
   error?: string
+  /** Structured cautions — never blocking. Always an array after normalising. */
+  warnings: TargetWarning[]
+  /** Filesystem targets: what the kernel says this path is, e.g. `nfs4`, `ext4`. */
+  filesystemType?: string
+  freeBytes?: number
+  totalBytes?: number
+  /** The path that was probed, echoed back by the server. */
+  path?: string
+}
+
+/**
+ * Operator copy for the warnings the contract names, because the reason each
+ * one matters is not obvious from its code.
+ *
+ * `not_mount_point` is the classic silent failure: the share never mounted, so
+ * ProxBack writes into the empty mountpoint directory on the root disk and the
+ * backups quietly fill the system volume instead of the NAS.
+ */
+const TARGET_WARNING_COPY: Record<string, string> = {
+  not_mount_point:
+    'This path is not a mount point. If the share failed to mount, backups fill this server’s own disk instead of the NAS.',
+  not_a_mount_point:
+    'This path is not a mount point. If the share failed to mount, backups fill this server’s own disk instead of the NAS.',
+  same_filesystem:
+    'This path is on the same filesystem as ProxBack’s own data. A disk that fails takes the backups with it.',
+  same_filesystem_allowed:
+    'This path is on the same filesystem as ProxBack’s own data, and was allowed explicitly. A disk that fails takes the backups with it.',
+}
+
+/** Human sentence for a warning: the known copy, else the server's message. */
+export function describeTargetWarning(warning: TargetWarning): string {
+  return TARGET_WARNING_COPY[warning.code] ?? warning.message ?? warning.code
+}
+
+function normaliseWarning(value: unknown): TargetWarning | null {
+  if (typeof value === 'string') {
+    const text = value.trim()
+    return text ? { code: text, message: text } : null
+  }
+  if (typeof value !== 'object' || value === null) return null
+  const raw = value as Record<string, unknown>
+  const code = typeof raw.code === 'string' ? raw.code : ''
+  const message =
+    typeof raw.message === 'string'
+      ? raw.message
+      : typeof raw.detail === 'string'
+        ? raw.detail
+        : code
+  if (!code && !message) return null
+  return { code: code || message, message: message || code }
+}
+
+/** Capacity of a filesystem target, or `null` when the server reports none. */
+export interface TargetCapacity {
+  usedBytes: number
+  freeBytes: number
+  totalBytes: number
+  /** 0–100 share of the volume in use. */
+  usedPct: number
+  /** 0–100 share still free. */
+  freePct: number
+  /** True under 10% free — a NAS is not elastic, so say so before it fills. */
+  low: boolean
+}
+
+/** Share of free space below which a filesystem target is called out. */
+export const LOW_SPACE_PCT = 10
+
+/**
+ * Reads `freeBytes`/`totalBytes` into something renderable. Returns `null` for
+ * S3 (elastic, so capacity is not a fact about it) and for any server that
+ * omits the figures — the console then says nothing rather than drawing an
+ * empty bar that reads as "full".
+ */
+export function capacityOf(target: Pick<Target, 'kind' | 'freeBytes' | 'totalBytes'>): TargetCapacity | null {
+  if (target.kind !== 'filesystem') return null
+  const total = Number(target.totalBytes)
+  const free = Number(target.freeBytes)
+  if (!Number.isFinite(total) || total <= 0) return null
+  if (!Number.isFinite(free) || free < 0) return null
+  const clampedFree = Math.min(free, total)
+  const used = total - clampedFree
+  const freePct = (clampedFree / total) * 100
+  return {
+    usedBytes: used,
+    freeBytes: clampedFree,
+    totalBytes: total,
+    usedPct: (used / total) * 100,
+    freePct,
+    low: freePct < LOW_SPACE_PCT,
+  }
+}
+
+/**
+ * Where a target writes, in one line: the path for a filesystem target, the
+ * bucket and host for S3. Used anywhere a target has to be recognised.
+ */
+export function targetLocation(target: Target): string {
+  if (target.kind === 'filesystem') return target.path || '—'
+  const host = (target.endpoint || '').replace(/^https?:\/\//, '').replace(/\/+$/, '')
+  return host ? `${target.bucket} · ${host}` : target.bucket || '—'
 }
 
 /* Schedules (v0.4.0) -------------------------------------------------------
@@ -659,10 +942,18 @@ export type JobPatch = Partial<JobCreate>
 
 export type RunStatus = 'running' | 'success' | 'failed' | 'canceled'
 
+/** What a run did. Backups write; restores and verifications only read. */
+export type RunKind = 'backup' | 'restore' | 'verify'
+
 export interface JobRun {
   id: ID
   jobId: ID
   jobName: string
+  /**
+   * What the run did. Restores and verifications only read, so figures like
+   * data reduction do not apply to them.
+   */
+  kind?: RunKind
   status: RunStatus
   startedAt: string
   finishedAt?: string | null
@@ -697,6 +988,12 @@ export interface DataReduction {
   pct: number
   /** processed ÷ uploaded, or null when nothing was uploaded. */
   ratio: number | null
+  /**
+   * False for restores and verifications: they only read, so reduction is not
+   * 0% — it does not apply, and the console must render nothing rather than a
+   * figure that invites a wrong conclusion.
+   */
+  applies: boolean
 }
 
 /**
@@ -704,6 +1001,7 @@ export interface DataReduction {
  * otherwise derives them from the byte counters with the same formulas.
  */
 export function reductionOf(run: {
+  kind?: RunKind
   bytesProcessed: number
   bytesUploaded: number
   reductionPct?: number
@@ -711,6 +1009,10 @@ export function reductionOf(run: {
 }): DataReduction {
   const processed = Number.isFinite(run.bytesProcessed) ? Math.max(0, run.bytesProcessed) : 0
   const uploaded = Number.isFinite(run.bytesUploaded) ? Math.max(0, run.bytesUploaded) : 0
+
+  if (run.kind === 'restore' || run.kind === 'verify') {
+    return { pct: 0, ratio: null, applies: false }
+  }
 
   const pct =
     typeof run.reductionPct === 'number' && Number.isFinite(run.reductionPct)
@@ -730,7 +1032,7 @@ export function reductionOf(run: {
         ? processed / uploaded
         : null
 
-  return { pct, ratio }
+  return { pct, ratio, applies: true }
 }
 
 /** Per-object state inside a run — the "objects in this session" breakdown. */
@@ -993,6 +1295,83 @@ export interface WebhookTestResult {
   error?: string
 }
 
+/* Audit trail (v0.6.0) -----------------------------------------------------
+ *
+ * Roles without attribution are theatre, so every mutation is recorded. The
+ * log is append-only and admin-only, and a **denied** attempt is the whole
+ * point of keeping it — it is rendered distinctly, never as just another row.
+ * ------------------------------------------------------------------------- */
+
+export type AuditResult = 'ok' | 'denied' | 'error' | (string & {})
+
+export interface AuditEntry {
+  id: ID
+  /** RFC 3339 timestamp. Newest first in the response. */
+  at: string
+  /** Username of whoever attempted it — the `actor` filter matches this. */
+  actor: string
+  actorId?: ID | null
+  /** What was attempted, e.g. `user.create`. The `action` filter matches this. */
+  action: string
+  /** What it was done to: kind, id and the name an operator would recognise. */
+  objectKind?: string
+  objectId?: ID | null
+  objectName?: string
+  result: AuditResult
+  sourceIP?: string
+  /** Free-text context. Secrets are never recorded. */
+  detail?: string
+}
+
+export interface AuditQuery {
+  limit?: number
+  action?: string
+  actor?: string
+}
+
+/**
+ * Field spellings have varied across the v0.6.0 server rollout (`sourceIP` vs
+ * `sourceIp`, `objectId` vs `objectID`), so every row is read tolerantly and
+ * exposed under one name.
+ */
+function normaliseAuditEntry(value: unknown, index: number): AuditEntry {
+  const raw = (typeof value === 'object' && value !== null ? value : {}) as Record<string, unknown>
+  const text = (...keys: string[]): string => {
+    for (const key of keys) {
+      const candidate = raw[key]
+      if (typeof candidate === 'string' && candidate) return candidate
+      if (typeof candidate === 'number') return String(candidate)
+    }
+    return ''
+  }
+  const id = raw.id
+  return {
+    id: typeof id === 'string' || typeof id === 'number' ? id : index,
+    at: text('at', 'timestamp', 'createdAt'),
+    actor: text('actor', 'actorUsername', 'username'),
+    actorId: (raw.actorId ?? raw.actorID ?? null) as ID | null,
+    action: text('action'),
+    objectKind: text('objectKind', 'object_kind'),
+    objectId: (raw.objectId ?? raw.objectID ?? null) as ID | null,
+    objectName: text('objectName', 'object_name'),
+    result: text('result') || 'ok',
+    sourceIP: text('sourceIP', 'sourceIp', 'source_ip', 'ip'),
+    detail: text('detail', 'details'),
+  }
+}
+
+/** The object an entry touched, as one recognisable string. */
+export function auditObjectText(entry: AuditEntry): string {
+  const name = entry.objectName?.trim()
+  const kind = entry.objectKind?.trim()
+  if (name && kind) return `${kind} · ${name}`
+  if (name) return name
+  if (kind && entry.objectId !== null && entry.objectId !== undefined && String(entry.objectId)) {
+    return `${kind} #${entry.objectId}`
+  }
+  return kind || '—'
+}
+
 /* ---------------------------------------------------------------------------
  * Transport
  * ------------------------------------------------------------------------- */
@@ -1023,6 +1402,15 @@ export class ApiError extends Error {
     return this.status === 401
   }
 
+  /**
+   * True when the signed-in role may not do this. The server enforces every
+   * required role, so a 403 is the honest answer to a control the console
+   * failed to hide — and it is explained, not shown raw.
+   */
+  get isForbidden(): boolean {
+    return this.status === 403
+  }
+
   /** True when the request conflicted with current state (e.g. job running). */
   get isConflict(): boolean {
     return this.status === 409
@@ -1034,9 +1422,36 @@ export function isApiError(err: unknown): err is ApiError {
   return err instanceof ApiError
 }
 
-/** Best-effort human message for anything thrown by the client. */
+/** True when this failure was a role check, whatever the server called it. */
+export function isForbidden(err: unknown): boolean {
+  return isApiError(err) && err.isForbidden
+}
+
+/** What a 403 means, in words an operator can act on. */
+export const FORBIDDEN_MESSAGE = 'Your role does not allow this.'
+
+/**
+ * Server wording for a role refusal that adds nothing a reader needs — these
+ * are replaced wholesale by `FORBIDDEN_MESSAGE` rather than appended to it.
+ */
+const BARE_FORBIDDEN = /^(403\s*)?(forbidden|unauthorized|unauthorised|access denied|permission denied|not allowed|insufficient permissions?)\.?$/i
+
+/**
+ * Best-effort human message for anything thrown by the client.
+ *
+ * Every catch site in the console funnels through here, which is what makes the
+ * 403 promise hold everywhere: a role refusal is explained in one sentence
+ * instead of surfacing the server's bare "forbidden".
+ */
 export function errorMessage(err: unknown): string {
-  if (isApiError(err)) return err.message
+  if (isApiError(err)) {
+    if (err.isForbidden) {
+      const detail = err.message.trim()
+      if (!detail || BARE_FORBIDDEN.test(detail)) return FORBIDDEN_MESSAGE
+      return `${FORBIDDEN_MESSAGE} ${detail}`
+    }
+    return err.message
+  }
   if (err instanceof Error) return err.message
   return String(err)
 }
@@ -1082,7 +1497,12 @@ async function parseError(res: Response, url: string): Promise<ApiError> {
     /* body unreadable — fall through to the generic message */
   }
   if (!message) {
-    message = res.status === 401 ? 'Not signed in.' : `Request failed with status ${res.status}.`
+    message =
+      res.status === 401
+        ? 'Not signed in.'
+        : res.status === 403
+          ? FORBIDDEN_MESSAGE
+          : `Request failed with status ${res.status}.`
   }
   return new ApiError(res.status, message, url, body)
 }
@@ -1151,6 +1571,54 @@ export function changePassword(currentPassword: string, newPassword: string): Pr
     method: 'POST',
     body: { currentPassword, newPassword },
   })
+}
+
+/* ---------------------------------------------------------------------------
+ * Users and roles
+ *
+ * Admin-only, and the server says so with a 403 rather than a silent no-op.
+ * The last admin cannot be deleted or demoted — a 409 — so nobody can lock
+ * themselves out of their own backup server.
+ * ------------------------------------------------------------------------- */
+
+export async function listUsers(signal?: AbortSignal): Promise<UserAccount[]> {
+  const users = await request<UserAccount[]>('/api/users', { signal })
+  if (!Array.isArray(users)) return []
+  return users.map((user) => ({ ...user, role: parseRole(user.role) }))
+}
+
+export function createUser(input: UserCreate): Promise<UserAccount> {
+  return request<UserAccount>('/api/users', { method: 'POST', body: { ...input } })
+}
+
+/**
+ * Changes a role, a password, or both. A user may always change **their own**
+ * password through `changePassword` instead, which needs no admin rights.
+ */
+export function patchUser(id: ID, input: UserPatch): Promise<UserAccount> {
+  return request<UserAccount>(`/api/users/${encodeURIComponent(String(id))}`, {
+    method: 'PATCH',
+    body: { ...input },
+  })
+}
+
+/** Deleting a user revokes their sessions immediately. */
+export function deleteUser(id: ID): Promise<void> {
+  return request<void>(`/api/users/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
+}
+
+/* ---------------------------------------------------------------------------
+ * Audit trail
+ * ------------------------------------------------------------------------- */
+
+/** Newest first, admin only. Rows are normalised into one field spelling. */
+export async function listAudit(query: AuditQuery = {}, signal?: AbortSignal): Promise<AuditEntry[]> {
+  const entries = await request<unknown[]>('/api/audit', {
+    query: { limit: query.limit, action: query.action, actor: query.actor },
+    signal,
+  })
+  if (!Array.isArray(entries)) return []
+  return entries.map(normaliseAuditEntry)
 }
 
 /* ---------------------------------------------------------------------------
@@ -1245,21 +1713,55 @@ export function getFreeVMID(hostId: ID, signal?: AbortSignal): Promise<FreeVMID>
 }
 
 /* ---------------------------------------------------------------------------
- * S3 targets
+ * Storage targets
  * ------------------------------------------------------------------------- */
 
-export function listTargets(): Promise<Target[]> {
-  return request<Target[]>('/api/targets')
+/** `kind` is normalised so no caller has to treat "absent" as a third case. */
+function normaliseTarget(target: Target): Target {
+  return { ...target, kind: parseTargetKind(target.kind) }
 }
 
-export function createTarget(input: TargetCreate): Promise<Target> {
-  return request<Target>('/api/targets', { method: 'POST', body: { ...input } })
+export async function listTargets(signal?: AbortSignal): Promise<Target[]> {
+  const targets = await request<Target[]>('/api/targets', { signal })
+  return Array.isArray(targets) ? targets.map(normaliseTarget) : []
 }
 
-export function testTarget(id: ID): Promise<TargetTestResult> {
-  return request<TargetTestResult>(`/api/targets/${encodeURIComponent(String(id))}/test`, {
-    method: 'POST',
-  })
+/**
+ * Creates either shape. The two field sets are mutually exclusive — the server
+ * rejects a mix — so the console sends exactly the fields of the chosen kind.
+ */
+export async function createTarget(input: TargetCreate): Promise<Target> {
+  return normaliseTarget(await request<Target>('/api/targets', { method: 'POST', body: { ...input } }))
+}
+
+/**
+ * Connection test. S3 writes, reads and deletes a probe object; a filesystem
+ * target must exist, be a directory, be writable, and not sit on ProxBack's own
+ * filesystem unless that was explicitly allowed.
+ *
+ * `warnings` is always an array afterwards: a warning means the target works
+ * and something about it will bite later, which is not the same as a failure.
+ */
+export async function testTarget(id: ID): Promise<TargetTestResult> {
+  const result = await request<TargetTestResult>(
+    `/api/targets/${encodeURIComponent(String(id))}/test`,
+    { method: 'POST' },
+  )
+  const raw = (result ?? {}) as unknown as Record<string, unknown>
+  const list = Array.isArray(raw.warnings) ? raw.warnings : []
+  return {
+    ...result,
+    ok: !!result?.ok,
+    warnings: list
+      .map(normaliseWarning)
+      .filter((warning): warning is TargetWarning => warning !== null),
+    filesystemType:
+      typeof raw.filesystemType === 'string'
+        ? raw.filesystemType
+        : typeof raw.fsType === 'string'
+          ? raw.fsType
+          : undefined,
+  }
 }
 
 export function deleteTarget(id: ID): Promise<void> {

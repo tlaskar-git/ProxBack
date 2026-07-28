@@ -1,5 +1,6 @@
 // Package s3target wraps aws-sdk-go-v2 for S3-compatible object stores
-// (AWS S3, Backblaze B2, MinIO and the ProxBack S3 simulator).
+// (AWS S3, Backblaze B2, MinIO and the ProxBack S3 simulator). It is one
+// implementation of blobstore.Store; the other is a filesystem path.
 package s3target
 
 import (
@@ -17,10 +18,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	"proxback/internal/blobstore"
 )
 
-// ErrNotFound is returned when an object does not exist.
-var ErrNotFound = errors.New("s3: object not found")
+// ErrNotFound is returned when an object does not exist. It is
+// blobstore.ErrNotFound: a caller branching on a missing object does not have to
+// know which kind of target it is talking to.
+var ErrNotFound = blobstore.ErrNotFound
 
 // Config describes an S3-compatible endpoint.
 type Config struct {
@@ -37,6 +42,9 @@ type Client struct {
 	api    *s3.Client
 	bucket string
 }
+
+// The engine only ever sees a blobstore.Store.
+var _ blobstore.Store = (*Client)(nil)
 
 // NormalizeEndpoint makes a pasted endpoint usable: trims whitespace and a
 // trailing slash, and defaults the scheme to https:// when it is missing
@@ -198,17 +206,23 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 }
 
 // Object is one entry from a listing.
-type Object struct {
-	Key  string
-	Size int64
-	// LastModified is the object's server-side timestamp. Not every S3
-	// implementation reports it, so treat the zero value as "unknown".
-	LastModified time.Time
-}
+type Object = blobstore.Object
 
 // List returns every object under prefix.
 func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
 	var out []Object
+	if err := c.Walk(ctx, prefix, func(o Object) error {
+		out = append(out, o)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Walk calls fn for every object under prefix, one ListObjectsV2 page at a time.
+// An error from fn stops the walk and is returned unchanged.
+func (c *Client) Walk(ctx context.Context, prefix string, fn func(Object) error) error {
 	var token *string
 	for {
 		page, err := c.api.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -217,7 +231,7 @@ func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
 			ContinuationToken: token,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("s3: list %q: %w", prefix, err)
+			return fmt.Errorf("s3: list %q: %w", prefix, err)
 		}
 		for _, o := range page.Contents {
 			if o.Key == nil {
@@ -231,14 +245,15 @@ func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
 			if o.LastModified != nil {
 				modified = o.LastModified.UTC()
 			}
-			out = append(out, Object{Key: *o.Key, Size: size, LastModified: modified})
+			if err := fn(Object{Key: *o.Key, Size: size, LastModified: modified}); err != nil {
+				return err
+			}
 		}
 		if page.IsTruncated == nil || !*page.IsTruncated || page.NextContinuationToken == nil {
-			break
+			return nil
 		}
 		token = page.NextContinuationToken
 	}
-	return out, nil
 }
 
 // Test performs a put/get/delete round trip on a probe object. It never

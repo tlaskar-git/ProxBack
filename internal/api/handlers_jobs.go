@@ -235,6 +235,11 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if err := s.sched.ReloadSchedules(r.Context()); err != nil {
 		s.log.Warn("could not reload schedules", "error", err)
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditJobCreate, ObjectKind: "job",
+		ObjectID: created.ID, ObjectName: created.Name,
+		Detail: "kind " + created.Kind + ", " + created.Schedule.Label(),
+	})
 	out, err := s.jobDTOs(r, []*store.Job{created})
 	if err != nil {
 		s.serverError(w, err)
@@ -309,6 +314,11 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 	if err := s.sched.ReloadSchedules(r.Context()); err != nil {
 		s.log.Warn("could not reload schedules", "error", err)
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditJobModify, ObjectKind: "job",
+		ObjectID: job.ID, ObjectName: job.Name,
+		Detail: "kind " + job.Kind + ", " + job.Schedule.Label(),
+	})
 	out, err := s.jobDTOs(r, []*store.Job{job})
 	if err != nil {
 		s.serverError(w, err)
@@ -318,13 +328,23 @@ func (s *Server) handlePatchJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteJob(w http.ResponseWriter, r *http.Request) {
-	if err := s.st.DeleteJob(r.Context(), chi.URLParam(r, "id")); err != nil {
+	id := chi.URLParam(r, "id")
+	// The job is read first so the trail can name what was deleted; after the
+	// delete there is nothing left to ask.
+	name := ""
+	if job, err := s.st.JobByID(r.Context(), id); err == nil {
+		name = job.Name
+	}
+	if err := s.st.DeleteJob(r.Context(), id); err != nil {
 		s.notFoundOr(w, err, "job")
 		return
 	}
 	if err := s.sched.ReloadSchedules(r.Context()); err != nil {
 		s.log.Warn("could not reload schedules", "error", err)
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditJobDelete, ObjectKind: "job", ObjectID: id, ObjectName: name,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -464,7 +484,8 @@ func sortPreview(entries []retentionPreviewEntry) {
 }
 
 func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
-	runID, err := s.sched.TriggerJob(r.Context(), chi.URLParam(r, "id"))
+	jobID := chi.URLParam(r, "id")
+	runID, err := s.sched.TriggerJob(r.Context(), jobID)
 	if err != nil {
 		switch {
 		case errors.Is(err, sched.ErrAlreadyRunning):
@@ -476,7 +497,28 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// What is recorded is the request: who started which job, and the run it
+	// produced. How the run ends is the run's own history — the trail does not
+	// reach into the scheduler to wait for it.
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditRunStart, ObjectKind: "job",
+		ObjectID: jobID, ObjectName: s.jobName(r, jobID),
+		Detail: "started run " + runID + " manually",
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"runId": runID})
+}
+
+// jobName is the job's display name for a trail entry, empty when it cannot be
+// read. An audit lookup must never be the reason a request fails.
+func (s *Server) jobName(r *http.Request, jobID string) string {
+	if jobID == "" {
+		return ""
+	}
+	job, err := s.st.JobByID(r.Context(), jobID)
+	if err != nil {
+		return ""
+	}
+	return job.Name
 }
 
 // ---------------------------------------------------------------- runs
@@ -535,7 +577,8 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 // trigger path, so the retry uses the job as it stands now and obeys the same
 // "one run per job" rule as a manual start.
 func (s *Server) handleRetryRun(w http.ResponseWriter, r *http.Request) {
-	runID, err := s.sched.RetryRun(r.Context(), chi.URLParam(r, "id"))
+	sourceRun := chi.URLParam(r, "id")
+	runID, err := s.sched.RetryRun(r.Context(), sourceRun)
 	if err != nil {
 		switch {
 		case errors.Is(err, sched.ErrAlreadyRunning):
@@ -549,6 +592,15 @@ func (s *Server) handleRetryRun(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	name := ""
+	if run, rerr := s.st.RunByID(r.Context(), runID); rerr == nil {
+		name = run.JobName
+	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditRunRetry, ObjectKind: "run",
+		ObjectID: runID, ObjectName: name,
+		Detail: "re-ran run " + sourceRun,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"runId": runID})
 }
 
@@ -588,6 +640,10 @@ func (s *Server) handleDeleteRun(w http.ResponseWriter, r *http.Request) {
 		s.notFoundOr(w, err, "run")
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditRunDelete, ObjectKind: "run", ObjectID: id, ObjectName: run.JobName,
+		Detail: "removed from run history",
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -622,12 +678,18 @@ func (s *Server) handleClearRuns(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, err)
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditRunDelete, ObjectKind: "run", ObjectID: body.JobID,
+		ObjectName: s.jobName(r, body.JobID),
+		Detail:     fmt.Sprintf("cleared %d %s runs from history", n, body.Scope),
+	})
 	writeJSON(w, http.StatusOK, map[string]int{"deleted": n})
 }
 
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if _, err := s.st.RunByID(r.Context(), id); err != nil {
+	run, err := s.st.RunByID(r.Context(), id)
+	if err != nil {
 		s.notFoundOr(w, err, "run")
 		return
 	}
@@ -635,6 +697,9 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "run is not in progress")
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditRunCancel, ObjectKind: "run", ObjectID: id, ObjectName: run.JobName,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -659,7 +724,8 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleVerifyBackup(w http.ResponseWriter, r *http.Request) {
-	runID, err := s.sched.Verify(r.Context(), chi.URLParam(r, "id"))
+	backupID := chi.URLParam(r, "id")
+	runID, err := s.sched.Verify(r.Context(), backupID)
 	if err != nil {
 		switch {
 		case errors.Is(err, sched.ErrAlreadyRunning):
@@ -671,14 +737,41 @@ func (s *Server) handleVerifyBackup(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditVerifyStart, ObjectKind: "backup",
+		ObjectID: backupID, ObjectName: s.backupName(r, backupID),
+		Detail: "started verification run " + runID,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"runId": runID})
 }
 
+// backupName is the workload a restore point belongs to, for a trail entry.
+func (s *Server) backupName(r *http.Request, backupID string) string {
+	b, err := s.st.BackupByID(r.Context(), backupID)
+	if err != nil {
+		return ""
+	}
+	return b.SourceName
+}
+
 func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
-	if err := s.sched.DeleteBackup(r.Context(), chi.URLParam(r, "id")); err != nil {
+	id := chi.URLParam(r, "id")
+	// Read the restore point before it goes, so the trail can say what was
+	// destroyed rather than only which id was requested.
+	name, detail := "", ""
+	if b, err := s.st.BackupByID(r.Context(), id); err == nil {
+		name = b.SourceName
+		detail = fmt.Sprintf("%s restore point of %s, created %s",
+			b.Kind, b.SourceName, b.CreatedAt.Format(time.RFC3339))
+	}
+	if err := s.sched.DeleteBackup(r.Context(), id); err != nil {
 		s.notFoundOr(w, err, "backup")
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditBackupDelete, ObjectKind: "backup",
+		ObjectID: id, ObjectName: name, Detail: detail,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -708,5 +801,35 @@ func (s *Server) handleCreateRestore(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// A restore is the one operation that writes into the estate, so the trail
+	// records both halves of the decision: the mode and the destination.
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditRestoreStart, ObjectKind: "backup",
+		ObjectID: spec.BackupID, ObjectName: s.backupName(r, spec.BackupID),
+		Detail: restoreDetail(spec) + ", run " + runID,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"runId": runID})
+}
+
+// restoreDetail describes a restore in one line: the mode it runs in and where
+// the data lands. Nothing here is a secret — a host id, a node, a VMID, a
+// storage name or a destination path.
+func restoreDetail(spec sched.RestoreSpec) string {
+	mode := spec.Mode
+	if mode == "" {
+		mode = "alongside"
+	}
+	out := "mode " + mode
+	switch {
+	case spec.VM != nil:
+		out += fmt.Sprintf(", to host %s node %s vmid %d", spec.VM.HostID, spec.VM.Node, spec.VM.VMID)
+		if spec.VM.Storage != "" {
+			out += " storage " + spec.VM.Storage
+		}
+	case spec.Agent != nil:
+		out += fmt.Sprintf(", to agent %s path %s", spec.Agent.AgentID, spec.Agent.DestPath)
+	default:
+		out += ", to the original location"
+	}
+	return out
 }

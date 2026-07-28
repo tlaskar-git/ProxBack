@@ -1,7 +1,13 @@
 // Package engine implements ProxBack's chunk-based, deduplicating backup engine:
 // 4 MiB fixed chunking with SHA-256 content addressing, a per-target chunk index
-// with an S3 HEAD fallback, JSON manifests, verified restores and orphan chunk
-// garbage collection.
+// with a HEAD fallback against the target, JSON manifests, verified restores and
+// orphan chunk garbage collection.
+//
+// The engine has no idea what kind of target it is writing to: it holds a
+// blobstore.Store, which is S3-compatible object storage or a local/NAS
+// filesystem path. Every behaviour below — dedup, compression, retention,
+// verification, restore, orphan collection and the 24 h chunk grace — is
+// therefore identical for both kinds by construction rather than by convention.
 package engine
 
 import (
@@ -17,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"proxback/internal/s3target"
+	"proxback/internal/blobstore"
 )
 
 // ErrHashMismatch is returned when restored data fails verification.
@@ -55,7 +61,11 @@ type Options struct {
 
 // Engine is bound to exactly one backup target.
 type Engine struct {
-	s3       *s3target.Client
+	// bs is the target's storage — S3-compatible object storage or a filesystem
+	// path. Everything the engine does (dedup, manifests, restore, verification,
+	// garbage collection) goes through this interface, so no code path below can
+	// behave differently for one kind of target.
+	bs       blobstore.Store
 	targetID string
 	idx      ChunkIndex
 	log      *slog.Logger
@@ -79,13 +89,13 @@ type chunkStore struct {
 }
 
 // New builds an engine for one target with the default options.
-func New(s3c *s3target.Client, targetID string, idx ChunkIndex, log *slog.Logger) *Engine {
-	return NewWithOptions(s3c, targetID, idx, log, Options{})
+func New(bs blobstore.Store, targetID string, idx ChunkIndex, log *slog.Logger) *Engine {
+	return NewWithOptions(bs, targetID, idx, log, Options{})
 }
 
 // NewWithOptions builds an engine for one target, normalising out-of-range
 // options to their defaults so a bad setting can never break a backup.
-func NewWithOptions(s3c *s3target.Client, targetID string, idx ChunkIndex, log *slog.Logger, opts Options) *Engine {
+func NewWithOptions(bs blobstore.Store, targetID string, idx ChunkIndex, log *slog.Logger, opts Options) *Engine {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -104,7 +114,7 @@ func NewWithOptions(s3c *s3target.Client, targetID string, idx ChunkIndex, log *
 		grace = 0
 	}
 	return &Engine{
-		s3:       s3c,
+		bs:       bs,
 		targetID: targetID,
 		idx:      idx,
 		log:      log,
@@ -320,7 +330,7 @@ func (e *Engine) putChunk(ctx context.Context, sha string, data []byte) (int64, 
 	}
 	// Cache miss: the chunk may still be on the target (fresh index, or an index
 	// row lost). Fall back to a HEAD before spending upload bandwidth.
-	if _, exists, err := e.s3.Head(ctx, ChunkKey(sha)); err != nil {
+	if _, exists, err := e.bs.Head(ctx, ChunkKey(sha)); err != nil {
 		return 0, err
 	} else if exists {
 		if err := e.idx.AddChunk(ctx, e.targetID, sha, int64(len(data))); err != nil {
@@ -335,7 +345,7 @@ func (e *Engine) putChunk(ctx context.Context, sha string, data []byte) (int64, 
 	if err := waitUpload(ctx, len(body)); err != nil {
 		return 0, err
 	}
-	if err := e.s3.Put(ctx, ChunkKey(sha), body); err != nil {
+	if err := e.bs.Put(ctx, ChunkKey(sha), body); err != nil {
 		return 0, err
 	}
 	// The index records the raw chunk size: it is the dedup index of the stream's
@@ -358,7 +368,7 @@ func (e *Engine) HasChunk(ctx context.Context, sha string) (bool, error) {
 	if has {
 		return true, nil
 	}
-	size, exists, err := e.s3.Head(ctx, ChunkKey(sha))
+	size, exists, err := e.bs.Head(ctx, ChunkKey(sha))
 	if err != nil {
 		return false, err
 	}
@@ -374,7 +384,7 @@ func (e *Engine) HasChunk(ctx context.Context, sha string) (bool, error) {
 	return exists, nil
 }
 
-// WriteManifest serialises a manifest to its S3 key.
+// WriteManifest serialises a manifest to its key on the target.
 func (e *Engine) WriteManifest(ctx context.Context, m *Manifest) error {
 	if m.ChunkSize == 0 {
 		m.ChunkSize = ChunkSize
@@ -384,17 +394,17 @@ func (e *Engine) WriteManifest(ctx context.Context, m *Manifest) error {
 		return fmt.Errorf("engine: encode manifest: %w", err)
 	}
 	key := ManifestKey(m.SourceKind, m.SourceID, m.BackupID)
-	if err := e.s3.Put(ctx, key, raw); err != nil {
+	if err := e.bs.Put(ctx, key, raw); err != nil {
 		return err
 	}
 	e.log.Debug("manifest written", "key", key, "chunks", m.ChunkCount(), "bytes", m.SizeBytes)
 	return nil
 }
 
-// ReadManifest loads a manifest from S3.
+// ReadManifest loads a manifest from the target.
 func (e *Engine) ReadManifest(ctx context.Context, sourceKind, sourceID, backupID string) (*Manifest, error) {
 	key := ManifestKey(sourceKind, sourceID, backupID)
-	raw, err := e.s3.GetBytes(ctx, key)
+	raw, err := e.bs.GetBytes(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -407,13 +417,13 @@ func (e *Engine) ReadManifest(ctx context.Context, sourceKind, sourceID, backupI
 
 // ManifestExists reports whether a manifest object is present.
 func (e *Engine) ManifestExists(ctx context.Context, sourceKind, sourceID, backupID string) (bool, error) {
-	_, ok, err := e.s3.Head(ctx, ManifestKey(sourceKind, sourceID, backupID))
+	_, ok, err := e.bs.Head(ctx, ManifestKey(sourceKind, sourceID, backupID))
 	return ok, err
 }
 
 // DeleteManifest removes a manifest object.
 func (e *Engine) DeleteManifest(ctx context.Context, sourceKind, sourceID, backupID string) error {
-	return e.s3.Delete(ctx, ManifestKey(sourceKind, sourceID, backupID))
+	return e.bs.Delete(ctx, ManifestKey(sourceKind, sourceID, backupID))
 }
 
 // RestoreDisk streams a disk back out of the target, verifying every chunk's
@@ -424,7 +434,7 @@ func (s *Session) RestoreDisk(ctx context.Context, dm DiskManifest, w io.Writer)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		stored, err := s.e.s3.GetBytes(ctx, ChunkKey(ch.Sha256))
+		stored, err := s.e.bs.GetBytes(ctx, ChunkKey(ch.Sha256))
 		if err != nil {
 			return fmt.Errorf("engine: restore %s: %w", dm.Name, err)
 		}
@@ -491,27 +501,34 @@ type GCResult struct {
 
 // GC deletes chunks on the target that no manifest references any more and
 // removes them from the chunk index.
+//
+// Both listings are streamed (blobstore.Walk) rather than materialised: a target
+// with a million chunks is 4 TB of backups, which is an ordinary NAS, and a GC
+// pass must not need a slice of a million objects to run. What it does hold is
+// the set of chunk hashes present — the index reconcile below cannot be done
+// without it — plus the (normally tiny) list of chunks it decided to delete.
+// Deletion happens after the walk finishes on purpose: unlinking entries from a
+// directory that is being read is exactly the kind of thing a filesystem is
+// allowed to be creative about.
 func (e *Engine) GC(ctx context.Context) (GCResult, error) {
 	var res GCResult
-	manifests, err := e.s3.List(ctx, ManifestPrefix)
-	if err != nil {
-		return res, err
-	}
 	referenced := make(map[string]struct{}, 1024)
-	for _, o := range manifests {
+	err := e.bs.Walk(ctx, ManifestPrefix, func(o blobstore.Object) error {
 		if !strings.HasSuffix(o.Key, ".json") {
-			continue
+			return nil
 		}
-		raw, err := e.s3.GetBytes(ctx, o.Key)
+		raw, err := e.bs.GetBytes(ctx, o.Key)
 		if err != nil {
-			if errors.Is(err, s3target.ErrNotFound) {
-				continue
+			// Retention may have pruned this manifest between the listing and the
+			// read; that is not a GC failure.
+			if errors.Is(err, blobstore.ErrNotFound) {
+				return nil
 			}
-			return res, err
+			return err
 		}
 		var m Manifest
 		if err := json.Unmarshal(raw, &m); err != nil {
-			return res, fmt.Errorf("engine: gc decode %s: %w", o.Key, err)
+			return fmt.Errorf("engine: gc decode %s: %w", o.Key, err)
 		}
 		res.ManifestsScanned++
 		for _, d := range m.Disks {
@@ -519,8 +536,8 @@ func (e *Engine) GC(ctx context.Context) (GCResult, error) {
 				referenced[c.Sha256] = struct{}{}
 			}
 		}
-	}
-	chunks, err := e.s3.List(ctx, ChunkPrefix)
+		return nil
+	})
 	if err != nil {
 		return res, err
 	}
@@ -529,13 +546,14 @@ func (e *Engine) GC(ctx context.Context) (GCResult, error) {
 		return res, fmt.Errorf("engine: gc chunk index: %w", err)
 	}
 	now := time.Now()
-	present := make(map[string]struct{}, len(chunks))
-	for _, o := range chunks {
+	present := make(map[string]struct{}, len(indexed))
+	var doomed []blobstore.Object
+	err = e.bs.Walk(ctx, ChunkPrefix, func(o blobstore.Object) error {
 		res.ChunksScanned++
 		sha := strings.TrimPrefix(o.Key, ChunkPrefix)
 		present[sha] = struct{}{}
 		if _, ok := referenced[sha]; ok {
-			continue
+			return nil
 		}
 		// A run that was interrupted (cancelled, crashed, server restarted for an
 		// update) has uploaded chunks that no manifest references yet. Deleting
@@ -545,19 +563,26 @@ func (e *Engine) GC(ctx context.Context) (GCResult, error) {
 		if age, ok := e.chunkAge(now, sha, indexed, o); ok && age < e.gcGrace {
 			res.ChunksSkippedRecent++
 			res.BytesSkippedRecent += o.Size
-			continue
+			return nil
 		}
-		if err := e.s3.Delete(ctx, o.Key); err != nil {
+		doomed = append(doomed, o)
+		return nil
+	})
+	if err != nil {
+		return res, err
+	}
+	for _, o := range doomed {
+		if err := e.bs.Delete(ctx, o.Key); err != nil {
 			return res, err
 		}
-		if err := e.idx.DeleteChunk(ctx, e.targetID, sha); err != nil {
+		if err := e.idx.DeleteChunk(ctx, e.targetID, strings.TrimPrefix(o.Key, ChunkPrefix)); err != nil {
 			return res, fmt.Errorf("engine: gc chunk index: %w", err)
 		}
 		res.ChunksDeleted++
 		res.BytesFreed += o.Size
 	}
 	// Reconcile the other direction: index rows whose chunk is gone from the
-	// bucket (lifecycle rules, out-of-band deletion) would make dedup skip
+	// target (a bucket lifecycle rule, a deletion outside ProxBack) would make dedup skip
 	// uploads forever and produce unrestorable backups. Drop them so the next
 	// run re-uploads. Chunks spared by the grace window are present, so they keep
 	// their rows.
@@ -584,7 +609,7 @@ func (e *Engine) GC(ctx context.Context) (GCResult, error) {
 // moment a PUT succeeds — and the object's LastModified is only a fallback for
 // chunks with no index row, because S3 implementations vary in how (and whether)
 // they report it.
-func (e *Engine) chunkAge(now time.Time, sha string, indexed map[string]time.Time, o s3target.Object) (time.Duration, bool) {
+func (e *Engine) chunkAge(now time.Time, sha string, indexed map[string]time.Time, o blobstore.Object) (time.Duration, bool) {
 	if e.gcGrace <= 0 {
 		return 0, false
 	}
@@ -603,15 +628,16 @@ func (e *Engine) chunkAge(now time.Time, sha string, indexed map[string]time.Tim
 // stamped with the time of the rebuild — which also gives them one grace window
 // of protection from collection.
 func (e *Engine) SyncChunkIndex(ctx context.Context) (int, error) {
-	objs, err := e.s3.List(ctx, ChunkPrefix)
-	if err != nil {
-		return 0, err
-	}
-	for _, o := range objs {
+	n := 0
+	if err := e.bs.Walk(ctx, ChunkPrefix, func(o blobstore.Object) error {
 		sha := strings.TrimPrefix(o.Key, ChunkPrefix)
 		if err := e.idx.AddChunk(ctx, e.targetID, sha, o.Size); err != nil {
-			return 0, fmt.Errorf("engine: sync chunk index: %w", err)
+			return fmt.Errorf("engine: sync chunk index: %w", err)
 		}
+		n++
+		return nil
+	}); err != nil {
+		return 0, err
 	}
-	return len(objs), nil
+	return n, nil
 }

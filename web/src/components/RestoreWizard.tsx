@@ -28,11 +28,12 @@ import {
   RotateCcw,
   ShieldAlert,
 } from 'lucide-react'
-import { createRestore, errorMessage, getFreeVMID } from '../api'
-import type { Agent, Backup, CachedVM, Host, RestoreMode, RestoreRequest } from '../api'
+import { createRestore, errorMessage, getFreeVMID, isOffsite, targetLocation } from '../api'
+import type { Agent, Backup, CachedVM, Host, RestoreMode, RestoreRequest, Target } from '../api'
 import { cn } from '../lib/cn'
 import { formatBytes, formatDateTime, formatRelative } from '../lib/format'
 import { identityText, WorkloadIdentity } from './Identity'
+import { TargetKindChip } from './TargetIdentity'
 import { Modal } from './Modal'
 import { useToast } from './Toast'
 import {
@@ -134,6 +135,7 @@ function ModeTile({
 
 export function RestoreWizard({
   backup,
+  target,
   hosts,
   agents,
   vms,
@@ -141,6 +143,12 @@ export function RestoreWizard({
   onStarted,
 }: {
   backup: Backup | null
+  /**
+   * The target this point is read back from. Shown because a local path and an
+   * offsite bucket restore at completely different speeds, and the operator
+   * should know which one they are waiting on before they start.
+   */
+  target?: Target
   hosts: Host[]
   agents: Agent[]
   vms: CachedVM[]
@@ -655,10 +663,27 @@ export function RestoreWizard({
                   )}
                 </DefinitionRow>
 
+                <DefinitionRow label="Read back from">
+                  {target ? (
+                    <span className="inline-flex flex-wrap items-center gap-2">
+                      {target.name}
+                      <TargetKindChip kind={target.kind} />
+                      <span className="font-mono text-meta text-slate-500">
+                        {targetLocation(target)}
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="text-slate-500">
+                      The target this point was written to is no longer configured.
+                    </span>
+                  )}
+                </DefinitionRow>
+
                 <DefinitionRow label="Estimated transfer">
                   <Num>{formatBytes(backup.sizeBytes)}</Num>
                   <span className="ml-2 text-meta text-slate-500">
                     full size of this point, read back from the target
+                    {target && isOffsite(target.kind) ? ' over the internet' : ''}
                   </span>
                 </DefinitionRow>
               </DefinitionList>

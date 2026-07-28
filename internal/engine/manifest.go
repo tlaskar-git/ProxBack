@@ -21,7 +21,7 @@ type DiskManifest struct {
 	Chunks    []Chunk `json:"chunks"`
 }
 
-// Manifest is the backup point descriptor stored in S3.
+// Manifest is the backup point descriptor stored on the target.
 type Manifest struct {
 	BackupID      string         `json:"backupId"`
 	JobID         string         `json:"jobId"`
@@ -56,21 +56,23 @@ func Kind(parentID string) string {
 	return KindIncremental
 }
 
-// ChunkKey is the S3 key of a deduplicated chunk.
+// ChunkKey is the object key of a deduplicated chunk. The key space is the same
+// on every kind of target — object storage and filesystem alike — so a target can
+// be rsynced offsite or migrated between kinds without translation.
 func ChunkKey(sha256hex string) string { return "chunks/" + sha256hex }
 
-// ChunkPrefix is the S3 prefix holding all chunks of a target.
+// ChunkPrefix is the prefix holding all chunks of a target.
 const ChunkPrefix = "chunks/"
 
-// ManifestPrefix is the S3 prefix holding all manifests of a target.
+// ManifestPrefix is the prefix holding all manifests of a target.
 const ManifestPrefix = "manifests/"
 
-// ManifestKey is the S3 key of a backup manifest.
+// ManifestKey is the object key of a backup manifest.
 func ManifestKey(sourceKind, sourceID, backupID string) string {
 	return fmt.Sprintf("manifests/%s/%s/%s.json", sourceKind, sourceID, backupID)
 }
 
-// SourceManifestPrefix is the S3 prefix holding all manifests of one source.
+// SourceManifestPrefix is the prefix holding all manifests of one source.
 func SourceManifestPrefix(sourceKind, sourceID string) string {
 	return fmt.Sprintf("manifests/%s/%s/", sourceKind, sourceID)
 }

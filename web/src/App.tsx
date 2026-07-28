@@ -1,19 +1,24 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
 import { Route, Routes, useNavigate } from 'react-router-dom'
+import { Lock } from 'lucide-react'
 import {
+  capabilitiesFor,
   errorMessage,
   getMe,
   getSettings,
   getSetupStatus,
   isApiError,
   logout as apiLogout,
+  roleOf,
+  ROLE_LABEL,
 } from './api'
-import type { User } from './api'
+import type { Role, User } from './api'
 import { Layout } from './components/Layout'
 import { BrandMark } from './components/Brand'
-import { Button, Spinner } from './components/ui'
+import { Button, EmptyState, PageHeader, Spinner } from './components/ui'
 import { useToast } from './components/Toast'
-import { SessionProvider } from './session'
+import { SessionProvider, useSession } from './session'
 import type { Session } from './session'
 import { LoginPage } from './pages/LoginPage'
 import { SetupPage } from './pages/SetupPage'
@@ -26,13 +31,21 @@ import { RestorePointsPage } from './pages/RestorePointsPage'
 import { TargetsPage } from './pages/TargetsPage'
 import { AgentsPage } from './pages/AgentsPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { UsersPage } from './pages/UsersPage'
+import { AuditPage } from './pages/AuditPage'
 import { NotFoundPage } from './pages/NotFoundPage'
 
 type Phase =
   | { state: 'loading' }
   | { state: 'setup' }
   | { state: 'login'; defaultLogin: boolean }
-  | { state: 'ready'; user: User; mustChangePassword: boolean; serverVersion: string }
+  | {
+      state: 'ready'
+      user: User
+      role: Role
+      mustChangePassword: boolean
+      serverVersion: string
+    }
   | { state: 'unreachable'; message: string }
 
 function BootScreen({ message, onRetry }: { message?: string; onRetry?: () => void }) {
@@ -84,6 +97,7 @@ export default function App() {
         setPhase({
           state: 'ready',
           user: me.user,
+          role: roleOf(me),
           mustChangePassword: !!me.mustChangePassword,
           serverVersion: me.serverVersion ?? '',
         })
@@ -121,13 +135,25 @@ export default function App() {
 
   const onAuthenticated = useCallback(
     (user: User) => {
-      setPhase({ state: 'ready', user, mustChangePassword: false, serverVersion: '' })
-      // The login response does not carry the default-password flag; refresh it.
+      setPhase({
+        state: 'ready',
+        user,
+        // Use the role the login response carries, and otherwise assume the
+        // least until `GET /api/me` answers a moment later: guessing admin
+        // would flash controls this user may not have, and a viewer watching
+        // them appear and then vanish is worse than watching them arrive.
+        role: user.role ?? 'viewer',
+        mustChangePassword: false,
+        serverVersion: '',
+      })
+      // The login response carries neither the role nor the default-password
+      // flag; refresh both.
       getMe()
         .then((me) =>
           setPhase({
             state: 'ready',
             user: me.user,
+            role: roleOf(me),
             mustChangePassword: !!me.mustChangePassword,
             serverVersion: me.serverVersion ?? '',
           }),
@@ -160,6 +186,8 @@ export default function App() {
     if (phase.state !== 'ready') return null
     return {
       user: phase.user,
+      role: phase.role,
+      can: capabilitiesFor(phase.role),
       serverName,
       setServerName,
       signOut,
@@ -192,9 +220,52 @@ export default function App() {
           <Route path="targets" element={<TargetsPage />} />
           <Route path="agents" element={<AgentsPage />} />
           <Route path="settings" element={<SettingsPage />} />
+          <Route
+            path="users"
+            element={
+              <AdminOnly title="Users">
+                <UsersPage />
+              </AdminOnly>
+            }
+          />
+          <Route
+            path="audit"
+            element={
+              <AdminOnly title="Audit">
+                <AuditPage />
+              </AdminOnly>
+            }
+          />
           <Route path="*" element={<NotFoundPage />} />
         </Route>
       </Routes>
     </SessionProvider>
+  )
+}
+
+/**
+ * Admin-only pages are not in a non-admin's navigation, but a bookmark or a
+ * pasted link still lands here. Say plainly that the page exists and that this
+ * account may not read it — the server would answer 403 anyway, and an
+ * explanation beats a raw error or a pretended 404.
+ */
+function AdminOnly({ title, children }: { title: string; children: ReactNode }) {
+  const { can, role } = useSession()
+  const navigate = useNavigate()
+  if (can.manageUsers) return <>{children}</>
+  return (
+    <>
+      <PageHeader title={title} description="Administrators only." />
+      <EmptyState
+        icon={<Lock className="size-5" aria-hidden />}
+        title="This page is for administrators"
+        description={`You are signed in as ${ROLE_LABEL[role].toLowerCase()}. ${title} is limited to administrators, who can give you the role if you need it.`}
+        action={
+          <Button variant="primary" onClick={() => navigate('/')}>
+            Back to the dashboard
+          </Button>
+        }
+      />
+    </>
   )
 }

@@ -51,14 +51,29 @@ func (s *Server) handleCreateEnrollToken(w http.ResponseWriter, r *http.Request)
 		s.serverError(w, err)
 		return
 	}
+	// Minting an enrollment token is what admits a new agent, so it is the agent
+	// creation the trail can record. The token value itself is a credential and is
+	// never written here.
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditAgentCreate, ObjectKind: "agent",
+		Detail: "issued an agent enrollment token, valid until " + tok.ExpiresAt.Format(time.RFC3339),
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"token": tok.Token, "expiresAt": tok.ExpiresAt})
 }
 
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
-	if err := s.st.DeleteAgent(r.Context(), chi.URLParam(r, "id")); err != nil {
+	id := chi.URLParam(r, "id")
+	name := ""
+	if agent, err := s.st.AgentByID(r.Context(), id); err == nil {
+		name = agent.Hostname
+	}
+	if err := s.st.DeleteAgent(r.Context(), id); err != nil {
 		s.notFoundOr(w, err, "agent")
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditAgentDelete, ObjectKind: "agent", ObjectID: id, ObjectName: name,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

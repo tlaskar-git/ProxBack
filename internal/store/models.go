@@ -56,10 +56,14 @@ func NewID() string {
 
 // User is a control-panel operator.
 type User struct {
-	ID           int64     `json:"id"`
-	Username     string    `json:"username"`
-	PasswordHash string    `json:"-"`
-	CreatedAt    time.Time `json:"-"`
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+	// Role is what this user may do. It is never empty for a row written by this
+	// build; a row from before roles existed is migrated to RoleAdmin.
+	Role         Role       `json:"role"`
+	PasswordHash string     `json:"-"`
+	CreatedAt    time.Time  `json:"-"`
+	LastLoginAt  *time.Time `json:"-"`
 }
 
 // Session is an opaque server-side session token.
@@ -113,11 +117,32 @@ func (v VM) HasTag(tag string) bool {
 	return false
 }
 
-// S3Target is a backup destination. SecretKey is only populated by accessors that
-// explicitly decrypt it and is never serialised.
+// Target kinds. A target is either S3-compatible object storage or a path the
+// operator has mounted (NFS, SMB, iSCSI, a USB disk, a ZFS dataset) — ProxBack
+// implements no network filesystem protocol of its own.
+const (
+	// TargetKindS3 is object storage. It is the default, which is what every row
+	// written before targets had a kind migrates to.
+	TargetKindS3 = "s3"
+	// TargetKindFilesystem is a directory on a local or mounted filesystem.
+	TargetKindFilesystem = "filesystem"
+)
+
+// S3Target is a backup destination. It keeps its name from the release where
+// object storage was the only kind; the table is likewise still s3_targets, so no
+// installation has to be migrated to a new table to gain filesystem targets.
+//
+// Kind decides which half of the struct is meaningful: TargetKindS3 uses
+// Endpoint/Region/Bucket/AccessKey/SecretKey/PathStyle, TargetKindFilesystem uses
+// Path. Mixing the two is rejected at the API boundary.
+//
+// SecretKey is only populated by accessors that explicitly decrypt it and is
+// never serialised.
 type S3Target struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
+	Kind      string    `json:"kind"`
+	Path      string    `json:"path"`
 	Endpoint  string    `json:"endpoint"`
 	Region    string    `json:"region"`
 	Bucket    string    `json:"bucket"`
@@ -127,6 +152,9 @@ type S3Target struct {
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"-"`
 }
+
+// IsFilesystem reports whether the target is a filesystem path.
+func (t *S3Target) IsFilesystem() bool { return t.Kind == TargetKindFilesystem }
 
 // Agent is an enrolled in-guest agent.
 type Agent struct {
@@ -303,10 +331,13 @@ func ValidRestoreMode(v string) bool {
 
 // JobRun is one execution of a job (or a restore operation).
 type JobRun struct {
-	ID             string     `json:"id"`
-	JobID          string     `json:"jobId"`
-	JobName        string     `json:"jobName"`
-	Kind           string     `json:"-"`
+	ID      string `json:"id"`
+	JobID   string `json:"jobId"`
+	JobName string `json:"jobName"`
+	// Kind distinguishes a backup from a restore or verification. The console
+	// needs it to know when a figure does not apply: a verification uploads
+	// nothing, so its data reduction is not 0% — it is meaningless.
+	Kind           string     `json:"kind"`
 	Status         string     `json:"status"`
 	StartedAt      time.Time  `json:"startedAt"`
 	FinishedAt     *time.Time `json:"finishedAt,omitempty"`

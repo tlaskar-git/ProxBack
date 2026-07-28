@@ -34,6 +34,7 @@ import {
   toneForStatus,
 } from '../components/ui'
 import { cn } from '../lib/cn'
+import { roleDeniedReason, useSession } from '../session'
 import { useAsync } from '../lib/useAsync'
 import { formatBytes, formatCount, formatUptime } from '../lib/format'
 
@@ -73,6 +74,8 @@ function VMCard({
   busy: boolean
 }) {
   const tags = tagsOf(vm)
+  const { can, role } = useSession()
+  const denied = can.operateJobs ? undefined : roleDeniedReason(role, 'start backups')
   return (
     // A guest no *enabled* job covers carries an amber edge, so the gap the
     // dashboard counts is findable by scanning rather than by reading every
@@ -153,6 +156,9 @@ function VMCard({
           variant="primary"
           className="w-full"
           loading={busy}
+          disabled={!can.operateJobs}
+          title={denied}
+          aria-label={denied ? `Back up ${vm.name} now — ${denied}` : undefined}
           icon={<Play className="size-3.5" aria-hidden />}
           onClick={onBackup}
         >

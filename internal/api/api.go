@@ -149,65 +149,104 @@ func (s *Server) apiRoutes() chi.Router {
 	})
 
 	// Session cookie authenticated routes.
+	//
+	// Authorisation is decided here, by the group a route is registered in, and
+	// never inside a handler: a new endpoint is protected by where it sits, so
+	// protecting it is not something anyone has to remember. The three groups are
+	// the PLAN's capability table — viewer reads, operator runs work, admin owns
+	// users, credentials, infrastructure, settings and updates.
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireSession)
 
+		// ---- any signed-in user, including a viewer ----------------------------
+		//
+		// Reads, plus the two things that are about the caller's own session. A
+		// user changing their own password needs no role: it is their account.
 		r.Post("/logout", s.handleLogout)
 		r.Get("/me", s.handleMe)
 		r.Post("/me/password", s.handleChangePassword)
 
 		r.Get("/update/status", s.handleUpdateStatus)
-		r.Post("/update/apply", s.handleUpdateApply)
 
 		r.Get("/dashboard", s.handleDashboard)
 		r.Get("/posture", s.handlePosture)
 
 		r.Get("/hosts", s.handleListHosts)
-		r.Post("/hosts", s.handleCreateHost)
-		r.Post("/hosts/{id}/test", s.handleTestHost)
-		r.Delete("/hosts/{id}", s.handleDeleteHost)
 		r.Get("/hosts/{id}/vms", s.handleHostVMs)
 		r.Get("/hosts/{id}/free-vmid", s.handleFreeVMID)
 		r.Get("/vms", s.handleListVMs)
 
 		r.Get("/targets", s.handleListTargets)
-		r.Post("/targets", s.handleCreateTarget)
-		r.Post("/targets/{id}/test", s.handleTestTarget)
-		r.Delete("/targets/{id}", s.handleDeleteTarget)
 
 		r.Get("/jobs", s.handleListJobs)
-		r.Post("/jobs", s.handleCreateJob)
-		r.Patch("/jobs/{id}", s.handlePatchJob)
-		r.Delete("/jobs/{id}", s.handleDeleteJob)
-		r.Post("/jobs/{id}/run", s.handleRunJob)
 		r.Get("/jobs/{id}/retention-preview", s.handleRetentionPreview)
 
 		r.Get("/runs", s.handleListRuns)
-		r.Post("/runs/clear", s.handleClearRuns)
 		r.Get("/runs/{id}", s.handleGetRun)
 		r.Get("/runs/{id}/log", s.handleRunLog)
-		r.Delete("/runs/{id}", s.handleDeleteRun)
-		r.Post("/runs/{id}/cancel", s.handleCancelRun)
-		r.Post("/runs/{id}/retry", s.handleRetryRun)
 
 		r.Get("/backups", s.handleListBackups)
-		r.Post("/backups/{id}/verify", s.handleVerifyBackup)
-		r.Delete("/backups/{id}", s.handleDeleteBackup)
-		r.Post("/restores", s.handleCreateRestore)
 
 		r.Get("/agents", s.handleListAgents)
-		r.Post("/agents/enroll-token", s.handleCreateEnrollToken)
-		r.Delete("/agents/{id}", s.handleDeleteAgent)
-
 		r.Get("/helpers", s.handleListHelpers)
-		r.Post("/helpers/enroll-token", s.handleCreateHelperEnrollToken)
-		r.Post("/helpers/deploy", s.handleDeployHelper)
-		r.Post("/helpers/{id}/assign", s.handleAssignHelper)
-		r.Delete("/helpers/{id}", s.handleDeleteHelper)
-
 		r.Get("/settings", s.handleGetSettings)
-		r.Put("/settings", s.handlePutSettings)
-		r.Post("/settings/test-webhook", s.handleTestWebhook)
+
+		// ---- operator and above -----------------------------------------------
+		//
+		// Everything that runs, cancels or edits protected work. A viewer gets 403.
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireRole(store.RoleOperator))
+
+			r.Post("/jobs", s.handleCreateJob)
+			r.Patch("/jobs/{id}", s.handlePatchJob)
+			r.Delete("/jobs/{id}", s.handleDeleteJob)
+			r.Post("/jobs/{id}/run", s.handleRunJob)
+
+			r.Post("/runs/clear", s.handleClearRuns)
+			r.Delete("/runs/{id}", s.handleDeleteRun)
+			r.Post("/runs/{id}/cancel", s.handleCancelRun)
+			r.Post("/runs/{id}/retry", s.handleRetryRun)
+
+			r.Post("/backups/{id}/verify", s.handleVerifyBackup)
+			r.Delete("/backups/{id}", s.handleDeleteBackup)
+			r.Post("/restores", s.handleCreateRestore)
+		})
+
+		// ---- admin only -------------------------------------------------------
+		//
+		// Users, credentials, hosts, storage targets, node helpers, agents,
+		// settings, software updates and the audit trail itself.
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireRole(store.RoleAdmin))
+
+			r.Get("/users", s.handleListUsers)
+			r.Post("/users", s.handleCreateUser)
+			r.Patch("/users/{id}", s.handlePatchUser)
+			r.Delete("/users/{id}", s.handleDeleteUser)
+
+			r.Get("/audit", s.handleListAudit)
+
+			r.Post("/update/apply", s.handleUpdateApply)
+
+			r.Post("/hosts", s.handleCreateHost)
+			r.Post("/hosts/{id}/test", s.handleTestHost)
+			r.Delete("/hosts/{id}", s.handleDeleteHost)
+
+			r.Post("/targets", s.handleCreateTarget)
+			r.Post("/targets/{id}/test", s.handleTestTarget)
+			r.Delete("/targets/{id}", s.handleDeleteTarget)
+
+			r.Post("/agents/enroll-token", s.handleCreateEnrollToken)
+			r.Delete("/agents/{id}", s.handleDeleteAgent)
+
+			r.Post("/helpers/enroll-token", s.handleCreateHelperEnrollToken)
+			r.Post("/helpers/deploy", s.handleDeployHelper)
+			r.Post("/helpers/{id}/assign", s.handleAssignHelper)
+			r.Delete("/helpers/{id}", s.handleDeleteHelper)
+
+			r.Put("/settings", s.handlePutSettings)
+			r.Post("/settings/test-webhook", s.handleTestWebhook)
+		})
 	})
 	return r
 }
@@ -259,6 +298,50 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 func userFrom(ctx context.Context) *store.User {
 	u, _ := ctx.Value(ctxUser).(*store.User)
 	return u
+}
+
+// requireRole refuses a request whose user does not carry the required role.
+//
+// It is middleware rather than a check inside each handler on purpose: a route is
+// protected by the group it is registered in, so a new endpoint added to the
+// admin group is protected without anybody remembering to guard it, and a
+// forbidden request can never turn into a silent no-op. The refusal is an honest
+// 403 with a JSON error — never a 404 pretending the endpoint does not exist —
+// and it is recorded in the audit trail as a denied attempt, because an operator
+// probing admin endpoints is exactly what a trail is for.
+//
+// It must be used inside a group that already carries requireSession; without a
+// user it refuses everything.
+func (s *Server) requireRole(required store.Role) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user := userFrom(r.Context())
+			if user == nil {
+				writeError(w, http.StatusUnauthorized, "authentication required")
+				return
+			}
+			if !user.Role.AtLeast(required) {
+				// The route is named as the object: the request never reached a
+				// handler, so there is no host, job or user to name here.
+				s.audit(r, store.AuditEntry{
+					Action:     store.AuditAccessDenied,
+					Result:     store.AuditDenied,
+					ObjectKind: "route",
+					ObjectID:   r.Method + " " + r.URL.Path,
+					ObjectName: r.URL.Path,
+					Detail:     "role " + string(user.Role) + " does not carry " + string(required),
+				})
+				s.log.Warn("request denied by role",
+					"user", user.Username, "role", user.Role, "required", required,
+					"method", r.Method, "path", r.URL.Path)
+				writeError(w, http.StatusForbidden,
+					"this action requires the "+string(required)+" role; you are signed in as "+
+						user.Username+" ("+string(user.Role)+")")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func (s *Server) requireAgent(next http.Handler) http.Handler {

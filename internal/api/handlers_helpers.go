@@ -94,6 +94,12 @@ func (s *Server) handleCreateHelperEnrollToken(w http.ResponseWriter, r *http.Re
 		s.serverError(w, err)
 		return
 	}
+	// The token value is a credential and is never recorded; which host it admits
+	// a helper into is exactly what the trail should say.
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditHelperCreate, ObjectKind: "helper",
+		Detail: "issued a node helper enrollment token for host " + body.HostID,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"token": tok.Token, "expiresAt": tok.ExpiresAt})
 }
 
@@ -136,14 +142,29 @@ func (s *Server) handleAssignHelper(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("node helper assigned to a host", "helper", id, "hostId", hostID, "node", h.Node)
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditHelperModify, ObjectKind: "helper",
+		ObjectID: h.ID, ObjectName: h.Node,
+		Detail: "assigned to host " + hostID,
+	})
 	writeJSON(w, http.StatusOK, toHelperDTO(h, names))
 }
 
 func (s *Server) handleDeleteHelper(w http.ResponseWriter, r *http.Request) {
-	if err := s.st.DeleteHelper(r.Context(), chi.URLParam(r, "id")); err != nil {
+	id := chi.URLParam(r, "id")
+	name, detail := "", ""
+	if h, err := s.st.HelperByID(r.Context(), id); err == nil {
+		name = h.Node
+		detail = "host " + h.HostID + ", address " + h.Address
+	}
+	if err := s.st.DeleteHelper(r.Context(), id); err != nil {
 		s.notFoundOr(w, err, "node helper")
 		return
 	}
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditHelperDelete, ObjectKind: "helper",
+		ObjectID: id, ObjectName: name, Detail: detail,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -271,6 +292,12 @@ func (s *Server) handleDeployHelper(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("node helper deployed", "node", node, "address", address, "port", port)
+	// The SSH password used for the one connection is never stored or logged, and
+	// it is not recorded here either.
+	s.audit(r, store.AuditEntry{
+		Action: store.AuditHelperCreate, ObjectKind: "helper", ObjectName: node,
+		Detail: fmt.Sprintf("deployed over SSH to %s:%d for host %s", address, port, hostID),
+	})
 
 	logLines := res.Log
 	if logLines == nil {

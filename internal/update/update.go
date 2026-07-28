@@ -24,7 +24,8 @@ import (
 // the PROXBACK_UPDATE_REPO environment variable (owner/name).
 const DefaultRepo = "tlaskar-git/ProxBack"
 
-// ErrNoReleases is returned when the repository has no published releases yet.
+// ErrNoReleases is returned when the repository has no published releases yet,
+// or — from ByTag — when the asked-for version was never published.
 var ErrNoReleases = errors.New("update: no releases published yet")
 
 // ErrNoAsset is returned when the latest release has no binary for this platform.
@@ -76,7 +77,18 @@ func New(log *slog.Logger) *Checker {
 
 // Latest fetches the newest published release.
 func (c *Checker) Latest(ctx context.Context) (*Release, error) {
-	url := fmt.Sprintf("%s/repos/%s/releases/latest", c.APIBase, c.Repo)
+	return c.release(ctx, fmt.Sprintf("%s/repos/%s/releases/latest", c.APIBase, c.Repo))
+}
+
+// ByTag fetches the release published under one version tag. Healing the staged
+// agent and node helper binaries needs this rather than Latest: they must match
+// the server that hands them out, which is not necessarily the newest release.
+func (c *Checker) ByTag(ctx context.Context, ver string) (*Release, error) {
+	tag := "v" + strings.TrimPrefix(strings.TrimSpace(ver), "v")
+	return c.release(ctx, fmt.Sprintf("%s/repos/%s/releases/tags/%s", c.APIBase, c.Repo, tag))
+}
+
+func (c *Checker) release(ctx context.Context, url string) (*Release, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("update: build request: %w", err)
@@ -197,26 +209,25 @@ func (c *Checker) Apply(ctx context.Context, rel *Release, asset Asset, binPath 
 		return fmt.Errorf("update: finish download: %w", err)
 	}
 
-	// Verify against checksums.txt when the release ships one.
-	for _, a := range rel.Assets {
-		if a.Name != "checksums.txt" {
-			continue
-		}
-		var buf strings.Builder
-		if err := c.download(ctx, a.DownloadURL, &buf); err != nil {
-			return fmt.Errorf("update: fetch checksums: %w", err)
-		}
-		want := checksumFor(buf.String(), asset.Name)
-		if want == "" {
-			c.log.Warn("release checksums.txt has no entry for asset", "asset", asset.Name)
-			break
-		}
-		got := hex.EncodeToString(sum.Sum(nil))
-		if got != want {
+	// Verify against checksums.txt when the release ships one. The staged agent
+	// and node helper binaries go through the same two calls in stageAsset, so
+	// the server binary and the binaries it hands out cannot end up held to
+	// different standards.
+	checksums, err := c.releaseChecksums(ctx, rel)
+	if err != nil {
+		return err
+	}
+	want := checksumFor(checksums, asset.Name)
+	switch {
+	case checksums == "":
+		// releaseChecksums has already warned that the release publishes none.
+	case want == "":
+		c.log.Warn("release checksums.txt has no entry for asset", "asset", asset.Name)
+	default:
+		if got := hex.EncodeToString(sum.Sum(nil)); got != want {
 			return fmt.Errorf("update: checksum mismatch for %s: got %s want %s", asset.Name, got, want)
 		}
 		c.log.Info("update checksum verified", "asset", asset.Name)
-		break
 	}
 
 	if err := os.Chmod(tmpPath, 0o755); err != nil {

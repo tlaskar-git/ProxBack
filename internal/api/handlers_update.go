@@ -12,6 +12,17 @@ import (
 	"proxback/internal/version"
 )
 
+// stagedFailureMessages flattens the per-binary failures for the JSON response.
+// Nil rather than an empty slice, so a clean refresh emits null and the console
+// has one thing to test.
+func stagedFailureMessages(res update.StagedRefresh) []string {
+	var out []string
+	for _, f := range res.Failed {
+		out = append(out, f.Name+": "+f.Err.Error())
+	}
+	return out
+}
+
 type updateStatusDTO struct {
 	CurrentVersion  string `json:"currentVersion"`
 	LatestVersion   string `json:"latestVersion,omitempty"`
@@ -100,6 +111,14 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, err)
 		return
 	}
+	// Refresh what this server hands out, from the same release, before the
+	// restart below. Without this the server upgrades and the staged agent does
+	// not: a 0.6.0 server keeps installing the agent its installer left behind,
+	// which is how every Windows install came to fail with SCM error 1053 while
+	// the console reported a healthy, up-to-date server. It is best effort — a
+	// staged binary that cannot be refreshed is logged and reported by
+	// GET /api/downloads/status, and never undoes a successful server upgrade.
+	staged := s.refreshStagedBinaries(r, rel, checker)
 	s.audit(r, store.AuditEntry{
 		Action: store.AuditUpdateApply, ObjectKind: "server", ObjectName: "proxback-server",
 		Detail: "updated from " + version.Version + " to " + rel.Version(),
@@ -119,5 +138,13 @@ func (s *Server) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 		"ok":         true,
 		"version":    rel.Version(),
 		"restarting": restarting,
+		// What the console will hand out from here on, so the operator learns
+		// about a staged binary that could not be refreshed at the moment they
+		// update rather than the next time an install mysteriously fails.
+		"stagedBinaries": map[string]any{
+			"refreshed": staged.Updated,
+			"skipped":   staged.Skipped,
+			"failed":    stagedFailureMessages(staged),
+		},
 	})
 }

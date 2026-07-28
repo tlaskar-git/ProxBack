@@ -629,6 +629,16 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(pveSrv.Close)
 
 	// 1c. ProxBack server.
+	//
+	// The server reconciles its staged agent and node helper binaries against the
+	// release repository on startup. Point that at a repository with no releases:
+	// a test must never depend on the internet, and this is also the air-gapped
+	// path — the staged binaries are left exactly as the test finds them, which is
+	// what the download subtests below assert on.
+	noReleases := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(noReleases.Close)
+	t.Setenv("PROXBACK_UPDATE_API", noReleases.URL)
+
 	dataDir := t.TempDir()
 	instance, err := app.New(context.Background(), app.Options{DataDir: dataDir, Logger: log})
 	if err != nil {

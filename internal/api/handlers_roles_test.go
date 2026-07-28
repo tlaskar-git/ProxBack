@@ -144,6 +144,7 @@ func TestRoleCapabilityMatrix(t *testing.T) {
 		// Applying an update contacts the release repository, so only the refusal
 		// half is asserted here.
 		{method: http.MethodPost, path: "/api/update/apply", needs: store.RoleAdmin, skipAllowed: true},
+		{method: http.MethodGet, path: "/api/downloads/status", needs: store.RoleAdmin},
 	}
 
 	for _, route := range routes {

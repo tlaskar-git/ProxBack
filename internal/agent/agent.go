@@ -24,10 +24,15 @@ import (
 
 	"proxback/internal/agentmgr"
 	"proxback/internal/engine"
+	"proxback/internal/version"
 )
 
-// Version is the agent build version reported at registration.
-const Version = "1.0.0"
+// Version is the agent build version, reported at registration and by
+// --version. It is the one version of the whole distribution rather than a
+// number maintained by hand here: a hand-maintained "1.0.0" is precisely what
+// let a 0.6.0 server hand out a 0.2.x agent with nothing — not the console, not
+// the registration record, not --version — able to notice the drift.
+var Version = version.Version
 
 // DefaultHeartbeatInterval is how often the agent polls the server.
 const DefaultHeartbeatInterval = 15 * time.Second

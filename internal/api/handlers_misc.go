@@ -17,6 +17,7 @@ import (
 
 	"proxback/internal/notify"
 	"proxback/internal/store"
+	"proxback/internal/update"
 )
 
 // ---------------------------------------------------------------- dashboard
@@ -316,23 +317,29 @@ func (s *Server) handleTestWebhook(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- downloads
 
-// allowedDownloads maps the public download names to their file names in
-// <dataDir>/downloads. The map is the whole of the name validation: nothing
-// outside it can be requested, so no path can escape the downloads directory.
-var allowedDownloads = map[string]string{
-	"proxback-agent-linux-amd64":       "proxback-agent-linux-amd64",
-	"proxback-agent-windows-amd64.exe": "proxback-agent-windows-amd64.exe",
-	"proxback-helper-linux-amd64":      "proxback-helper-linux-amd64",
-}
+// allowedDownloads is the set of names /downloads serves. It is derived from the
+// one list of staged artifacts in internal/update so this endpoint, the
+// post-update refresh and GET /api/downloads/status can never disagree about
+// which files exist — and so the version sidecars beside them are not servable.
+//
+// The set is the whole of the name validation: nothing outside it can be
+// requested, so no path can escape the downloads directory.
+var allowedDownloads = func() map[string]struct{} {
+	arts := update.StagedArtifacts()
+	out := make(map[string]struct{}, len(arts))
+	for _, a := range arts {
+		out[a.Name] = struct{}{}
+	}
+	return out
+}()
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
-	file, ok := allowedDownloads[name]
-	if !ok {
+	if _, ok := allowedDownloads[name]; !ok {
 		writeError(w, http.StatusNotFound, "unknown download")
 		return
 	}
-	full := filepath.Join(s.dataDir, "downloads", file)
+	full := update.StagedPath(s.dataDir, name)
 	f, err := os.Open(full)
 	if err != nil {
 		writeError(w, http.StatusNotFound,

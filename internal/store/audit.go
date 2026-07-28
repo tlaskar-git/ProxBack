@@ -73,6 +73,13 @@ const (
 	AuditSettingsModify = "settings.modify"
 	AuditUpdateApply    = "update.apply"
 
+	// AuditDownloadsRefresh records a refresh of the agent and node helper
+	// binaries staged in <data>/downloads. It is its own action rather than a
+	// footnote on update.apply because the two can disagree: the server can
+	// upgrade successfully while a staged binary fails to refresh, and that gap
+	// is exactly what silently hands a guest the wrong build.
+	AuditDownloadsRefresh = "downloads.refresh"
+
 	// AuditAccessDenied records a request refused by the role middleware. The
 	// object names the route that was probed, because at that point the request
 	// never reached a handler and there is no object to name.

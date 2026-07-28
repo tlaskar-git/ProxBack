@@ -161,6 +161,11 @@ start automatically, restarts it on failure, and verifies it reached running sta
 reporting success. On Windows it logs to the Event Log, so a service that will not start
 can be diagnosed. Remove with `--uninstall`; `--print-install` prints the manual steps.
 
+Always take the binary from the console's own Agents page rather than an old copy: the
+server keeps the agent and helper binaries it serves in step with its own version, and
+*Agents* reports the version it is handing out. `proxback-agent --version` tells you what
+you have.
+
 The agent does not require the guest to run on Proxmox — any Windows or Linux machine that
 can reach the server works.
 

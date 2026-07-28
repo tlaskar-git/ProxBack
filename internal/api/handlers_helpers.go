@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,6 +14,7 @@ import (
 	"proxback/internal/helpermgr"
 	"proxback/internal/nodedeploy"
 	"proxback/internal/store"
+	"proxback/internal/update"
 )
 
 type helperDTO struct {
@@ -243,10 +243,12 @@ func (s *Server) handleDeployHelper(w http.ResponseWriter, r *http.Request) {
 		helperPort = store.DefaultHelperPort
 	}
 
-	binary := filepath.Join(s.dataDir, "downloads", helperBinaryName)
+	binary := update.StagedPath(s.dataDir, helperBinaryName)
 	if st, err := os.Stat(binary); err != nil || st.IsDir() {
 		writeError(w, http.StatusBadRequest,
-			"the node helper binary is not staged on this server; build it and place it in <data>/downloads/"+helperBinaryName)
+			"the node helper binary is not staged on this server; build it and place it in <data>/"+
+				update.StagedDirName+"/"+helperBinaryName+
+				" (GET /api/downloads/status reports what is staged)")
 		return
 	}
 

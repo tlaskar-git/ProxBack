@@ -65,6 +65,10 @@ func newTestServer(t *testing.T) *testServer {
 		Sched:   sched.New(st, agents, log),
 		DataDir: dataDir,
 		Logger:  log,
+		// No unit test may reach out to the release repository: the startup
+		// reconciliation of the staged binaries is exercised deliberately, in
+		// internal/update and in TestDownloadsStatus, against a fake release.
+		DisableStagedBinaryRefresh: true,
 	})
 	if err != nil {
 		t.Fatalf("build api server: %v", err)

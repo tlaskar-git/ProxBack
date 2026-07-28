@@ -46,6 +46,13 @@ type Config struct {
 	// process can shut down gracefully (systemd Restart=always brings the new
 	// binary up). Nil disables the automatic restart.
 	OnRestartRequested func()
+	// DisableStagedBinaryRefresh switches off the startup reconciliation of the
+	// staged agent and node helper binaries against this server's version.
+	//
+	// The zero value keeps it on, because a real installation must heal itself
+	// without anyone asking: the servers this fixes are already drifted. Tests
+	// set it so a unit test never reaches out to the release repository.
+	DisableStagedBinaryRefresh bool
 }
 
 // Server is the ProxBack HTTP handler.
@@ -96,6 +103,13 @@ func New(cfg Config) (*Server, error) {
 		deployHelper: nodedeploy.Deploy,
 	}
 	s.router = s.routes()
+	// A server that self-updated before this existed is still serving the agent
+	// its installer staged. Healing that is a background, best-effort pass: it
+	// must never delay or fail startup, least of all on an installation with no
+	// route to the release repository.
+	if !cfg.DisableStagedBinaryRefresh && cfg.DataDir != "" {
+		go s.reconcileStagedBinaries()
+	}
 	return s, nil
 }
 
@@ -227,6 +241,10 @@ func (s *Server) apiRoutes() chi.Router {
 			r.Get("/audit", s.handleListAudit)
 
 			r.Post("/update/apply", s.handleUpdateApply)
+			// The staged binaries an operator is about to hand to a guest or a
+			// node. Admin because deploying them is admin, and because it names
+			// the versions of everything this server serves.
+			r.Get("/downloads/status", s.handleDownloadsStatus)
 
 			r.Post("/hosts", s.handleCreateHost)
 			r.Post("/hosts/{id}/test", s.handleTestHost)

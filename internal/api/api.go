@@ -229,6 +229,11 @@ func (s *Server) apiRoutes() chi.Router {
 
 			r.Post("/backups/{id}/verify", s.handleVerifyBackup)
 			r.Delete("/backups/{id}", s.handleDeleteBackup)
+			// Reading what is inside a restore point discloses exactly what a
+			// restore does, so it sits at the same level rather than with the
+			// read-only listings above.
+			r.Get("/backups/{id}/files", s.handleBrowseBackup)
+			r.Get("/backups/{id}/files/download", s.handleDownloadBackupFile)
 			r.Post("/restores", s.handleCreateRestore)
 		})
 

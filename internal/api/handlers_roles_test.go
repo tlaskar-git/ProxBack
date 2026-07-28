@@ -120,6 +120,11 @@ func TestRoleCapabilityMatrix(t *testing.T) {
 		{method: http.MethodPost, path: "/api/runs/no-such-run/retry", needs: store.RoleOperator},
 		{method: http.MethodPost, path: "/api/backups/no-such-backup/verify", needs: store.RoleOperator},
 		{method: http.MethodDelete, path: "/api/backups/no-such-backup", needs: store.RoleOperator},
+		// Listing the files in a restore point names every path on a protected
+		// machine, and downloading one hands back its contents. That is the same
+		// disclosure a restore is, so a viewer must not reach either.
+		{method: http.MethodGet, path: "/api/backups/no-such-backup/files", needs: store.RoleOperator},
+		{method: http.MethodGet, path: "/api/backups/no-such-backup/files/download?path=x", needs: store.RoleOperator},
 		{method: http.MethodPost, path: "/api/restores", needs: store.RoleOperator},
 
 		// Admin: users, the trail, credentials, infrastructure, settings, updates.

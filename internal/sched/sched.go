@@ -64,6 +64,10 @@ type Manager struct {
 
 	gate *gate
 
+	// browseIdx caches the file indexes built for browsing restore points. It
+	// holds nothing that cannot be rebuilt from the target.
+	browseIdx browseCache
+
 	mu           sync.Mutex
 	cancels      map[string]context.CancelFunc
 	entries      map[string]cron.EntryID

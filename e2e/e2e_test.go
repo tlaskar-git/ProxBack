@@ -15,8 +15,11 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1639,6 +1642,85 @@ func TestEndToEnd(t *testing.T) {
 		if backups[0].Kind != "incremental" || backups[0].ParentID != backups[1].ID {
 			t.Fatalf("agent incremental chain = %q parent %q, want parent %s",
 				backups[0].Kind, backups[0].ParentID, backups[1].ID)
+		}
+	})
+
+	/*
+		Recovering one file out of a restore point, without restoring anything.
+
+		This is the whole chain against a real backup on a real target: the stored
+		chunks are indexed into a file listing, one file is located by name, and its
+		bytes come back byte-for-byte — while the 12 MiB file sitting next to it in
+		the same archive is never read.
+	*/
+	t.Run("11b-browse-and-recover-a-single-file", func(t *testing.T) {
+		var backups []apiBackup
+		h.ok(http.MethodGet, "/api/backups?sourceKind=agent&sourceId="+agentInfo.ID, nil, &backups)
+		if len(backups) == 0 {
+			t.Fatal("no agent restore point to browse")
+		}
+		point := backups[0].ID
+
+		// The archive root is an absolute temp path, so the file is found by name
+		// rather than by a path this test would have to reconstruct.
+		var found struct {
+			Entries []struct {
+				Name string `json:"name"`
+				Path string `json:"path"`
+				Size int64  `json:"size"`
+				Dir  bool   `json:"dir"`
+			} `json:"entries"`
+		}
+		h.ok(http.MethodGet, "/api/backups/"+point+"/files?search=notes.txt", nil, &found)
+		if len(found.Entries) != 1 {
+			t.Fatalf("search for notes.txt returned %d entries, want 1: %+v", len(found.Entries), found.Entries)
+		}
+		hit := found.Entries[0]
+		if hit.Dir || hit.Name != "notes.txt" {
+			t.Fatalf("search hit = %+v", hit)
+		}
+		const want = "ProxBack agent backup test tree\n"
+		if hit.Size != int64(len(want)) {
+			t.Fatalf("notes.txt listed as %d bytes, want %d", hit.Size, len(want))
+		}
+
+		// Walking to its folder must show it too, so browsing and search agree.
+		parent := path.Dir(hit.Path)
+		var listing struct {
+			Path    string `json:"path"`
+			Entries []struct {
+				Name string `json:"name"`
+				Dir  bool   `json:"dir"`
+			} `json:"entries"`
+		}
+		h.ok(http.MethodGet, "/api/backups/"+point+"/files?path="+url.QueryEscape(parent), nil, &listing)
+		var names []string
+		for _, e := range listing.Entries {
+			names = append(names, e.Name)
+		}
+		if !slices.Contains(names, "notes.txt") {
+			t.Fatalf("listing of %s = %v, want it to contain notes.txt", parent, names)
+		}
+
+		// And the bytes themselves.
+		code, body := h.do(http.MethodGet,
+			"/api/backups/"+point+"/files/download?path="+url.QueryEscape(hit.Path), nil)
+		if code != http.StatusOK {
+			t.Fatalf("download = %d: %s", code, body)
+		}
+		if string(body) != want {
+			t.Fatalf("recovered %q, want %q", body, want)
+		}
+
+		// A folder is not a file, and a path that is not in the point is a 404
+		// rather than an empty download that looks like an empty file.
+		if code, _ := h.do(http.MethodGet,
+			"/api/backups/"+point+"/files/download?path="+url.QueryEscape(parent), nil); code == http.StatusOK {
+			t.Fatal("downloading a folder succeeded")
+		}
+		if code, _ := h.do(http.MethodGet,
+			"/api/backups/"+point+"/files/download?path=no/such/file", nil); code != http.StatusNotFound {
+			t.Fatalf("downloading a missing file = %d, want 404", code)
 		}
 	})
 

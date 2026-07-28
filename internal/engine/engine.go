@@ -360,6 +360,32 @@ func (e *Engine) putChunk(ctx context.Context, sha string, data []byte) (int64, 
 
 // HasChunk reports whether a chunk is present on the target, consulting the
 // index first and falling back to a HEAD request.
+// ReadChunk fetches one chunk and returns its plaintext bytes, verified.
+//
+// Every read of stored data goes through here — sequential restore, verify and
+// the random access that file browsing needs — so the content-address check and
+// the declared-size check are applied uniformly and cannot be skipped by a
+// caller that only wants a few bytes out of the middle of a backup.
+func (e *Engine) ReadChunk(ctx context.Context, ch Chunk) ([]byte, error) {
+	stored, err := e.bs.GetBytes(ctx, ChunkKey(ch.Sha256))
+	if err != nil {
+		return nil, err
+	}
+	// Chunks may be stored compressed or raw, in any mix within one manifest
+	// (the setting can change between runs). decodeChunk sniffs which; the
+	// SHA-256 check below is the arbiter either way.
+	data := decodeChunk(stored)
+	sum := sha256.Sum256(data)
+	if got := hex.EncodeToString(sum[:]); got != ch.Sha256 {
+		return nil, fmt.Errorf("%w: expected %s got %s", ErrHashMismatch, ch.Sha256, got)
+	}
+	if ch.Size != 0 && int64(len(data)) != ch.Size {
+		return nil, fmt.Errorf("engine: chunk %s size %d, manifest says %d",
+			ch.Sha256, len(data), ch.Size)
+	}
+	return data, nil
+}
+
 func (e *Engine) HasChunk(ctx context.Context, sha string) (bool, error) {
 	has, err := e.idx.HasChunk(ctx, e.targetID, sha)
 	if err != nil {
@@ -434,21 +460,9 @@ func (s *Session) RestoreDisk(ctx context.Context, dm DiskManifest, w io.Writer)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		stored, err := s.e.bs.GetBytes(ctx, ChunkKey(ch.Sha256))
+		data, err := s.e.ReadChunk(ctx, ch)
 		if err != nil {
 			return fmt.Errorf("engine: restore %s: %w", dm.Name, err)
-		}
-		// Chunks may be stored compressed or raw, in any mix within one manifest
-		// (the setting can change between runs). decodeChunk sniffs which; the
-		// SHA-256 check below is the arbiter either way.
-		data := decodeChunk(stored)
-		sum := sha256.Sum256(data)
-		if got := hex.EncodeToString(sum[:]); got != ch.Sha256 {
-			return fmt.Errorf("%w: %s expected %s got %s", ErrHashMismatch, dm.Name, ch.Sha256, got)
-		}
-		if int64(len(data)) != ch.Size {
-			return fmt.Errorf("engine: restore %s: chunk %s size %d, manifest says %d",
-				dm.Name, ch.Sha256, len(data), ch.Size)
 		}
 		if _, err := w.Write(data); err != nil {
 			return fmt.Errorf("engine: restore %s: write: %w", dm.Name, err)

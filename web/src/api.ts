@@ -1945,6 +1945,57 @@ export function deleteBackup(id: ID): Promise<void> {
   return request<void>(`/api/backups/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
 }
 
+/* ---------------------------------------------------------------------------
+ * Browsing inside a restore point
+ * ------------------------------------------------------------------------- */
+
+/** One file or folder inside a restore point. */
+export interface BackupEntry {
+  name: string
+  /** Slash-separated and relative to the root of the backup. */
+  path: string
+  size: number
+  dir: boolean
+  mtime?: string
+  /** Target of a symlink, when the entry is one. Shown, never followed. */
+  link?: string
+}
+
+export interface BackupListing {
+  path: string
+  entries: BackupEntry[]
+  /** The restore point held more entries than could be indexed. */
+  truncated: boolean
+}
+
+/**
+ * Lists one folder inside a restore point, or searches the whole point by name
+ * when `search` is given.
+ *
+ * The first call against a restore point builds its index, which reads the
+ * archive's headers from the target — quick for a local target, and paid once
+ * per point per half hour.
+ */
+export function browseBackup(
+  id: ID,
+  opts: { path?: string; search?: string; limit?: number } = {},
+): Promise<BackupListing> {
+  return request<BackupListing>(`/api/backups/${encodeURIComponent(String(id))}/files`, {
+    query: { path: opts.path, search: opts.search, limit: opts.limit },
+  })
+}
+
+/**
+ * The URL that downloads one file out of a restore point.
+ *
+ * Returned as a URL rather than fetched, so the browser streams it straight to
+ * disk — a recovered file never has to fit in a JS string.
+ */
+export function backupFileURL(id: ID, path: string): string {
+  const base = `/api/backups/${encodeURIComponent(String(id))}/files/download`
+  return `${base}?path=${encodeURIComponent(path)}`
+}
+
 /**
  * Starts a restore. `mode` is always explicit — the server refuses an
  * `overwrite` whose `confirmName` does not match the destination VM's current

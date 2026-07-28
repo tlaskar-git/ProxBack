@@ -817,6 +817,9 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 	if err := m.st.DeleteBackup(ctx, b.ID); err != nil {
 		return err
 	}
+	// The chunks this point referenced are about to be collectable, so a cached
+	// listing of it would offer files that can no longer be read.
+	m.dropBrowseIndex(b.ID)
 	m.mu.Lock()
 	idle := m.targetActive[target.ID] == 0
 	m.mu.Unlock()

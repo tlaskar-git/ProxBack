@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   ChevronRight,
   Database,
+  FolderOpen,
   History,
   Laptop,
   RefreshCw,
@@ -25,6 +26,7 @@ import {
 import type { Agent, Backup, CachedVM, Host, ID, SourceKind, Target } from '../api'
 import { useConfirm } from '../components/Confirm'
 import { WorkloadIdentity, identityText } from '../components/Identity'
+import { FileBrowser } from '../components/FileBrowser'
 import { RestoreWizard } from '../components/RestoreWizard'
 import { TargetKindChip } from '../components/TargetIdentity'
 import { useToast } from '../components/Toast'
@@ -170,6 +172,7 @@ function BackupRow({
   target,
   depth,
   onRestore,
+  onBrowse,
   onDeleted,
 }: {
   backup: Backup
@@ -177,6 +180,7 @@ function BackupRow({
   target?: Target
   depth: number
   onRestore: () => void
+  onBrowse: () => void
   onDeleted: () => void
 }) {
   const toast = useToast()
@@ -187,6 +191,8 @@ function BackupRow({
   const [verifying, setVerifying] = useState(false)
 
   const denied = can.operateJobs ? undefined : roleDeniedReason(role, 'restore, verify or prune')
+  // Only an agent file backup is an archive of files; a VM point is disk images.
+  const browsable = backup.sourceKind === 'agent'
 
   const onVerify = async () => {
     setVerifying(true)
@@ -281,6 +287,23 @@ function BackupRow({
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
+        {/* A VM point holds raw disk images rather than an archive of files, so
+            there is nothing to list yet. The button says why instead of opening
+            a dialog that can only apologise. */}
+        <Button
+          size="sm"
+          icon={<FolderOpen className="size-3.5" aria-hidden />}
+          onClick={onBrowse}
+          disabled={!browsable || !can.operateJobs}
+          title={
+            browsable
+              ? (denied ?? 'Browse the files in this restore point and recover one')
+              : 'This is a whole-VM image. Install the agent in the guest for file-level backups you can browse.'
+          }
+          aria-label={`Browse the files in the restore point from ${formatDateTime(backup.createdAt)}`}
+        >
+          Browse
+        </Button>
         <Button
           size="sm"
           variant="primary"
@@ -347,6 +370,7 @@ export function RestorePointsPage() {
    */
   const [openKeys, setOpenKeys] = useState<ReadonlySet<string> | null>(null)
   const [restoring, setRestoring] = useState<Backup | null>(null)
+  const [browsing, setBrowsing] = useState<Backup | null>(null)
 
   const groups = useMemo(() => groupSources(data?.backups ?? []), [data?.backups])
 
@@ -528,6 +552,7 @@ export function RestorePointsPage() {
                             target={targetOf(backup)}
                             depth={depths.get(String(backup.id)) ?? 0}
                             onRestore={() => setRestoring(backup)}
+                            onBrowse={() => setBrowsing(backup)}
                             onDeleted={() => void refresh()}
                           />
                         ))}
@@ -540,6 +565,8 @@ export function RestorePointsPage() {
           </ul>
         </Card>
       )}
+
+      <FileBrowser backup={browsing} onClose={() => setBrowsing(null)} />
 
       <RestoreWizard
         backup={restoring}

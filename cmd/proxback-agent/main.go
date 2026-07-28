@@ -169,7 +169,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := runAgent(ctx, log); err != nil && !errors.Is(err, context.Canceled) {
+	err = runAgent(ctx, log)
+	switch {
+	case errors.Is(err, agent.ErrRestartRequired):
+		// The binary on disk is now a different build from the one running. The
+		// service manager is what restarts it — systemd because the unit
+		// carries Restart=always, the Windows SCM because a non-zero exit
+		// triggers the recovery action --install registers — so exiting with a
+		// failure code is the restart.
+		log.Info("update installed; exiting so the service manager starts the new version")
+		return exitError
+	case err != nil && !errors.Is(err, context.Canceled):
 		log.Error("agent exited with error", "error", err)
 		return exitError
 	}

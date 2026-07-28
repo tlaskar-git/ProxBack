@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -149,10 +150,25 @@ func (s *Store) HelperByKeyHash(ctx context.Context, hash string) (*NodeHelper, 
 		`SELECT `+helperCols+` FROM helpers WHERE api_key_hash = ?`, hash))
 }
 
-// TouchHelper records a heartbeat.
+// TouchHelper records a heartbeat without changing the recorded version.
 func (s *Store) TouchHelper(ctx context.Context, id string, at time.Time) error {
-	if _, err := s.db.ExecContext(ctx, `UPDATE helpers SET last_seen = ? WHERE id = ?`, fmtTime(at), id); err != nil {
-		return fmt.Errorf("touch helper: %w", err)
+	return s.RecordHelperHeartbeat(ctx, id, at, "")
+}
+
+// RecordHelperHeartbeat records a heartbeat and refreshes the helper's reported
+// version. As for agents, the version travels on every beat so a helper that
+// updates itself is visible within one beat instead of at its next enrollment —
+// which, for a node helper installed once and left alone, may be never. An
+// empty version leaves the stored one alone.
+func (s *Store) RecordHelperHeartbeat(ctx context.Context, id string, at time.Time, version string) error {
+	q := `UPDATE helpers SET last_seen = ? WHERE id = ?`
+	args := []any{fmtTime(at), id}
+	if v := strings.TrimSpace(version); v != "" {
+		q = `UPDATE helpers SET last_seen = ?, version = ? WHERE id = ?`
+		args = []any{fmtTime(at), v, id}
+	}
+	if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("record helper heartbeat: %w", err)
 	}
 	return nil
 }

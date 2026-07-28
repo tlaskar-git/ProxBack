@@ -27,6 +27,10 @@ var (
 	ErrUnauthorized = errors.New("agentmgr: unauthorized")
 	ErrUnknownRun   = errors.New("agentmgr: unknown or finished run")
 	ErrBadToken     = errors.New("agentmgr: invalid or expired enrollment token")
+	// ErrAgentBusy refuses a self-update to an agent that has work in flight.
+	// Applying an update restarts the agent, and a restart in the middle of a
+	// backup throws away everything the guest has uploaded so far.
+	ErrAgentBusy = errors.New("agentmgr: the agent has a run in flight")
 )
 
 // Dispatch is a work item handed to an agent on heartbeat.
@@ -54,12 +58,29 @@ type Dispatch struct {
 	PostScript string `json:"postScript,omitempty"`
 	// ScriptTimeoutSeconds bounds each of them.
 	ScriptTimeoutSeconds int `json:"scriptTimeoutSeconds,omitempty"`
+
+	// The self-update fields, set only when Type is DispatchUpdate.
+	//
+	// Asset is a file name under the server's own /downloads endpoint, never a
+	// URL: an agent fetches its new binary from the server it is enrolled with
+	// and from nowhere else, whatever a dispatch claims. Sha256 and SizeBytes
+	// are what the server measured on the file it is about to hand out, so the
+	// guest can refuse anything that arrives truncated or rewritten in transit.
+	Version   string `json:"version,omitempty"`
+	Asset     string `json:"asset,omitempty"`
+	Sha256    string `json:"sha256,omitempty"`
+	SizeBytes int64  `json:"sizeBytes,omitempty"`
 }
 
 // Dispatch types.
 const (
 	DispatchBackup  = "backup"
 	DispatchRestore = "restore"
+	// DispatchUpdate tells an agent to replace its own binary with the build
+	// this server hands out and restart. It carries no run: nothing in the
+	// job_runs table describes it, and its outcome is reported by the version
+	// on the agent's next heartbeat rather than by a completion call.
+	DispatchUpdate = "update"
 )
 
 // Result is what the agent-driven run produced.
@@ -197,9 +218,24 @@ func Status(a *store.Agent) string {
 
 // ---------------------------------------------------------------- heartbeat
 
-// Heartbeat records liveness and returns any queued dispatches for the agent.
-func (m *Manager) Heartbeat(ctx context.Context, agentID string) ([]Dispatch, error) {
-	if err := m.st.TouchAgent(ctx, agentID, store.Now()); err != nil {
+// HeartbeatRequest is the body of POST /api/agents/heartbeat.
+//
+// Every field is optional. An agent built before the server asked for them
+// sends an empty object and keeps whatever it registered with — reporting the
+// running version must never be the reason a heartbeat stops working.
+type HeartbeatRequest struct {
+	// Version is the build the agent is running right now, which is not
+	// necessarily the one it registered with: an agent that self-updates says so
+	// here, and that is how the console learns the update took.
+	Version string `json:"version,omitempty"`
+	OS      string `json:"os,omitempty"`
+	Arch    string `json:"arch,omitempty"`
+}
+
+// Heartbeat records liveness, refreshes what the agent reports it is running,
+// and returns any queued dispatches for it.
+func (m *Manager) Heartbeat(ctx context.Context, agentID string, req HeartbeatRequest) ([]Dispatch, error) {
+	if err := m.st.RecordAgentHeartbeat(ctx, agentID, store.Now(), req.Version, req.OS, req.Arch); err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
@@ -210,6 +246,57 @@ func (m *Manager) Heartbeat(ctx context.Context, agentID string) ([]Dispatch, er
 	}
 	delete(m.pending, agentID)
 	return q, nil
+}
+
+// ---------------------------------------------------------------- self-update
+
+// Busy reports whether the agent has work in flight. It is the check that stops
+// an operator restarting an agent in the middle of a backup.
+//
+// A run counts from the moment it is dispatched, not from the moment the agent
+// collects it: enqueue registers the run and queues the dispatch together, so
+// the live runs are exactly the entries in active. The pending queue is not
+// consulted, because a dispatch left there after its run was abandoned or
+// failed describes work that no longer exists — treating that as busy would
+// leave an agent permanently unupdatable after one cancelled run.
+func (m *Manager) Busy(agentID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.busyLocked(agentID)
+}
+
+func (m *Manager) busyLocked(agentID string) bool {
+	for _, rs := range m.active {
+		if rs.agentID == agentID && !rs.closed {
+			return true
+		}
+	}
+	return false
+}
+
+// QueueUpdate hands an agent a self-update to pick up on its next poll, or
+// answers ErrAgentBusy when it has work in flight.
+//
+// A pending update replaces any earlier one rather than queueing beside it: two
+// dispatches would have the agent download and swap the same binary twice, and
+// the second swap would run against a binary that is already the new one.
+func (m *Manager) QueueUpdate(agentID string, d Dispatch) error {
+	d.Type = DispatchUpdate
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.busyLocked(agentID) {
+		return ErrAgentBusy
+	}
+	q := m.pending[agentID]
+	kept := make([]Dispatch, 0, len(q)+1)
+	for _, existing := range q {
+		if existing.Type != DispatchUpdate {
+			kept = append(kept, existing)
+		}
+	}
+	m.pending[agentID] = append(kept, d)
+	m.log.Info("agent self-update queued", "agentId", agentID, "version", d.Version, "asset", d.Asset)
+	return nil
 }
 
 func (m *Manager) enqueue(agentID string, d Dispatch, rs *runState) {

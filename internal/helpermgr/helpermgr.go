@@ -8,10 +8,16 @@
 package helpermgr
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +43,7 @@ var (
 type Manager struct {
 	st  *store.Store
 	log *slog.Logger
+	hc  *http.Client
 }
 
 // New builds a manager.
@@ -44,7 +51,15 @@ func New(st *store.Store, log *slog.Logger) *Manager {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Manager{st: st, log: log}
+	return &Manager{
+		st:  st,
+		log: log,
+		// Asking a helper to update itself is a short call — it answers as soon
+		// as it has decided whether it can — but the helper downloads and
+		// verifies its new binary before answering, so the timeout allows for a
+		// slow link rather than for a slow decision.
+		hc: &http.Client{Timeout: updateRequestTimeout},
+	}
 }
 
 // CreateEnrollToken issues a single-use helper enrollment token valid for 24
@@ -168,9 +183,114 @@ func (m *Manager) Authenticate(ctx context.Context, key string) (*store.NodeHelp
 	return h, nil
 }
 
-// Heartbeat records liveness.
-func (m *Manager) Heartbeat(ctx context.Context, helperID string) error {
-	return m.st.TouchHelper(ctx, helperID, store.Now())
+// HeartbeatRequest is the body of POST /api/helpers/heartbeat. Version is
+// optional: a helper old enough not to send it keeps the version it registered
+// with, and its heartbeat still counts.
+type HeartbeatRequest struct {
+	Version string `json:"version,omitempty"`
+}
+
+// Heartbeat records liveness and refreshes the helper's reported version.
+func (m *Manager) Heartbeat(ctx context.Context, helperID string, req HeartbeatRequest) error {
+	return m.st.RecordHelperHeartbeat(ctx, helperID, store.Now(), req.Version)
+}
+
+// ---------------------------------------------------------------- self-update
+
+// updateRequestTimeout bounds the call that tells a helper to update itself.
+// The helper downloads and verifies the new binary before it answers, so this
+// covers a transfer over the management network, not a decision.
+const updateRequestTimeout = 10 * time.Minute
+
+// UpdateRequest is the body of POST /update on a node helper.
+//
+// It names an asset, not a URL: the helper fetches its new binary from the
+// server it is enrolled with, using its own stored server address, so nothing
+// the server sends can point a node at somewhere else. Sha256 and SizeBytes are
+// what the server measured on the file it is about to serve.
+type UpdateRequest struct {
+	Version   string `json:"version"`
+	Asset     string `json:"asset"`
+	Sha256    string `json:"sha256"`
+	SizeBytes int64  `json:"sizeBytes"`
+}
+
+// UpdateResponse is what a helper answers when it has applied an update.
+type UpdateResponse struct {
+	OK      bool   `json:"ok"`
+	Version string `json:"version"`
+	// Restarting reports whether the helper is on its way down to come back on
+	// the new binary. The server never treats this as proof: only a heartbeat
+	// carrying the new version is.
+	Restarting bool `json:"restarting"`
+}
+
+// ErrHelperBusy is returned when a helper refuses to update because it has an
+// export, import or policy script running. Restarting it would abort the run.
+var ErrHelperBusy = errors.New("helpermgr: the node helper has work in flight")
+
+// ErrHelperUnreachable marks a failure that never reached the helper at all.
+var ErrHelperUnreachable = errors.New("helpermgr: the node helper could not be reached")
+
+// RequestUpdate tells one helper to replace its own binary and restart.
+//
+// Helpers are contacted directly by the server over their authenticated HTTP
+// API — the same channel that already carries export and import — rather than
+// polling for work like an agent does, so this is a synchronous call: it
+// returns once the helper has downloaded, verified and installed the binary, or
+// once it has refused. A successful return still is not a successful update.
+// That is only established when the helper heartbeats at the new version.
+func (m *Manager) RequestUpdate(ctx context.Context, h *store.NodeHelper, req UpdateRequest) (UpdateResponse, error) {
+	var out UpdateResponse
+	if h == nil {
+		return out, errors.New("helpermgr: no helper")
+	}
+	port := h.Port
+	if port <= 0 {
+		port = store.DefaultHelperPort
+	}
+	target := "http://" + net.JoinHostPort(h.Address, strconv.Itoa(port)) + "/update"
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return out, fmt.Errorf("helpermgr: encode update request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(raw))
+	if err != nil {
+		return out, fmt.Errorf("helpermgr: build update request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+h.AccessSecret)
+	resp, err := m.hc.Do(httpReq)
+	if err != nil {
+		return out, fmt.Errorf("%w at %s: %w", ErrHelperUnreachable, target, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode == http.StatusConflict {
+		return out, fmt.Errorf("%w: %s", ErrHelperBusy, helperMessage(body))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return out, fmt.Errorf("helpermgr: node helper %s answered http %d: %s",
+			target, resp.StatusCode, helperMessage(body))
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return out, fmt.Errorf("helpermgr: decode update response: %w", err)
+	}
+	m.log.Info("node helper self-update applied", "helperId", h.ID, "node", h.Node,
+		"version", out.Version, "restarting", out.Restarting)
+	return out, nil
+}
+
+// helperMessage pulls the message out of a helper's {"error": "..."} answer,
+// falling back to the raw body so nothing is swallowed.
+func helperMessage(body []byte) string {
+	var env struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err == nil && env.Error != "" {
+		return env.Error
+	}
+	return strings.TrimSpace(string(body))
 }
 
 // Online reports whether a helper counts as online.

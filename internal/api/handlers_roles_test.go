@@ -139,6 +139,12 @@ func TestRoleCapabilityMatrix(t *testing.T) {
 		{method: http.MethodPost, path: "/api/helpers/deploy", needs: store.RoleAdmin},
 		{method: http.MethodPost, path: "/api/helpers/no-such-helper/assign", needs: store.RoleAdmin},
 		{method: http.MethodDelete, path: "/api/helpers/no-such-helper", needs: store.RoleAdmin},
+		// Telling a deployed component to replace its own binary is admin for
+		// the same reason deploying one is.
+		{method: http.MethodPost, path: "/api/agents/no-such-agent/update", needs: store.RoleAdmin},
+		{method: http.MethodPost, path: "/api/agents/update-all", needs: store.RoleAdmin},
+		{method: http.MethodPost, path: "/api/helpers/no-such-helper/update", needs: store.RoleAdmin},
+		{method: http.MethodPost, path: "/api/helpers/update-all", needs: store.RoleAdmin},
 		{method: http.MethodPut, path: "/api/settings", needs: store.RoleAdmin},
 		{method: http.MethodPost, path: "/api/settings/test-webhook", needs: store.RoleAdmin},
 		// Applying an update contacts the release repository, so only the refusal

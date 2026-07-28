@@ -129,7 +129,7 @@ func (ts *testServer) deployBody() map[string]any {
 func deployBody() map[string]any {
 	return map[string]any{
 		"node":               "pve1",
-		"address":            "10.20.1.5",
+		"address":            "192.0.2.10",
 		"username":           "root",
 		"password":           "root-password",
 		"serverUrl":          "https://proxback.local:8443",
@@ -145,7 +145,7 @@ func TestDeployHelperEndpointHappyPath(t *testing.T) {
 	ts.deployHelper = func(_ context.Context, p nodedeploy.Params) (nodedeploy.Result, error) {
 		got = p
 		return nodedeploy.Result{Log: []string{
-			"connected to 10.20.1.5:22 (SHA256:abc123)",
+			"connected to 192.0.2.10:22 (SHA256:abc123)",
 			"uploaded proxback-helper (15.1 MiB)",
 			"installer: enrolled as helper h-1 for node pve1 (port 8007)",
 		}}, nil
@@ -174,7 +174,7 @@ func TestDeployHelperEndpointHappyPath(t *testing.T) {
 	if got.Port != 22 || got.HelperPort != store.DefaultHelperPort {
 		t.Errorf("ports = %d/%d, want 22/%d", got.Port, got.HelperPort, store.DefaultHelperPort)
 	}
-	if got.Address != "10.20.1.5" || got.Username != "root" || got.Password != "root-password" {
+	if got.Address != "192.0.2.10" || got.Username != "root" || got.Password != "root-password" {
 		t.Errorf("connection params = %+v", nodedeploy.Params{
 			Address: got.Address, Username: got.Username, Password: "…",
 		})
@@ -203,11 +203,11 @@ func TestDeployHelperEndpointReportsHelperOnline(t *testing.T) {
 	ts := newTestServer(t)
 	ts.stageHelperBinary(t)
 	ts.deployHelper = func(context.Context, nodedeploy.Params) (nodedeploy.Result, error) {
-		return nodedeploy.Result{Log: []string{"connected to 10.20.1.5:22 (SHA256:abc123)"}}, nil
+		return nodedeploy.Result{Log: []string{"connected to 192.0.2.10:22 (SHA256:abc123)"}}, nil
 	}
 	now := store.Now()
 	if _, err := ts.st.CreateHelper(context.Background(), &store.NodeHelper{
-		HostID: ts.hostID, Node: "pve1", Address: "10.20.1.5", Port: store.DefaultHelperPort,
+		HostID: ts.hostID, Node: "pve1", Address: "192.0.2.10", Port: store.DefaultHelperPort,
 		Version: "0.3.1", AccessSecret: "secret", APIKeyHash: "hash", LastSeen: &now,
 	}); err != nil {
 		t.Fatalf("create helper: %v", err)
@@ -247,8 +247,8 @@ func TestDeployHelperEndpointDeploymentFailure(t *testing.T) {
 	ts := newTestServer(t)
 	ts.stageHelperBinary(t)
 	ts.deployHelper = func(context.Context, nodedeploy.Params) (nodedeploy.Result, error) {
-		return nodedeploy.Result{Log: []string{"connected to 10.20.1.5:22 (SHA256:abc123)"}},
-			&testError{"nodedeploy: ssh to root@10.20.1.5:22: ssh: unable to authenticate"}
+		return nodedeploy.Result{Log: []string{"connected to 192.0.2.10:22 (SHA256:abc123)"}},
+			&testError{"nodedeploy: ssh to root@192.0.2.10:22: ssh: unable to authenticate"}
 	}
 
 	code, got := ts.post(t, "/api/helpers/deploy", ts.deployBody())

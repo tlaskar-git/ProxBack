@@ -166,6 +166,15 @@ server keeps the agent and helper binaries it serves in step with its own versio
 *Agents* reports the version it is handing out. `proxback-agent --version` tells you what
 you have.
 
+### Keeping agents and helpers current
+
+Updating the server does not update the components it talks to, so *Agents* and *Node
+helpers* show each one's running version and flag those behind the server. Updating one is
+a button: the component fetches the matching binary from the server it is already enrolled
+with, verifies it, replaces itself, and restarts. An update is refused while that component
+has work in flight, and is only reported as applied once the component's next heartbeat
+confirms the new version.
+
 The agent does not require the guest to run on Proxmox — any Windows or Linux machine that
 can reach the server works.
 

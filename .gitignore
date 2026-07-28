@@ -11,3 +11,15 @@ web/dist/
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Stray build output: `go build ./cmd/...` from the repo root drops binaries here.
+/proxback-server
+/proxback-server.exe
+/proxback-agent
+/proxback-agent.exe
+/proxback-helper
+/proxback-helper.exe
+/pve-sim
+/pve-sim.exe
+/s3-sim
+/s3-sim.exe

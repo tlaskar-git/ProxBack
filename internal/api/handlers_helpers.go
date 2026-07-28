@@ -15,6 +15,7 @@ import (
 	"proxback/internal/nodedeploy"
 	"proxback/internal/store"
 	"proxback/internal/update"
+	"proxback/internal/version"
 )
 
 type helperDTO struct {
@@ -31,13 +32,21 @@ type helperDTO struct {
 	Status       string     `json:"status"`
 	LastSeen     *time.Time `json:"lastSeen"`
 	RegisteredAt time.Time  `json:"registeredAt"`
+	// ServerVersion, UpToDate and UpdateAvailable answer, per row, whether this
+	// helper is the build its server hands out. Same shape as the agent list,
+	// for the same reason: both endpoints return bare arrays.
+	ServerVersion   string `json:"serverVersion"`
+	UpToDate        bool   `json:"upToDate"`
+	UpdateAvailable bool   `json:"updateAvailable"`
 }
 
 func toHelperDTO(h *store.NodeHelper, hostNames map[string]string) helperDTO {
+	upToDate, updateAvailable := versionDrift(h.Version)
 	return helperDTO{
 		ID: h.ID, HostID: h.HostID, HostName: hostNames[h.HostID],
 		Node: h.Node, Address: h.Address, Port: h.Port, Version: h.Version,
 		Status: helpermgr.Status(h), LastSeen: h.LastSeen, RegisteredAt: h.RegisteredAt,
+		ServerVersion: version.Version, UpToDate: upToDate, UpdateAvailable: updateAvailable,
 	}
 }
 
@@ -358,9 +367,12 @@ func (s *Server) handleHelperRegister(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHelperHeartbeat(w http.ResponseWriter, r *http.Request) {
 	h := helperFrom(r.Context())
-	if err := s.helpers.Heartbeat(r.Context(), h.ID); err != nil {
+	// Optional and advisory, exactly as for agents: a helper that predates
+	// version reporting sends "{}" and still counts as alive.
+	beat := decodeOptionalJSON[helpermgr.HeartbeatRequest](r)
+	if err := s.helpers.Heartbeat(r.Context(), h.ID, beat); err != nil {
 		s.serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "serverVersion": version.Version})
 }

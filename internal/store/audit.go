@@ -57,6 +57,14 @@ const (
 	AuditAgentCreate = "agent.create"
 	AuditAgentDelete = "agent.delete"
 
+	// AuditAgentUpdate and AuditHelperUpdate record an operator instructing a
+	// deployed component to replace its own binary. They are their own actions
+	// rather than a "modify" because they are the only entries that explain why
+	// a guest's agent restarted, and because a refusal — an agent with a run in
+	// flight — is worth a trail of its own.
+	AuditAgentUpdate  = "agent.update"
+	AuditHelperUpdate = "helper.update"
+
 	AuditJobCreate = "job.create"
 	AuditJobModify = "job.modify"
 	AuditJobDelete = "job.delete"

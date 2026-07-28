@@ -12,6 +12,7 @@ import (
 	"proxback/internal/agentmgr"
 	"proxback/internal/engine"
 	"proxback/internal/store"
+	"proxback/internal/version"
 )
 
 type agentDTO struct {
@@ -23,12 +24,22 @@ type agentDTO struct {
 	Status       string     `json:"status"`
 	LastSeen     *time.Time `json:"lastSeen"`
 	RegisteredAt time.Time  `json:"registeredAt"`
+	// ServerVersion, UpToDate and UpdateAvailable are the drift the console
+	// exists to show. They ride on each row rather than in a list envelope
+	// because this endpoint has always returned a bare array, and a row that
+	// answers "is this one behind?" by itself is also the row a detail page can
+	// render without fetching the list.
+	ServerVersion   string `json:"serverVersion"`
+	UpToDate        bool   `json:"upToDate"`
+	UpdateAvailable bool   `json:"updateAvailable"`
 }
 
 func toAgentDTO(a *store.Agent) agentDTO {
+	upToDate, updateAvailable := versionDrift(a.Version)
 	return agentDTO{
 		ID: a.ID, Hostname: a.Hostname, OS: a.OS, Arch: a.Arch, Version: a.Version,
 		Status: agentmgr.Status(a), LastSeen: a.LastSeen, RegisteredAt: a.RegisteredAt,
+		ServerVersion: version.Version, UpToDate: upToDate, UpdateAvailable: updateAvailable,
 	}
 }
 
@@ -98,12 +109,20 @@ func (s *Server) handleAgentRegister(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	agent := agentFrom(r.Context())
-	jobs, err := s.agents.Heartbeat(r.Context(), agent.ID)
+	// The body is optional and its contents advisory: an agent that predates
+	// version reporting sends "{}", and a malformed one must still count as a
+	// heartbeat. Liveness is never denied over an optional field.
+	beat := decodeOptionalJSON[agentmgr.HeartbeatRequest](r)
+	jobs, err := s.agents.Heartbeat(r.Context(), agent.ID, beat)
 	if err != nil {
 		s.serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+	// serverVersion travels back on every beat so an agent can see, without
+	// being told, whether it is the build its server hands out.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"jobs": jobs, "serverVersion": version.Version,
+	})
 }
 
 func (s *Server) handleAgentChunk(w http.ResponseWriter, r *http.Request) {

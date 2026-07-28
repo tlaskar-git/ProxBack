@@ -57,8 +57,29 @@ export function BrandLockup({
 }: {
   className?: string
   subtitle?: string
-  size?: 'sm' | 'md'
+  /**
+   * `lg` stacks the mark above the wordmark. At the size the sidebar wants,
+   * a horizontal lockup would run past 224px, so the large variant goes
+   * vertical rather than shrinking the mark back down.
+   */
+  size?: 'sm' | 'md' | 'lg'
 }) {
+  if (size === 'lg') {
+    return (
+      <div className={className}>
+        <div className="flex flex-col items-center gap-2.5">
+          <BrandMark className="size-[78px] text-accent-400" title="ProxBack" />
+          <span className="text-[45px] leading-none font-semibold tracking-[-0.03em] text-slate-50">
+            Prox<span className="text-slate-400">Back</span>
+          </span>
+        </div>
+        {subtitle ? (
+          <p className="mt-2 text-center text-[12px] text-slate-500">{subtitle}</p>
+        ) : null}
+      </div>
+    )
+  }
+
   const markSize = size === 'sm' ? 'size-5' : 'size-[26px]'
   const nameSize = size === 'sm' ? 'text-[13px]' : 'text-[15px]'
   return (

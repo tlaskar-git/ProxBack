@@ -266,7 +266,7 @@ func TestDeployBoundsTheOutputTail(t *testing.T) {
 func TestDeployValidatesParams(t *testing.T) {
 	binary, _ := stageBinary(t, 16)
 	base := nodedeploy.Params{
-		Address: "10.20.1.5", Username: "root", Password: "pw",
+		Address: "192.0.2.10", Username: "root", Password: "pw",
 		BinaryPath: binary, ServerURL: "https://proxback.local", EnrollToken: "tok",
 	}
 	for _, tc := range []struct {
@@ -294,7 +294,7 @@ func TestDeployValidatesParams(t *testing.T) {
 
 func TestDeployMissingBinary(t *testing.T) {
 	p := nodedeploy.Params{
-		Address: "10.20.1.5", Username: "root", Password: "pw",
+		Address: "192.0.2.10", Username: "root", Password: "pw",
 		BinaryPath: filepath.Join(t.TempDir(), "absent"),
 		ServerURL:  "https://proxback.local", EnrollToken: "tok",
 	}

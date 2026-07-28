@@ -84,7 +84,16 @@ func main() {
 		return
 	}
 
-	if err := h.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	err = h.Run(ctx)
+	switch {
+	case errors.Is(err, helper.ErrRestartRequired):
+		// The binary on disk is now a newer build than the one running. The
+		// unit carries Restart=on-failure, so exiting with a failure code is
+		// what starts the new version — there is nothing else to do here, and
+		// nothing that could restart us from inside our own cgroup.
+		log.Info("update installed; exiting so systemd starts the new version")
+		os.Exit(1)
+	case err != nil && !errors.Is(err, context.Canceled):
 		log.Error("helper exited with error", "error", err)
 		os.Exit(1)
 	}

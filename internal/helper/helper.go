@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"proxback/internal/helpermgr"
@@ -71,6 +72,10 @@ type Config struct {
 	Runner Runner
 	// Node overrides the detected node name (tests and unusual hostnames).
 	Node string
+	// BinaryPath is the file a self-update replaces. Empty — the normal case —
+	// means the running executable. It exists so a test can exercise the real
+	// download-and-swap against a scratch file instead of the test binary.
+	BinaryPath string
 }
 
 // storedConfig is the on-disk state written after enrollment.
@@ -89,6 +94,15 @@ type Helper struct {
 	log    *slog.Logger
 	hc     *http.Client
 	runner Runner
+
+	// inflight counts the node commands running right now — exports, imports
+	// and policy scripts. A self-update refuses while it is non-zero, because
+	// restarting mid-export truncates a backup the server believes is working.
+	inflight atomic.Int64
+	// restartc is closed when an installed self-update needs the process to
+	// exit; restartOnce keeps a second update from closing it twice.
+	restartc    chan struct{}
+	restartOnce sync.Once
 
 	mu   sync.Mutex
 	self storedConfig
@@ -118,7 +132,7 @@ func New(cfg Config) (*Helper, error) {
 	if runner == nil {
 		runner = ExecRunner{}
 	}
-	return &Helper{cfg: cfg, log: log, hc: hc, runner: runner}, nil
+	return &Helper{cfg: cfg, log: log, hc: hc, runner: runner, restartc: make(chan struct{})}, nil
 }
 
 // ---------------------------------------------------------------- command exec
@@ -343,9 +357,16 @@ func (h *Helper) Enroll(ctx context.Context) error {
 	return nil
 }
 
-// Heartbeat reports liveness once.
+// Heartbeat reports liveness once, along with the version this binary is.
+//
+// The version travels on every beat rather than only at enrollment because a
+// node helper enrolls once and then runs for years: without this, a helper that
+// updated itself would go on being displayed as whatever it was the day it was
+// deployed, which is precisely the blindness that let an agent sit two releases
+// behind its server unnoticed.
 func (h *Helper) Heartbeat(ctx context.Context) error {
-	return h.doJSON(ctx, http.MethodPost, "/api/helpers/heartbeat", map[string]any{}, nil, true)
+	beat := helpermgr.HeartbeatRequest{Version: version.Version}
+	return h.doJSON(ctx, http.MethodPost, "/api/helpers/heartbeat", beat, nil, true)
 }
 
 // ---------------------------------------------------------------- run loop
@@ -376,18 +397,32 @@ func (h *Helper) Run(ctx context.Context) error {
 		errc <- err
 	}()
 
+	// The heartbeat loop is bound to a context this function owns, not to the
+	// caller's, because Run now has a second way to end: an installed
+	// self-update. Waiting on a loop that only watches the caller's context
+	// would hold the shutdown open until the next tick — an hour, on a helper
+	// configured with a long interval.
+	loopCtx, stopLoop := context.WithCancel(ctx)
+	defer stopLoop()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		h.heartbeatLoop(ctx)
+		h.heartbeatLoop(loopCtx)
 	}()
 
 	var serveErr error
 	select {
 	case <-ctx.Done():
 	case serveErr = <-errc:
+	case <-h.restartc:
+		// A self-update has been installed. Shut down cleanly — the handler
+		// that applied it is still finishing its response, and Shutdown below
+		// waits for it — then report the restart so the caller can exit and let
+		// systemd bring the new binary up.
+		serveErr = ErrRestartRequired
 	}
+	stopLoop()
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -464,13 +499,18 @@ func (h *Helper) doJSON(ctx context.Context, method, path string, body, out any,
 // ---------------------------------------------------------------- HTTP API
 
 // Handler returns the helper's HTTP handler. Routing is done by hand: the helper
-// is a three-endpoint daemon that must stay a single dependency-free binary.
+// is a handful-of-endpoints daemon that must stay a single dependency-free
+// binary.
 func (h *Helper) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", h.handleHealth)
 	mux.HandleFunc("/export/", h.handleExport)
 	mux.HandleFunc("/import/", h.handleImport)
 	mux.HandleFunc("/script", h.handleScript)
+	// Self-update. A helper is contacted rather than polling, so this is how the
+	// console reaches it — over the same authenticated channel as export and
+	// import, with the same access secret.
+	mux.HandleFunc("/update", h.handleUpdate)
 	return mux
 }
 
@@ -551,6 +591,7 @@ func (h *Helper) handleExport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	defer h.startWork()()
 	fw := &flushWriter{w: w, f: flusherOf(w)}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	h.log.Info("export started", "vmid", vmid)
@@ -590,6 +631,7 @@ func (h *Helper) handleImport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	defer h.startWork()()
 	storage := r.URL.Query().Get("storage")
 	force := r.URL.Query().Get("force") == "1"
 	h.log.Info("import started", "vmid", vmid, "storage", storage, "force", force)
@@ -682,6 +724,7 @@ func (h *Helper) handleScript(w http.ResponseWriter, r *http.Request) {
 		phase = "script"
 	}
 
+	defer h.startWork()()
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	out := &tailBuffer{max: ScriptOutputTail}

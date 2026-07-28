@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"proxback/internal/agentmgr"
@@ -64,6 +65,10 @@ type Config struct {
 	InsecureTLS       bool
 	Logger            *slog.Logger
 	HTTPClient        *http.Client
+	// BinaryPath is the file a self-update replaces. Empty — the normal case —
+	// means the running executable. It exists so a test can exercise the real
+	// download-and-swap against a scratch file instead of the test binary.
+	BinaryPath string
 }
 
 type storedConfig struct {
@@ -78,6 +83,10 @@ type Agent struct {
 	log  *slog.Logger
 	hc   *http.Client
 	self storedConfig
+	// restart is set once a self-update has been installed, which is what makes
+	// the poll loop return ErrRestartRequired instead of carrying on with a
+	// binary that is no longer the one on disk.
+	restart atomic.Bool
 }
 
 // New builds an agent.
@@ -154,6 +163,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		if err := a.pollOnce(ctx); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if errors.Is(err, ErrRestartRequired) {
+				return err
 			}
 			fails++
 			a.log.Warn("heartbeat failed; will retry",
@@ -286,14 +298,28 @@ func (a *Agent) Enroll(ctx context.Context) error {
 }
 
 // pollOnce sends a heartbeat and executes any dispatched work.
+//
+// The heartbeat carries the version this binary actually is, so a component
+// that upgraded or was rolled back is reflected on the server within one beat
+// rather than never — the drift that used to be invisible is the whole reason
+// self-update exists.
 func (a *Agent) pollOnce(ctx context.Context) error {
+	beat := agentmgr.HeartbeatRequest{Version: Version, OS: runtime.GOOS, Arch: runtime.GOARCH}
 	var res struct {
 		Jobs []agentmgr.Dispatch `json:"jobs"`
 	}
-	if err := a.doJSON(ctx, http.MethodPost, "/api/agents/heartbeat", map[string]any{}, &res, true); err != nil {
+	if err := a.doJSON(ctx, http.MethodPost, "/api/agents/heartbeat", beat, &res, true); err != nil {
 		return err
 	}
+	// Work first, updates last. A batch can hold both, and swapping the binary
+	// out from under a backup that is about to start would be a poor trade for
+	// being a few seconds newer.
+	var updates []agentmgr.Dispatch
 	for _, d := range res.Jobs {
+		if d.Type == agentmgr.DispatchUpdate {
+			updates = append(updates, d)
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -312,10 +338,28 @@ func (a *Agent) pollOnce(ctx context.Context) error {
 			a.reportFailure(ctx, d.RunID, err)
 		}
 	}
+	for _, d := range updates {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		a.log.Info("dispatch received", "type", d.Type, "version", d.Version)
+		// A failed update is logged where it happened and is deliberately not
+		// reported as a run failure: there is no run, and inventing one would
+		// put a red line in the backup history for something that never touched
+		// a backup. The console sees it as an agent that stayed on its old
+		// version, which is exactly what happened.
+		_ = a.runSelfUpdate(ctx, d)
+	}
+	if a.restart.Load() {
+		return ErrRestartRequired
+	}
 	return nil
 }
 
 func (a *Agent) reportFailure(ctx context.Context, runID string, cause error) {
+	if runID == "" {
+		return
+	}
 	body := map[string]string{"error": cause.Error()}
 	failCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()

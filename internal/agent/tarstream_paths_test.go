@@ -81,13 +81,13 @@ func TestLongContentAddressedNamesAreArchivable(t *testing.T) {
 // tar format can encode. A drive root must yield a usable prefix.
 func TestArchivePrefixOfAwkwardRoots(t *testing.T) {
 	cases := map[string]string{
-		filepath.Join("home", "taher", "docs"): "docs",
-		"/":                                    "root",
+		filepath.Join("srv", "data", "docs"): "docs",
+		"/":                                  "root",
 	}
 	if runtime.GOOS == "windows" {
 		cases[`D:\`] = "D"
 		cases[`D:`] = "D"
-		cases[`C:\Users\Taher`] = "Taher"
+		cases[`C:\Users\Example`] = "Example"
 	}
 	for in, want := range cases {
 		if got := archivePrefix(in); got != want {

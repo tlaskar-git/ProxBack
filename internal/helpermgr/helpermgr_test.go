@@ -282,7 +282,7 @@ func TestHeartbeatMovesLastSeen(t *testing.T) {
 	if helpermgr.Online(h) {
 		t.Fatal("an hour-old helper is online")
 	}
-	if err := m.Heartbeat(ctx, h.ID); err != nil {
+	if err := m.Heartbeat(ctx, h.ID, helpermgr.HeartbeatRequest{}); err != nil {
 		t.Fatalf("heartbeat: %v", err)
 	}
 	beaten, err := st.HelperByID(ctx, h.ID)
@@ -291,5 +291,45 @@ func TestHeartbeatMovesLastSeen(t *testing.T) {
 	}
 	if !helpermgr.Online(beaten) {
 		t.Fatalf("helper still offline after a heartbeat (lastSeen %v)", beaten.LastSeen)
+	}
+	// A heartbeat that says nothing about the version must not erase the one on
+	// record: a helper old enough not to report it keeps what it enrolled with.
+	if beaten.Version != "0.3.0" {
+		t.Fatalf("version after a silent heartbeat = %q, want 0.3.0", beaten.Version)
+	}
+}
+
+// TestHeartbeatRefreshesTheReportedVersion is the fix for a node helper that
+// updated itself and went on being displayed as the build it was deployed with.
+func TestHeartbeatRefreshesTheReportedVersion(t *testing.T) {
+	ctx := context.Background()
+	m, st, hostID := newManager(t)
+	h, err := st.CreateHelper(ctx, &store.NodeHelper{
+		HostID: hostID, Node: "pve3", Address: "10.0.0.13", Version: "0.6.1",
+		AccessSecret: "s", APIKeyHash: "h",
+	})
+	if err != nil {
+		t.Fatalf("create helper: %v", err)
+	}
+	if err := m.Heartbeat(ctx, h.ID, helpermgr.HeartbeatRequest{Version: "0.6.2"}); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	beaten, err := st.HelperByID(ctx, h.ID)
+	if err != nil {
+		t.Fatalf("reload helper: %v", err)
+	}
+	if beaten.Version != "0.6.2" {
+		t.Fatalf("version after an upgrade heartbeat = %q, want 0.6.2", beaten.Version)
+	}
+	// A downgrade is drift too, and must be just as visible.
+	if err := m.Heartbeat(ctx, h.ID, helpermgr.HeartbeatRequest{Version: "0.6.0"}); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	beaten, err = st.HelperByID(ctx, h.ID)
+	if err != nil {
+		t.Fatalf("reload helper: %v", err)
+	}
+	if beaten.Version != "0.6.0" {
+		t.Fatalf("version after a downgrade heartbeat = %q, want 0.6.0", beaten.Version)
 	}
 }

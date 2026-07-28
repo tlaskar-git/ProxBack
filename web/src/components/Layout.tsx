@@ -99,8 +99,8 @@ function RoleBadge({ role, className }: { role: Role; className?: string }) {
 
 function SidebarBrand() {
   return (
-    <div className="flex h-14 items-center border-b border-slate-800/80 px-4">
-      <BrandLockup subtitle="Proxmox VE recovery" />
+    <div className="flex flex-col items-center border-b border-slate-800/80 px-4 py-6">
+      <BrandLockup size="lg" subtitle="Proxmox VE recovery" />
     </div>
   )
 }

@@ -71,6 +71,11 @@ type Server struct {
 	// exercise the endpoint without a real SSH server.
 	deployHelper func(context.Context, nodedeploy.Params) (nodedeploy.Result, error)
 
+	// requestHelperUpdate tells a node helper to replace its own binary. It is
+	// a field for the same reason as deployHelper: the real one dials a daemon
+	// on a Proxmox node, and the endpoint's refusals deserve tests that do not.
+	requestHelperUpdate func(context.Context, *store.NodeHelper, helpermgr.UpdateRequest) (helpermgr.UpdateResponse, error)
+
 	spa    fs.FS
 	router chi.Router
 }
@@ -102,6 +107,7 @@ func New(cfg Config) (*Server, error) {
 
 		deployHelper: nodedeploy.Deploy,
 	}
+	s.requestHelperUpdate = cfg.Helpers.RequestUpdate
 	s.router = s.routes()
 	// A server that self-updated before this existed is still serving the agent
 	// its installer staged. Healing that is a background, best-effort pass: it
@@ -256,11 +262,18 @@ func (s *Server) apiRoutes() chi.Router {
 
 			r.Post("/agents/enroll-token", s.handleCreateEnrollToken)
 			r.Delete("/agents/{id}", s.handleDeleteAgent)
+			// Updating a deployed component is admin for the same reason
+			// deploying one is: it replaces the binary running inside somebody's
+			// guest, and it restarts it.
+			r.Post("/agents/{id}/update", s.handleUpdateAgent)
+			r.Post("/agents/update-all", s.handleUpdateAllAgents)
 
 			r.Post("/helpers/enroll-token", s.handleCreateHelperEnrollToken)
 			r.Post("/helpers/deploy", s.handleDeployHelper)
 			r.Post("/helpers/{id}/assign", s.handleAssignHelper)
 			r.Delete("/helpers/{id}", s.handleDeleteHelper)
+			r.Post("/helpers/{id}/update", s.handleUpdateHelper)
+			r.Post("/helpers/update-all", s.handleUpdateAllHelpers)
 
 			r.Put("/settings", s.handlePutSettings)
 			r.Post("/settings/test-webhook", s.handleTestWebhook)

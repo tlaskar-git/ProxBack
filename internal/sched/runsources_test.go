@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"proxback/internal/s3target"
 	"proxback/internal/store"
 )
 
@@ -127,6 +128,11 @@ func TestRunSourcesRecordAFailure(t *testing.T) {
 
 	// A storage target that is not there: planning succeeds (it only talks to
 	// Proxmox) and the first guest fails as soon as the engine touches S3.
+	// Production retries ride out a minute of outage; this test wants the
+	// failure, not the wait.
+	attempts, backoff := s3target.MaxAttempts, s3target.MaxBackoff
+	s3target.MaxAttempts, s3target.MaxBackoff = 2, 10*time.Millisecond
+	t.Cleanup(func() { s3target.MaxAttempts, s3target.MaxBackoff = attempts, backoff })
 	dead := httptest.NewServer(nil)
 	deadURL := dead.URL
 	dead.Close()

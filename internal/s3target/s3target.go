@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -109,6 +110,13 @@ func New(_ context.Context, cfg Config) (*Client, error) {
 		HTTPClient:                 &http.Client{Timeout: 5 * time.Minute},
 	}
 	api := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		// The SDK default of 3 attempts with short backoff gives up inside a
+		// few seconds. A backup uploads thousands of chunks over hours, so one
+		// short DNS or network blip on the LAN must not fail the whole guest.
+		o.Retryer = retry.NewStandard(func(so *retry.StandardOptions) {
+			so.MaxAttempts = MaxAttempts
+			so.MaxBackoff = MaxBackoff
+		})
 		if cfg.Endpoint != "" {
 			o.BaseEndpoint = aws.String(strings.TrimRight(cfg.Endpoint, "/"))
 		}
@@ -116,6 +124,14 @@ func New(_ context.Context, cfg Config) (*Client, error) {
 	})
 	return &Client{api: api, bucket: cfg.Bucket}, nil
 }
+
+// MaxAttempts is how many times one S3 request is tried before it fails. With
+// MaxBackoff it rides out a resolver or network outage of about a minute.
+// Tests that point at a dead endpoint lower it.
+var MaxAttempts = 8
+
+// MaxBackoff caps the wait between two attempts of one S3 request.
+var MaxBackoff = 20 * time.Second
 
 // Bucket returns the bucket this client is scoped to.
 func (c *Client) Bucket() string { return c.bucket }

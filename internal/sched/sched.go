@@ -695,8 +695,14 @@ func (m *Manager) finish(runID, notifyKind string, stats *engine.Stats, runErr e
 	}
 	status := store.RunSuccess
 	msg := ""
+	var partial *PartialError
 	switch {
 	case runErr == nil:
+	case errors.As(runErr, &partial):
+		// Some guests have restore points, some do not. The run is not a
+		// failure, and it is not a success either.
+		status = store.RunPartial
+		msg = runErr.Error()
 	case errors.Is(runErr, context.Canceled):
 		status = store.RunCanceled
 		msg = "canceled"
@@ -756,6 +762,10 @@ func (m *Manager) logTerminal(ctx context.Context, run *store.JobRun, status str
 		m.logRun(ctx, run.ID, "run succeeded in %s — %s processed, %s uploaded, %s",
 			dur, humanBytes(processed), humanBytes(uploaded),
 			store.ReductionSummary(processed, uploaded))
+	case store.RunPartial:
+		m.logRun(ctx, run.ID, "run partly succeeded in %s — %s processed, %s uploaded, %s — %s",
+			dur, humanBytes(processed), humanBytes(uploaded),
+			store.ReductionSummary(processed, uploaded), msg)
 	case store.RunCanceled:
 		m.logRun(ctx, run.ID, "run canceled after %s", dur)
 	default:

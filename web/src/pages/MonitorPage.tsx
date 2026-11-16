@@ -68,7 +68,8 @@ function HistoryRow({
   const { can, role } = useSession()
   const [busy, setBusy] = useState<'cancel' | 'retry' | null>(null)
   const running = run.status === 'running'
-  const failed = run.status === 'failed'
+  const failed = run.status === 'failed' || run.status === 'partial'
+  const partial = run.status === 'partial'
   const reduction = reductionOf(run)
   const denied = can.operateJobs ? undefined : roleDeniedReason(role, 'cancel or retry runs')
 
@@ -133,7 +134,10 @@ function HistoryRow({
             swaps the step text for an error and back. */}
         <div className="mt-0.5 flex h-4 items-center">
           {failed && run.error ? (
-            <span className="truncate text-micro text-fail-400/90" title={run.error}>
+            <span
+              className={`truncate text-micro ${partial ? 'text-warn-400/90' : 'text-fail-400/90'}`}
+              title={run.error}
+            >
               {run.error}
             </span>
           ) : run.currentStep ? (

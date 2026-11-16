@@ -3,6 +3,7 @@ package sched
 import (
 	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,8 +119,8 @@ func TestRunSourcesRecordABackupRun(t *testing.T) {
 }
 
 // TestRunSourcesRecordAFailure proves the monitor tells an operator which guest
-// broke and why — and that the guests the run never reached are closed out as
-// skipped rather than left spinning as pending.
+// broke and why, and that one broken guest does not stop the run from trying
+// the next one.
 func TestRunSourcesRecordAFailure(t *testing.T) {
 	h := newRunLogHarness(t)
 	ctx := context.Background()
@@ -158,31 +159,32 @@ func TestRunSourcesRecordAFailure(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("failed run recorded %d sources, want 2: %+v", len(got), got)
 	}
-	failed := got[0]
-	if failed.Name != "web-01" || failed.Status != store.SourceFailed {
-		t.Fatalf("first source = %+v, want web-01 failed", failed)
+	// Neither guest stops the other: both are attempted, both fail, and each
+	// row carries its own error, which the run's error repeats.
+	for i, want := range []struct {
+		name string
+		size int64
+	}{{"web-01", 32 << 20}, {"db-01", 16 << 20}} {
+		name, src := want.name, got[i]
+		if src.Name != name || src.Status != store.SourceFailed {
+			t.Fatalf("source %d = %+v, want %s failed", i, src, name)
+		}
+		if src.Error == "" {
+			t.Errorf("failed source %s carries no error", name)
+		}
+		if !strings.Contains(run.Error, name+": "+src.Error) {
+			t.Errorf("run error %q does not carry %s's error %q — the monitor and the run must agree",
+				run.Error, name, src.Error)
+		}
+		if src.FinishedAt == nil {
+			t.Errorf("failed source %s was never closed out", name)
+		}
+		if src.SizeBytes != want.size {
+			t.Errorf("source %s sizeBytes = %d, want the size it was planned with", name, src.SizeBytes)
+		}
 	}
-	if failed.Error == "" {
-		t.Error("the failed source carries no error")
-	}
-	if failed.Error != run.Error {
-		t.Errorf("source error %q, run error %q — the monitor and the run must agree",
-			failed.Error, run.Error)
-	}
-	if failed.FinishedAt == nil {
-		t.Error("the failed source was never closed out")
-	}
-	// The guest the run never reached keeps the size it was planned with, which
-	// is how the monitor can show a total before anything has moved.
-	skipped := got[1]
-	if skipped.Name != "db-01" || skipped.Status != store.SourceSkipped {
-		t.Fatalf("second source = %+v, want db-01 skipped", skipped)
-	}
-	if skipped.SizeBytes != 16<<20 {
-		t.Errorf("skipped source sizeBytes = %d, want the size it was planned with", skipped.SizeBytes)
-	}
-	if skipped.BytesProcessed != 0 || skipped.StartedAt != nil {
-		t.Errorf("skipped source looks like it ran: %+v", skipped)
+	if !strings.HasPrefix(run.Error, "all 2 VMs failed: ") {
+		t.Errorf("run error = %q, want it to say every VM failed", run.Error)
 	}
 }
 

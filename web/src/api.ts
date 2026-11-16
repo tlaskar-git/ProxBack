@@ -166,6 +166,8 @@ export interface UpdateApplyResult {
 export interface Last24h {
   succeeded: number
   failed: number
+  /** Runs in which some workloads succeeded and some failed. */
+  partial: number
   running: number
 }
 
@@ -940,7 +942,8 @@ export type JobPatch = Partial<JobCreate>
 
 /* Job runs ---------------------------------------------------------------- */
 
-export type RunStatus = 'running' | 'success' | 'failed' | 'canceled'
+/** `partial`: a VM job in which some workloads were backed up and some failed. */
+export type RunStatus = 'running' | 'success' | 'partial' | 'failed' | 'canceled'
 
 /** What a run did. Backups write; restores and verifications only read. */
 export type RunKind = 'backup' | 'restore' | 'verify'

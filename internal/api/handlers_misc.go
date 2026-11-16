@@ -25,7 +25,9 @@ import (
 type last24hDTO struct {
 	Succeeded int `json:"succeeded"`
 	Failed    int `json:"failed"`
-	Running   int `json:"running"`
+	// Partial counts runs in which some guests succeeded and some failed.
+	Partial int `json:"partial"`
+	Running int `json:"running"`
 }
 
 type dashboardDTO struct {
@@ -72,6 +74,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	out.Last24h = last24hDTO{
 		Succeeded: counts[store.RunSuccess],
 		Failed:    counts[store.RunFailed] + counts[store.RunCanceled],
+		Partial:   counts[store.RunPartial],
 		Running:   counts[store.RunRunning],
 	}
 	_, stored, err := s.st.ChunkStats(ctx, "")

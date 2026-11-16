@@ -269,6 +269,10 @@ function JobRow({
             <p className="mt-2 max-w-2xl rounded-md border border-fail-500/25 bg-fail-500/5 px-2.5 py-1.5 text-xs text-fail-300/90">
               {lastRun.error}
             </p>
+          ) : lastRun?.status === 'partial' && lastRun.error ? (
+            <p className="mt-2 max-w-2xl rounded-md border border-warn-500/25 bg-warn-500/5 px-2.5 py-1.5 text-xs text-warn-300/90">
+              {lastRun.error}
+            </p>
           ) : null}
         </div>
 

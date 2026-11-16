@@ -589,6 +589,7 @@ export function toneForStatus(status: string | null | undefined): PillTone {
     case 'unreachable':
       return 'fail'
     case 'warning':
+    case 'partial':
     case 'degraded':
     case 'pending':
     case 'limited':
@@ -606,7 +607,9 @@ export function RunStatusPill({ status }: { status: string }) {
       ? 'ok'
       : status === 'failed'
         ? 'fail'
-        : status === 'running'
+        : status === 'partial'
+          ? 'warn'
+          : status === 'running'
           ? 'brand'
           : 'neutral'
   return <StatusPill tone={tone} label={status} pulse={status === 'running'} />

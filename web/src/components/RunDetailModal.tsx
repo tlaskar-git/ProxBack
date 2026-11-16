@@ -165,7 +165,9 @@ export function RunDetailModal({
     run ?? { bytesProcessed: 0, bytesUploaded: 0 },
   )
   const running = run?.status === 'running'
-  const failed = run?.status === 'failed' || run?.status === 'canceled'
+  const failed =
+    run?.status === 'failed' || run?.status === 'canceled' || run?.status === 'partial'
+  const partial = run?.status === 'partial'
   const denied = can.operateJobs
     ? undefined
     : roleDeniedReason(role, 'cancel, retry or delete runs')
@@ -322,7 +324,17 @@ export function RunDetailModal({
             </div>
           ) : null}
 
-          {run.error ? (
+          {run.error && partial ? (
+            <div className="space-y-1.5 rounded-lg border border-warn-500/30 bg-warn-500/10 px-4 py-3">
+              <p className="flex items-center gap-2 text-meta font-medium text-warn-200">
+                <AlertTriangle className="size-3.5" aria-hidden />
+                Partly succeeded. The other workloads have new restore points.
+              </p>
+              <p className="font-mono text-xs leading-relaxed break-all whitespace-pre-wrap text-warn-300">
+                {run.error}
+              </p>
+            </div>
+          ) : run.error ? (
             <div className="space-y-1.5 rounded-lg border border-fail-500/30 bg-fail-500/10 px-4 py-3">
               <p className="flex items-center gap-2 text-meta font-medium text-fail-200">
                 <AlertTriangle className="size-3.5" aria-hidden />

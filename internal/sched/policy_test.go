@@ -105,6 +105,120 @@ func TestRunUnderPolicyGivesUpAfterTheLastAttempt(t *testing.T) {
 	requireLine(t, h.lines(run.ID), "no attempts left")
 }
 
+// TestOneFailedVMDoesNotFailTheJob is the multi-VM rule: a guest that fails is
+// recorded with its own error, the other guests are still backed up, and the
+// run ends partial rather than failed.
+func TestOneFailedVMDoesNotFailTheJob(t *testing.T) {
+	h := newPolicyHarness(t)
+	ctx := context.Background()
+	// The first export call is web-01's first disk.
+	h.faults.failExports(1)
+
+	job, err := h.st.CreateJob(ctx, &store.Job{
+		Name: "weekly", Kind: store.SourceVM, TargetID: h.target.ID,
+		Schedule: store.ManualSchedule(), Retention: store.KeepLast(2), Enabled: true,
+		Sources: store.JobSources{
+			{HostID: h.host.ID, VMID: 100, Name: "web-01"},
+			{HostID: h.host.ID, VMID: 101, Name: "db-01"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	run := h.runJob(job.ID)
+	if run.Status != store.RunPartial {
+		t.Fatalf("run finished %q (%s), want partial", run.Status, run.Error)
+	}
+	if !strings.HasPrefix(run.Error, "1 of 2 VMs failed: web-01: ") {
+		t.Fatalf("run error = %q, want it to name the failed VM", run.Error)
+	}
+	if run.ProgressPct != 100 {
+		t.Errorf("partial run progress = %v, want 100", run.ProgressPct)
+	}
+	if run.BytesProcessed != 16<<20 {
+		t.Errorf("partial run processed %d bytes, want db-01's 16 MiB", run.BytesProcessed)
+	}
+
+	sources, err := h.st.RunSources(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("run sources: %v", err)
+	}
+	if len(sources) != 2 || sources[0].Status != store.SourceFailed || sources[1].Status != store.SourceSuccess {
+		t.Fatalf("sources = %+v, want web-01 failed and db-01 succeeded", sources)
+	}
+	backups, err := h.st.ListBackups(ctx, store.BackupFilter{JobID: job.ID})
+	if err != nil {
+		t.Fatalf("list backups: %v", err)
+	}
+	if len(backups) != 1 || backups[0].SourceName != "db-01" {
+		t.Fatalf("restore points = %+v, want db-01 only", backups)
+	}
+
+	lines := h.lines(run.ID)
+	requireLine(t, lines, "web-01: failed, continuing with the remaining 1 VM")
+	requireLine(t, lines, "db-01: finished")
+	requireLine(t, lines, "garbage collection runs although 1 VM failed")
+	terminal := requireLine(t, lines, "run partly succeeded")
+	if !strings.Contains(terminal, "1 of 2 VMs failed: web-01") {
+		t.Errorf("terminal line %q does not name the failed VM", terminal)
+	}
+	if strings.Contains(strings.Join(lines, "\n"), "skipped garbage collection") {
+		t.Error("a partial run skipped garbage collection")
+	}
+}
+
+// TestRetryRerunsOnlyTheFailedVMs keeps retries cheap: the retry of a partial
+// attempt backs up the guests that failed, not the whole job again, and the
+// run's totals count both attempts.
+func TestRetryRerunsOnlyTheFailedVMs(t *testing.T) {
+	h := newPolicyHarness(t)
+	ctx := context.Background()
+	h.faults.failExports(1)
+
+	job, err := h.st.CreateJob(ctx, &store.Job{
+		Name: "weekly-retry", Kind: store.SourceVM, TargetID: h.target.ID,
+		Schedule: store.ManualSchedule(), Retention: store.KeepLast(2), Enabled: true,
+		Sources: store.JobSources{
+			{HostID: h.host.ID, VMID: 100, Name: "web-01"},
+			{HostID: h.host.ID, VMID: 101, Name: "db-01"},
+		},
+		Policy: store.JobPolicy{RetryCount: 1, RetryDelayMinutes: 1},
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	run := h.runJob(job.ID)
+	if run.Status != store.RunSuccess {
+		t.Fatalf("run finished %q: %s", run.Status, run.Error)
+	}
+	lines := h.lines(run.ID)
+	requireLine(t, lines, "attempt 1 of 2 failed: 1 of 2 VMs failed: web-01")
+	requireLine(t, lines, "retrying 1 VM that failed: web-01")
+	requireLine(t, lines, "attempt 2 of 2 succeeded")
+	if n := countLines(lines, "db-01: finished"); n != 1 {
+		t.Fatalf("db-01 was backed up %d times, want once", n)
+	}
+	backups, err := h.st.ListBackups(ctx, store.BackupFilter{JobID: job.ID})
+	if err != nil {
+		t.Fatalf("list backups: %v", err)
+	}
+	if len(backups) != 2 {
+		t.Fatalf("a retried run produced %d restore points, want one per VM", len(backups))
+	}
+	if run.BytesProcessed != 48<<20 {
+		t.Errorf("run processed %d bytes, want both VMs' 48 MiB across the two attempts", run.BytesProcessed)
+	}
+	sources, err := h.st.RunSources(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("run sources: %v", err)
+	}
+	for _, src := range sources {
+		if src.Status != store.SourceSuccess {
+			t.Errorf("source %s = %s after a successful retry", src.Name, src.Status)
+		}
+	}
+}
+
 // TestRunUnderPolicyDoesNotRetryACancellation is the rule that keeps a cancel
 // button meaning what it says: an operator who stops a run has stopped it, not
 // asked for it to be tried again.

@@ -139,6 +139,11 @@ policy: guest-agent quiescing, disk or path exclusions, automatic retry, a maxim
 duration, a permitted backup window, and pre/post scripts run where the data lives.
 Defaults are safe and the whole step is collapsed — a six-VM estate never needs to open it.
 
+A VM job backs up each guest on its own. When one guest fails, the job continues with the
+others, records that guest's error on its own row, and ends **partial** instead of failed.
+An automatic retry backs up only the guests that failed. Orphan-chunk collection still runs
+after a partial run, and the 24 h grace window keeps the failed guests' recent uploads.
+
 Retention supports GFS: keep-last plus daily, weekly, monthly and yearly copies. Before
 saving, the console shows exactly which restore points a policy would keep and which it
 would prune, and why each survivor was kept.

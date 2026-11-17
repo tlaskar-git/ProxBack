@@ -1,7 +1,8 @@
 // Package helperclient is the server-side client for the ProxBack node helper's
 // HTTP API: whole-VM export (a vzdump VMA stream), import (piped into qmrestore)
 // and a health probe. Transfers are unbounded in time — a multi-hundred-GiB
-// vzdump run may take hours — so only the response header wait is bounded.
+// vzdump run may take hours — so only the wait for the first response byte is
+// bounded, and for an export that wait is long (see ExportHeaderTimeout).
 package helperclient
 
 import (
@@ -15,16 +16,40 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// HeaderTimeout bounds how long we wait for a helper to start answering.
+// HeaderTimeout bounds how long we wait for a helper to start answering a
+// request that does no work before it answers (health, import).
 const HeaderTimeout = 60 * time.Second
+
+// ExportHeaderTimeout bounds how long an export may take to send its first
+// byte. The helper answers an export only when vzdump writes its first byte, and
+// vzdump does real work before that: it waits for the node's global vzdump lock
+// (held by any other backup job on the node, Proxmox's own included), runs the
+// guest-agent fs-freeze and sets up its snapshot. On a busy node that is well
+// over a minute, so the general HeaderTimeout fails healthy exports.
+const ExportHeaderTimeout = 30 * time.Minute
 
 // Client talks to node helpers. It is safe for concurrent use.
 type Client struct {
-	hc  *http.Client
-	log *slog.Logger
+	hc *http.Client
+	// export carries export requests. Its transport has no response header
+	// timeout of its own: Export enforces exportHeaderTimeout per request, so
+	// the failure can say what the helper was most likely waiting for.
+	export              *http.Client
+	exportHeaderTimeout time.Duration
+	log                 *slog.Logger
+}
+
+// SetExportHeaderTimeout overrides ExportHeaderTimeout. Tests use it; a value of
+// zero or less restores the default.
+func (c *Client) SetExportHeaderTimeout(d time.Duration) {
+	if d <= 0 {
+		d = ExportHeaderTimeout
+	}
+	c.exportHeaderTimeout = d
 }
 
 // New builds a client.
@@ -38,7 +63,12 @@ func New(log *slog.Logger) *Client {
 			IdleConnTimeout:       90 * time.Second,
 			MaxIdleConnsPerHost:   2,
 		}},
-		log: log,
+		export: &http.Client{Transport: &http.Transport{
+			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConnsPerHost: 2,
+		}},
+		exportHeaderTimeout: ExportHeaderTimeout,
+		log:                 log,
 	}
 }
 
@@ -95,20 +125,51 @@ func errorFor(method, url string, resp *http.Response) *Error {
 // when vzdump fails mid-run) surfaces as a read error, never as a clean EOF.
 func (c *Client) Export(ctx context.Context, addr string, port int, secret string, vmid int) (io.ReadCloser, error) {
 	target := fmt.Sprintf("%s/export/%d", baseURL(addr, port), vmid)
-	req, err := c.newRequest(ctx, http.MethodGet, target, secret, nil)
+	// The request context lives as long as the body: cancelling it is how the
+	// header wait is cut short, and it is released when the caller closes the
+	// stream.
+	reqCtx, cancel := context.WithCancel(ctx)
+	req, err := c.newRequest(reqCtx, http.MethodGet, target, secret, nil)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	resp, err := c.hc.Do(req)
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(c.exportHeaderTimeout, func() {
+		timedOut.Store(true)
+		cancel()
+	})
+	resp, err := c.export.Do(req)
+	timer.Stop()
 	if err != nil {
+		cancel()
+		if timedOut.Load() && ctx.Err() == nil {
+			return nil, fmt.Errorf("node helper: export vm %d: vzdump sent no data within %s: "+
+				"it is most likely waiting for the node's vzdump lock (another backup job on this node) "+
+				"or for a guest-agent fs-freeze; check `journalctl -u proxback-helper` and "+
+				"/var/log/vzdump/qemu-%d.log on the node", vmid, c.exportHeaderTimeout, vmid)
+		}
 		return nil, fmt.Errorf("node helper: export vm %d: %w", vmid, err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		defer cancel()
 		defer resp.Body.Close()
 		return nil, errorFor(http.MethodGet, target, resp)
 	}
 	c.log.Debug("node helper export started", "url", target, "vmid", vmid)
-	return resp.Body, nil
+	return &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}, nil
+}
+
+// cancelOnClose releases an export's request context once the stream is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
 
 // Import streams a VMA archive into qmrestore on the helper's node. storage

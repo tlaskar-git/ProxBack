@@ -243,7 +243,7 @@ func (s *Store) UpdateRunProgress(ctx context.Context, runID string, processed, 
 func (s *Store) FinishRun(ctx context.Context, runID, status string, processed, uploaded int64, dedupRatio float64, runErr string) error {
 	now := Now()
 	pct := 100.0
-	if status != RunSuccess {
+	if status != RunSuccess && status != RunPartial {
 		var cur float64
 		_ = s.db.QueryRowContext(ctx, `SELECT progress_pct FROM job_runs WHERE id = ?`, runID).Scan(&cur)
 		pct = cur

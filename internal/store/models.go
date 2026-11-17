@@ -293,6 +293,9 @@ const (
 	RunSuccess  = "success"
 	RunFailed   = "failed"
 	RunCanceled = "canceled"
+	// RunPartial is a VM job run in which some guests were backed up and some
+	// failed. Each guest's own outcome is on its run source row.
+	RunPartial = "partial"
 )
 
 // Run kinds.

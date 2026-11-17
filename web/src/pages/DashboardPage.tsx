@@ -473,6 +473,12 @@ function OutcomeChart({ stats }: { stats: DashboardStats }) {
         fill: 'var(--color-ok-500)',
       },
       {
+        key: 'partial',
+        name: 'Partial',
+        value: stats.last24h.partial ?? 0,
+        fill: 'var(--color-warn-500)',
+      },
+      {
         key: 'failed',
         name: 'Failed',
         value: stats.last24h.failed,

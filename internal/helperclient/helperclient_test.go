@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"proxback/internal/helperclient"
 )
@@ -22,6 +23,9 @@ type fakeHelper struct {
 	content []byte
 	// exportStatus, when non-zero, is answered instead of streaming content.
 	exportStatus int
+	// exportDelay holds the export answer back, the way vzdump does while it
+	// waits for the node's backup lock or a guest-agent fs-freeze.
+	exportDelay time.Duration
 
 	mu       sync.Mutex
 	paths    []string
@@ -39,6 +43,13 @@ func (f *fakeHelper) handler() http.Handler {
 	})
 	mux.HandleFunc("/export/", func(w http.ResponseWriter, r *http.Request) {
 		f.note(r)
+		if f.exportDelay > 0 {
+			select {
+			case <-time.After(f.exportDelay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		if f.exportStatus != 0 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(f.exportStatus)
@@ -198,5 +209,65 @@ func TestUnreachableHelperFails(t *testing.T) {
 	// Port 1 on the loopback interface is never listening.
 	if _, err := client().Health(context.Background(), "127.0.0.1", 1, secret); err == nil {
 		t.Fatal("health of an unreachable helper returned no error")
+	}
+}
+
+// TestExportWaitsForASlowFirstByte is the Weekly Backup failure: vzdump took
+// longer than the general header timeout to produce its first byte, and the
+// export failed with "timeout awaiting response headers" although the helper
+// was healthy. An export now waits for its own, much longer, first-byte window.
+func TestExportWaitsForASlowFirstByte(t *testing.T) {
+	fake := &fakeHelper{content: []byte("vma-after-a-wait"), exportDelay: 300 * time.Millisecond}
+	host, port := serve(t, fake)
+
+	c := client()
+	c.SetExportHeaderTimeout(5 * time.Second)
+	rc, err := c.Export(context.Background(), host, port, secret, 120)
+	if err != nil {
+		t.Fatalf("export with a slow first byte: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil || string(got) != "vma-after-a-wait" {
+		t.Fatalf("export returned %q, %v", got, err)
+	}
+}
+
+// TestExportExplainsAFirstByteTimeout keeps the failure actionable: an export
+// that never starts says what vzdump was most likely waiting for and where the
+// operator can look, instead of a bare transport error.
+func TestExportExplainsAFirstByteTimeout(t *testing.T) {
+	fake := &fakeHelper{content: []byte("never"), exportDelay: 5 * time.Second}
+	host, port := serve(t, fake)
+
+	c := client()
+	c.SetExportHeaderTimeout(100 * time.Millisecond)
+	_, err := c.Export(context.Background(), host, port, secret, 120)
+	if err == nil {
+		t.Fatal("export that never started returned no error")
+	}
+	for _, want := range []string{"export vm 120", "sent no data within 100ms", "vzdump lock", "qemu-120.log"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestExportCancellationIsNotReportedAsATimeout keeps a cancelled run honest.
+func TestExportCancellationIsNotReportedAsATimeout(t *testing.T) {
+	fake := &fakeHelper{content: []byte("never"), exportDelay: 5 * time.Second}
+	host, port := serve(t, fake)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := client().Export(ctx, host, port, secret, 120)
+	if err == nil {
+		t.Fatal("cancelled export returned no error")
+	}
+	if strings.Contains(err.Error(), "sent no data") {
+		t.Fatalf("a cancellation was reported as a first-byte timeout: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error %v does not carry the context's error", err)
 	}
 }

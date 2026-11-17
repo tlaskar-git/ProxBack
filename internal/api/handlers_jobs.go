@@ -666,7 +666,7 @@ func (s *Server) handleClearRuns(w http.ResponseWriter, r *http.Request) {
 	var statuses []string
 	switch body.Scope {
 	case clearScopeFinished:
-		statuses = []string{store.RunSuccess, store.RunFailed, store.RunCanceled}
+		statuses = []string{store.RunSuccess, store.RunPartial, store.RunFailed, store.RunCanceled}
 	case clearScopeFailed:
 		statuses = []string{store.RunFailed}
 	default:

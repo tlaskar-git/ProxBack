@@ -49,8 +49,11 @@ func (m *Manager) executeBackup(ctx context.Context, run *store.JobRun, job *sto
 		defer m.applyGlobalUploadLimit(m.detached())
 	}
 
+	// The state outlives each attempt, so a retry backs up only the guests that
+	// failed and the run's totals still count the ones that already succeeded.
+	state := newVMJobState()
 	return m.runUnderPolicy(ctx, run.ID, policy, func(attemptCtx context.Context) (*engine.Stats, error) {
-		return m.backupAttempt(attemptCtx, run, job, policy)
+		return m.backupAttempt(attemptCtx, run, job, policy, state)
 	})
 }
 
@@ -116,7 +119,7 @@ func (m *Manager) runUnderPolicy(ctx context.Context, runID string, policy store
 // pre-script where the data lives, back the sources up, run the post-script,
 // and collect orphan chunks if the attempt got all the way through.
 func (m *Manager) backupAttempt(ctx context.Context, run *store.JobRun, job *store.Job,
-	policy store.JobPolicy) (stats *engine.Stats, runErr error) {
+	policy store.JobPolicy, state *vmJobState) (stats *engine.Stats, runErr error) {
 	eng, target, err := m.engineForJob(ctx, job.TargetID, policy.UploadLimitMbpsOverride)
 	if err != nil {
 		return nil, err
@@ -131,12 +134,22 @@ func (m *Manager) backupAttempt(ctx context.Context, run *store.JobRun, job *sto
 		// yet; collecting them would throw away exactly the work its retry wants
 		// to deduplicate against. (The engine's grace window is the second line of
 		// defence, for runs whose process died outright.)
-		if runErr != nil || ctx.Err() != nil {
+		//
+		// A partial run is the exception. Every guest that succeeded has its
+		// manifest, and the chunks the failed guests uploaded are younger than the
+		// grace window, so collection cannot touch them. Skipping collection here
+		// would mean a job with one persistently broken guest never collects at all.
+		var partial *PartialError
+		isPartial := errors.As(runErr, &partial)
+		if (runErr != nil && !isPartial) || ctx.Err() != nil {
 			m.log.Info("skipping orphan chunk collection after an unsuccessful run",
 				"target", target.ID, "run", run.ID)
 			m.logRun(ctx, run.ID,
 				"skipped garbage collection: the run did not complete, so its uploaded chunks are kept for the next attempt")
 			return
+		}
+		if isPartial {
+			m.logRun(ctx, run.ID, "%s", partialGCNote(len(partial.Failures)))
 		}
 		res, err := eng.GC(m.detached())
 		if err != nil {
@@ -161,7 +174,7 @@ func (m *Manager) backupAttempt(ctx context.Context, run *store.JobRun, job *sto
 
 	switch job.Kind {
 	case store.SourceVM:
-		return m.backupVMJob(ctx, run, job, policy, eng)
+		return m.backupVMJob(ctx, run, job, policy, eng, state)
 	case store.SourceAgent:
 		return m.backupAgentJob(ctx, run, job, policy, eng)
 	default:
@@ -337,61 +350,104 @@ func (m *Manager) planVMJob(ctx context.Context, job *store.Job, policy store.Jo
 }
 
 func (m *Manager) backupVMJob(ctx context.Context, run *store.JobRun, job *store.Job,
-	policy store.JobPolicy, eng *engine.Engine) (*engine.Stats, error) {
-	plans, total, err := m.planVMJob(ctx, job, policy)
+	policy store.JobPolicy, eng *engine.Engine, state *vmJobState) (*engine.Stats, error) {
+	if state == nil {
+		state = newVMJobState()
+	}
+	plans, _, err := m.planVMJob(ctx, job, policy)
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, len(plans))
-	for _, p := range plans {
-		names = append(names, p.name)
-	}
-	if job.TagFilter != "" {
-		m.logRun(ctx, run.ID, "resolved tag %q to %s: %s",
-			job.TagFilter, countNoun(len(plans), "VM"), strings.Join(names, ", "))
-	} else {
-		m.logRun(ctx, run.ID, "backing up %s: %s",
+	retry := state.planned
+	if retry {
+		// A retry walks only the guests of the first plan that have not been
+		// backed up yet. A guest that joined the tag filter since the run started
+		// waits for the next run, as it would have without the retry.
+		plans = state.remaining(plans)
+		names := make([]string, 0, len(plans))
+		for _, p := range plans {
+			names = append(names, p.name)
+		}
+		m.logRun(ctx, run.ID, "retrying %s that failed: %s",
 			countNoun(len(plans), "VM"), strings.Join(names, ", "))
+	} else {
+		names := make([]string, 0, len(plans))
+		for _, p := range plans {
+			names = append(names, p.name)
+		}
+		if job.TagFilter != "" {
+			m.logRun(ctx, run.ID, "resolved tag %q to %s: %s",
+				job.TagFilter, countNoun(len(plans), "VM"), strings.Join(names, ", "))
+		} else {
+			m.logRun(ctx, run.ID, "backing up %s: %s",
+				countNoun(len(plans), "VM"), strings.Join(names, ", "))
+		}
+	}
+	var total int64
+	for _, p := range plans {
+		total += p.totalBytes
 	}
 	sess := eng.NewSession(total, m.progressFn(run.ID))
 	snapname := "proxback-" + run.ID[:8]
 
 	// Every guest is recorded up front, pending and with its known size, so the
 	// monitor can draw the whole run — one row per VM, advancing independently —
-	// from the moment it starts.
+	// from the moment it starts. A retry keeps those rows: the guests that
+	// already succeeded stay recorded as such.
 	mon := m.monitorFor(run.ID)
-	if mon != nil {
-		planned := make([]store.RunSource, 0, len(plans))
-		for i, p := range plans {
-			planned = append(planned, store.RunSource{
-				Seq: i, Name: p.name, Kind: store.SourceVM,
-				SourceID: p.sourceID, HostID: p.hostID, HostName: p.hostName, Node: p.node,
-				Status: store.SourcePending, SizeBytes: p.totalBytes,
-			})
+	if !retry {
+		state.record(plans)
+		if mon != nil {
+			planned := make([]store.RunSource, 0, len(plans))
+			for i, p := range plans {
+				planned = append(planned, store.RunSource{
+					Seq: i, Name: p.name, Kind: store.SourceVM,
+					SourceID: p.sourceID, HostID: p.hostID, HostName: p.hostName, Node: p.node,
+					Status: store.SourcePending, SizeBytes: p.totalBytes,
+				})
+			}
+			mon.plan(ctx, planned)
 		}
-		mon.plan(ctx, planned)
 	}
 
+	// One guest failing does not stop the others: each guest is its own restore
+	// point, and a broken VM must not leave the healthy ones unprotected. Only a
+	// cancellation, or the run's duration limit, stops the walk.
+	var failures []SourceFailure
 	for i, p := range plans {
 		if err := ctx.Err(); err != nil {
-			return statsPtr(sess), err
+			return state.stats(sess), err
 		}
 		before := sess.Stats()
+		seq := state.seq[p.sourceID]
 		if mon != nil {
-			mon.begin(ctx, i, before)
+			mon.begin(ctx, seq, before)
 		}
 		err := m.backupOneVM(ctx, run, job, policy, eng, sess, p, snapname, before)
 		if mon != nil {
 			mon.finish(ctx, sourceOutcome(err), sess.Stats(), errText(err))
 		}
-		if err != nil {
-			return statsPtr(sess), err
+		if err == nil {
+			state.done[p.sourceID] = true
+			continue
+		}
+		if ctx.Err() != nil {
+			return state.stats(sess), err
+		}
+		failures = append(failures, SourceFailure{Name: p.name, Err: err})
+		if rest := len(plans) - i - 1; rest > 0 {
+			m.logRun(ctx, run.ID, "%s: failed, continuing with the remaining %s: %v",
+				p.name, countNoun(rest, "VM"), err)
+		} else {
+			m.logRun(ctx, run.ID, "%s: failed: %v", p.name, err)
 		}
 	}
 
 	sess.SetStep("Completed")
 	sess.Flush()
-	return statsPtr(sess), nil
+	stats := state.stats(sess)
+	state.carry(*stats)
+	return stats, state.outcome(failures)
 }
 
 // backupOneVM backs up a single guest: export (helper or Proxmox extension),
